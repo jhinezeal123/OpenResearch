@@ -295,6 +295,12 @@ impl LocalPlane {
                 Some("modal") => crate::local::modal::launch_local_modal(&args).await,
                 Some("k8s") => crate::local::k8s::launch_local_k8s(&args).await,
                 Some("ssh") => crate::local::ssh::launch_local_ssh(&args).await,
+                Some(id) if crate::downstream::compute_backend(id).is_some() => {
+                    let run = crate::compute::submit(&args).await?;
+                    println!("\u{2713} {} run submitted.\n  run  {}", crate::compute::backend(id)?.capabilities().label, run.id);
+                    println!("{}", crate::invocation::follow_up(&run.experiment_id, &run.id));
+                    Ok(())
+                }
                 Some("slurm") => crate::local::slurm::launch_local_slurm(&args).await,
                 Some("ray") => crate::local::ray::launch_local_ray(&args).await,
                 Some("openresearch") => {
@@ -304,7 +310,7 @@ impl LocalPlane {
                 Some(other) => Err(anyhow!(
                     "Unknown --backend '{}'. Local experiments support: hf (Hugging Face Jobs), \
                      modal (Modal serverless GPUs), k8s (your Kubernetes cluster), ssh (your own box), \
-                     slurm (your Slurm cluster), ray (a Ray Jobs cluster), \
+                     slurm (your Slurm cluster), ray (a Ray Jobs cluster), kaggle (a private notebook over SSH), \
                      openresearch (an ephemeral OpenResearch box), tinker (local controller with remote model compute), \
                      local (this machine).",
                     other

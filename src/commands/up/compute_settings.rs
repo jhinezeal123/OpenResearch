@@ -1133,6 +1133,7 @@ pub(super) fn compute_settings_json(ssh: SshReadiness) -> Value {
                 n => format!("{n} hosts in ~/.ssh/config"),
             },
         },
+        crate::downstream::kaggle::settings::summary(),
         {
             "id": "tinker",
             "configured": tinker.is_some(),

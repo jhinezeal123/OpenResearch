@@ -22,6 +22,7 @@ pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod cursor;
 mod detect;
+
 pub(crate) mod opencode;
 mod options;
 mod plan_gate;
@@ -48,6 +49,7 @@ pub(crate) use detect::{
     ProbeTiming, ProbeTimingSink,
 };
 pub use detect::{HarnessAuthState, HarnessInfo, ModelInfo};
+pub(crate) use options::OptionChoice;
 pub use options::{HarnessOptions, PermissionMode};
 pub use plan_gate::command_is_readonly;
 pub use plan_gate::decide as plan_gate_decide;
@@ -520,13 +522,15 @@ pub fn permission_id_for_mode(harness_id: &str, mode: PermissionMode) -> Option<
 /// The one registry. Every consumer — chat dispatch, detection sweep, the
 /// create-session allowlist, and the skill installer — iterates this.
 pub fn registry() -> Vec<Box<dyn Harness>> {
-    vec![
+    let mut entries: Vec<Box<dyn Harness>> = vec![
         Box::new(claude::ClaudeCode),
         Box::new(codex::Codex),
         Box::new(opencode::OpenCode),
         Box::new(cursor::Cursor),
         Box::new(antigravity::Antigravity),
-    ]
+    ];
+    entries.extend(crate::downstream::harnesses());
+    entries
 }
 
 /// A single self-contained request for [`Harness::one_shot`].

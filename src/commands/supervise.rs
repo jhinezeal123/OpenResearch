@@ -21,7 +21,9 @@ use crate::jobs::ssh;
 use crate::jobs::{is_terminal_stage, stage_to_run_status, BackendDescriptor};
 use crate::store::{log_path, now_ms, RunStatus, Store};
 
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
+use crate::downstream::kaggle::supervisor as kaggle;
+
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How long a silent log stream is held before re-checking job state.
 const LOG_IDLE: Duration = Duration::from_secs(30);
 /// How long monitoring must keep failing before it is reported on the run.
@@ -149,6 +151,9 @@ pub async fn run(args: crate::SuperviseArgs) -> Result<()> {
     if descriptor.kind == "ssh_job" {
         return run_ssh(store, stored, descriptor, run_id).await;
     }
+    if descriptor.kind == "kaggle_job" {
+        return kaggle::run(store, stored, descriptor, run_id).await;
+    }
     if descriptor.kind == "slurm_job" {
         return run_slurm(store, stored, descriptor, run_id).await;
     }
@@ -243,7 +248,7 @@ pub async fn run(args: crate::SuperviseArgs) -> Result<()> {
 
 /// Local cancel intent from the run row itself. Best-effort — a transient
 /// db error must not kill supervision.
-fn local_cancel_requested(store: &Store, run_id: &str) -> bool {
+pub(crate) fn local_cancel_requested(store: &Store, run_id: &str) -> bool {
     store
         .get_run(run_id)
         .ok()
@@ -268,7 +273,7 @@ fn run_status_for_stage(store: &Store, run_id: &str, cancel_sent: bool, stage: &
     }
 }
 
-fn status_of(stored: &crate::store::StoredRun) -> Result<RunStatus> {
+pub(crate) fn status_of(stored: &crate::store::StoredRun) -> Result<RunStatus> {
     RunStatus::parse(&stored.status)
         .ok_or_else(|| anyhow!("Run {} has unknown status: {}", stored.id, stored.status))
 }
@@ -657,17 +662,34 @@ async fn run_ssh(
     Ok(())
 }
 
+#[async_trait::async_trait]
+pub(crate) trait SshOwner: Sync {
+    /// A provider-confirmed disappearance; transport errors alone are not proof.
+    async fn disappeared(&self) -> Option<String>;
+}
+
+struct OpenResearchOwner<'a>(&'a Credentials, &'a str);
+
+#[async_trait::async_trait]
+impl SshOwner for OpenResearchOwner<'_> {
+    async fn disappeared(&self) -> Option<String> {
+        openresearch::box_deleted(self.0, self.1)
+            .await
+            .then(|| format!("box {} was deleted while the run was active", self.1))
+    }
+}
+
 /// The ssh two-half loop, shared by every backend whose job is a run dir on a
 /// box we ssh into (ssh itself, openresearch). Runs until the job is terminal
 /// and returns the final run status after logs are drained.
-async fn watch_ssh_job(
+pub(crate) async fn watch_ssh_job(
     store: &Store,
     initial_status: RunStatus,
     target: ssh::SshTarget,
     dir: String,
     run_id: &str,
     descriptor: &mut BackendDescriptor,
-    sandbox: Option<(&Credentials, &str)>,
+    owner: Option<&dyn SshOwner>,
 ) -> Result<RunStatus> {
     let container = descriptor.ssh_container.clone();
     let path = log_path(run_id);
@@ -740,17 +762,21 @@ async fn watch_ssh_job(
         }
         let job = match observed {
             Ok(job) => job,
-            Err(_) => match sandbox {
-                Some((creds, id)) if openresearch::box_deleted(creds, id).await => ssh::JobState {
-                    stage: "ERROR".into(),
-                    message: Some(format!("box {id} was deleted while the run was active")),
-                },
-                _ => {
+            Err(_) => {
+                if let Some(message) = match owner {
+                    Some(owner) => owner.disappeared().await,
+                    None => None,
+                } {
+                    ssh::JobState {
+                        stage: "ERROR".into(),
+                        message: Some(message),
+                    }
+                } else {
                     missing_polls = 0;
                     tokio::time::sleep(POLL_INTERVAL).await;
                     continue;
                 }
-            },
+            }
         };
         // A home directory can blink out (stale NFS); end the run only once it stays missing.
         if job.message.as_deref() == Some(ssh::RUN_DIR_MISSING) {
@@ -1071,7 +1097,7 @@ async fn run_openresearch(
         dir,
         &run_id,
         &mut descriptor,
-        Some((&lifecycle, &sandbox_id)),
+        Some(&OpenResearchOwner(&lifecycle, &sandbox_id)),
     )
     .await;
     teardown_box(&store, &lifecycle, &sandbox_id, &run_id).await;

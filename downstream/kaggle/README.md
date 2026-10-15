@@ -1,0 +1,109 @@
+# Kaggle SSH compute
+
+Kaggle implements OpenResearch's `ComputeBackend`. The agent stays in its local
+chat/worktree and starts asynchronous experiment Runs using `orx exp run`.
+The notebook is a separate, reusable Session. DSH and Kaggle are independent.
+
+## Install on Windows
+
+Install [uv](https://docs.astral.sh/uv/), then run from this checkout:
+
+```powershell
+./downstream/kaggle/setup.ps1 -DataDir D:/path/to/openresearch-data -ImportFrom 'D:/path/to/old/kaggle mcp'
+```
+
+Use the same directory as `ORX_DATA_DIR`. `-Uv` can specify the installed uv
+executable. The installer creates a private CPython 3.12.13 interpreter,
+virtual environment and pinned dependencies under `<data>/kaggle`. Installer
+cache and temporary files are stored there too. `-ImportFrom` is optional and
+copies account metadata, tokens, cookies and saved login credentials **once**;
+it does not save a dependency on that directory. No credentials belong in Git.
+Re-run import only when you intend to replace those private account files.
+
+The executable embeds all Python runtime source, including `auto_login`, and
+extracts a versioned package into its own data directory. It does not import
+Python, modules or profiles from AI Scientist at runtime. Windows' native
+OpenSSH and the selected installed browser remain OS dependencies. Tailcat is
+downloaded from its official release and checked against pinned hashes.
+
+## Configure
+
+1. Open **Compute → More compute options → Kaggle SSH**.
+2. Enable accounts in the account pool. Selection applies across projects;
+   projects are not pinned to a single account.
+3. Set default accelerator, notebook lifetime, competition and dataset mounts.
+   Accept competition rules on Kaggle before using their datasets.
+4. Save, then **Check accounts**. **Recover cookie** uses the packaged
+   auto-login module and private profiles. If Kaggle requires manual
+   verification, complete it in the login window and check again.
+5. Choose Kaggle as the destination or launch explicitly:
+
+```text
+orx exp run <experiment-id> --backend kaggle --flavor cpu --timeout 10m
+```
+
+`--flavor` overrides the accelerator. `--timeout` bounds notebook lifetime;
+otherwise defaults apply. Lifetime starts at reservation and is never reset
+when a notebook is reused. A later Run is bounded by the remaining lifetime.
+
+## Runs and Sessions
+
+- An Experiment can have multiple immutable-source Runs. Every Run has its own
+  working directory, process group, log and exit receipt inside its Session.
+- A Session serves one Run at a time. Compatible idle Sessions in the same
+  project are reused, including after a failed Run. Packages, caches and
+  `/kaggle/working` survive. Source snapshots remain separate per Run.
+- Parallel Runs use different accounts. The pool conservatively admits one
+  live notebook per enabled account. External busy accounts are not used.
+  Additional Runs wait until a compatible Session/account is available.
+- Mounts, accelerator, project and requested lifetime define compatibility.
+  Incompatible notebooks remain available until you close them or TTL ends.
+- Submission and Run identities are durable. Reconnecting uses the same
+  notebook; a lost acknowledgement never causes a replacement submission.
+  Remote launch intents prevent replaying an uncertain experiment command.
+- A detached plugin worker owns the notebook independently of chat and app.
+  It keeps one SSH pipe for upload, launch, logs and monitoring. After a
+  transport failure it reconnects to that same notebook and inspects Run IDs.
+- **Stop Run** cancels only that Run's process group. The notebook is retained.
+  **Close session** or TTL shuts down the notebook. An account is released only
+  after a provider stop receipt. Unknown stop outcomes remain reserved.
+- The session list restarts a missing owner using the saved notebook identity.
+  Remote bootstrap TTL bounds compute even if the local machine goes offline.
+
+Logs are persisted in OpenResearch. Notebook storage remains ephemeral;
+export required artifacts before closing the Session. No Workbench workflow,
+MCP server, n8n or external Python checkout is required.
+
+## Ownership and maintenance
+
+`compute.rs`, `runtime.rs`, `supervisor.rs`, `settings.rs`, `ui/`, `python/`,
+setup and tests belong here. `downstream/bridge.rs` exposes the upstream
+contracts. `VENDORED.json` records the native package origin and original
+hashes; local changes redirect data, profile and cookie recovery paths.
+
+Merge upstream into this fork and build it. Installing an official upstream
+binary replaces the whole application, so it cannot retain custom plugins.
+The local D: launcher disables automatic upstream binary replacement.
+
+## Verification
+
+```powershell
+python -m unittest discover -s downstream/kaggle/tests -p 'test_*.py'
+```
+
+Tests cover concurrent pool admission, overflow, retry identity, reuse,
+project/mount isolation, unconfirmed shutdown ownership, profile import and
+independence from the donor checkout. Browser acceptance results are recorded
+after real CPU verification; GPU/TPU require separate hardware validation.
+
+Verified on Windows through the browser against real Kaggle CPU notebooks
+(2026-10-15): two concurrent accounts, overflow queue, failed Run → committed
+fix → Done on the same notebook and SSH pipe, reconnect after SSH loss, UI Stop
+without notebook teardown, and provider-confirmed Close session. A fresh CPU
+Run from the final embedded binary also reached Done; all QA sessions stopped.
+The printed `metric: 285` is a transport fixture, not a research benchmark.
+
+Local checks passed: 21 Python tests, 1,035 Rust unit tests, 9 integration tests,
+299 UI tests, UI production build, Rust formatting and Clippy. GPU/TPU and a
+fresh interactive/password cookie renewal were not exercised; auto-login
+packaging, script paths and private profile import are covered by tests.

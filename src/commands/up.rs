@@ -50,6 +50,7 @@ use crate::{browser, UpArgs};
 
 pub(crate) mod compute_settings;
 mod harness_setup;
+
 use compute_settings::*;
 
 pub async fn run(args: UpArgs) -> Result<()> {
@@ -379,7 +380,7 @@ async fn persistent_shutdown_signal() {
 }
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     agent: Arc<AgentHost>,
     chat: Arc<ChatHost>,
     claude: Arc<local::claude::ClaudeHost>,
@@ -625,6 +626,7 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
         .route("/api/projects/{id}/terminal", get(project_terminal))
         .route("/api/events", get(events))
         .route("/api/settings/hf", get(hf_settings).post(set_hf_token))
+        .merge(crate::downstream::routes())
         .route(
             "/api/settings/tinker",
             get(tinker_settings).post(set_tinker_key),
@@ -891,7 +893,7 @@ fn is_remote_callback_route(method: &Method, path: &str) -> bool {
 // --- error plumbing -------------------------------------------------------
 
 /// JSON error responses: `{"error": "..."}` with an explicit status.
-struct ApiError(StatusCode, String);
+pub(crate) struct ApiError(StatusCode, String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -905,7 +907,7 @@ impl From<crate::error::Error> for ApiError {
     }
 }
 
-fn bad_request(err: impl std::fmt::Display) -> ApiError {
+pub(crate) fn bad_request(err: impl std::fmt::Display) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, err.to_string())
 }
 
@@ -913,7 +915,7 @@ fn not_found(what: &str) -> ApiError {
     ApiError(StatusCode::NOT_FOUND, format!("{what} not found"))
 }
 
-type ApiResult = std::result::Result<Json<Value>, ApiError>;
+pub(crate) type ApiResult = std::result::Result<Json<Value>, ApiError>;
 
 // --- wire types -----------------------------------------------------------
 
@@ -4541,7 +4543,29 @@ async fn adopt_orphaned_runs(moving: Arc<AtomicBool>, gate: Arc<tokio::sync::Mut
             }
             Err(_) => {}
         }
+        // The dashboard reads run lists, not get_run. Reconcile recoverable
+        // terminal warnings here without putting provider calls on list loads.
+        if let Err(err) = reconcile_finished_run_warnings().await {
+            eprintln!("orx up: could not reconcile finished run warnings: {err}");
+        }
     }
+}
+
+async fn reconcile_finished_run_warnings() -> Result<()> {
+    let runs = Store::open()?.list_runs(INSTANCES_LIMIT)?;
+    for run in runs {
+        if !is_terminal(&run.status)
+            || !crate::jobs::BackendDescriptor::parse(&run.backend_json)
+                .is_ok_and(|descriptor| descriptor.monitoring_error.is_some())
+        {
+            continue;
+        }
+        if let Ok(backend) = backend_for_run(&run) {
+            // The adapter decides which provider state can resolve its warning.
+            let _ = backend.status(&run).await;
+        }
+    }
+    Ok(())
 }
 
 /// Spawns the missing supervisors and returns the runs whose spawn failed.

@@ -351,7 +351,7 @@ pub trait ComputeBackend: Send + Sync {
     }
 }
 
-async fn stage_snapshot(
+pub(crate) async fn stage_snapshot(
     project: &LocalProject,
     experiment: &LocalExperiment,
     include_ray_package: bool,
@@ -366,7 +366,7 @@ async fn stage_snapshot(
     .map(StagedSource)
 }
 
-fn ready() -> Result<Preflight> {
+pub(crate) fn ready() -> Result<Preflight> {
     Ok(Preflight {
         ready: true,
         detail: None,
@@ -675,10 +675,12 @@ pub fn backend(id: &str) -> Result<Box<dyn ComputeBackend>> {
         "modal" => Ok(Box::new(ModalCompute)),
         "k8s" => Ok(Box::new(KubernetesCompute)),
         "ssh" => Ok(Box::new(SshCompute::default())),
+
         "slurm" => Ok(Box::new(SlurmCompute)),
         "ray" => Ok(Box::new(RayCompute)),
         "openresearch" => Ok(Box::new(OpenResearchCompute)),
-        _ => Err(anyhow!("Unknown compute backend '{id}'.")),
+        _ => crate::downstream::compute_backend(id)
+            .ok_or_else(|| anyhow!("Unknown compute backend '{id}'.")),
     }
 }
 
@@ -763,7 +765,7 @@ pub fn validate_run_args(args: &crate::ExpRunArgs) -> Result<()> {
             return Err(anyhow!(
                 "Unknown --backend '{}'. Local experiments support: hf (Hugging Face Jobs), \
                  modal (Modal serverless GPUs), k8s (your Kubernetes cluster), ssh (your own box), \
-                 slurm (your Slurm cluster), ray (a Ray Jobs cluster), \
+                 slurm (your Slurm cluster), ray (a Ray Jobs cluster), kaggle (a private Kaggle notebook over SSH), \
                  openresearch (an ephemeral OpenResearch box), tinker (local controller with remote model compute), \
                  local (this machine).",
                 backend
@@ -1044,7 +1046,7 @@ pub fn recover_submission_handle(run_id: &str) -> Result<Option<BackendDescripto
     }
 }
 
-fn not_ready(detail: impl Into<String>) -> Preflight {
+pub(crate) fn not_ready(detail: impl Into<String>) -> Preflight {
     Preflight {
         ready: false,
         detail: Some(detail.into()),

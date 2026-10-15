@@ -6,6 +6,7 @@
 //! is the serialized handle a later supervisor uses to reattach.
 
 pub mod huggingface;
+
 pub mod kubernetes;
 pub mod localbox;
 mod managed_env;
