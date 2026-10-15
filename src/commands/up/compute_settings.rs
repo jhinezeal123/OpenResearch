@@ -1134,6 +1134,14 @@ pub(super) fn compute_settings_json(ssh: SshReadiness) -> Value {
             },
         },
         {
+            "id": "kaggle",
+            "configured": crate::jobs::kaggle::configured(),
+            "summary": crate::jobs::kaggle::load_settings().ok().flatten()
+                .filter(|s| s.validate().is_ok())
+                .map(|s| format!("{} · {} · {} min", s.account, s.accelerator, s.ttl_minutes))
+                .unwrap_or_else(|| "Connect the existing AI Scientist Kaggle runtime".into()),
+        },
+        {
             "id": "tinker",
             "configured": tinker.is_some(),
             "fromEnvironmentTab": matches!(tinker.as_ref().map(|(_, source)| source), Some(crate::jobs::tinker::ApiKeySource::OpenresearchEnv)),

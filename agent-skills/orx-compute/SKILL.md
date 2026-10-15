@@ -77,6 +77,7 @@ this `SKILL.md`:
 | Modal (`modal`) | [references/modal.md](references/modal.md) |
 | Kubernetes (`k8s`) | [references/k8s.md](references/k8s.md) |
 | SSH (`ssh`) | [references/ssh.md](references/ssh.md) |
+| Kaggle SSH (`kaggle`) | [references/kaggle.md](references/kaggle.md) |
 | Slurm (`slurm`) | [references/slurm.md](references/slurm.md) |
 | Ray Jobs (`ray`) | [references/ray.md](references/ray.md) |
 | OpenResearch (`openresearch`) | [references/openresearch.md](references/openresearch.md) |

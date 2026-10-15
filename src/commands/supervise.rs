@@ -21,6 +21,8 @@ use crate::jobs::ssh;
 use crate::jobs::{is_terminal_stage, stage_to_run_status, BackendDescriptor};
 use crate::store::{log_path, now_ms, RunStatus, Store};
 
+mod kaggle;
+
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How long a silent log stream is held before re-checking job state.
 const LOG_IDLE: Duration = Duration::from_secs(30);
@@ -148,6 +150,9 @@ pub async fn run(args: crate::SuperviseArgs) -> Result<()> {
     }
     if descriptor.kind == "ssh_job" {
         return run_ssh(store, stored, descriptor, run_id).await;
+    }
+    if descriptor.kind == "kaggle_job" {
+        return kaggle::run(store, stored, descriptor, run_id).await;
     }
     if descriptor.kind == "slurm_job" {
         return run_slurm(store, stored, descriptor, run_id).await;

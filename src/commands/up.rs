@@ -50,6 +50,7 @@ use crate::{browser, UpArgs};
 
 pub(crate) mod compute_settings;
 mod harness_setup;
+mod kaggle_settings;
 use compute_settings::*;
 
 pub async fn run(args: UpArgs) -> Result<()> {
@@ -625,6 +626,18 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
         .route("/api/projects/{id}/terminal", get(project_terminal))
         .route("/api/events", get(events))
         .route("/api/settings/hf", get(hf_settings).post(set_hf_token))
+        .route(
+            "/api/settings/kaggle",
+            get(kaggle_settings::get_settings).post(kaggle_settings::save_settings),
+        )
+        .route(
+            "/api/settings/kaggle/discover",
+            post(kaggle_settings::discover),
+        )
+        .route(
+            "/api/settings/kaggle/preflight",
+            post(kaggle_settings::preflight),
+        )
         .route(
             "/api/settings/tinker",
             get(tinker_settings).post(set_tinker_key),
@@ -4541,7 +4554,29 @@ async fn adopt_orphaned_runs(moving: Arc<AtomicBool>, gate: Arc<tokio::sync::Mut
             }
             Err(_) => {}
         }
+        // The dashboard reads run lists, not get_run. Reconcile recoverable
+        // terminal warnings here without putting provider calls on list loads.
+        if let Err(err) = reconcile_finished_run_warnings().await {
+            eprintln!("orx up: could not reconcile finished run warnings: {err}");
+        }
     }
+}
+
+async fn reconcile_finished_run_warnings() -> Result<()> {
+    let runs = Store::open()?.list_runs(INSTANCES_LIMIT)?;
+    for run in runs {
+        if !is_terminal(&run.status)
+            || !crate::jobs::BackendDescriptor::parse(&run.backend_json)
+                .is_ok_and(|descriptor| descriptor.monitoring_error.is_some())
+        {
+            continue;
+        }
+        if let Ok(backend) = backend_for_run(&run) {
+            // The adapter decides which provider state can resolve its warning.
+            let _ = backend.status(&run).await;
+        }
+    }
+    Ok(())
 }
 
 /// Spawns the missing supervisors and returns the runs whose spawn failed.

@@ -18,6 +18,8 @@ function backendName(kind: string): string {
       return "Kubernetes";
     case "ssh_job":
       return "SSH";
+    case "kaggle_job":
+      return "Kaggle SSH";
     case "slurm_job":
       return "Slurm";
     case "ray_job":
@@ -165,6 +167,7 @@ export function BackendLogo({ kind, size = 16 }: { kind: string; size?: number }
     case "k8s_job":
       return <KubernetesLogo size={size} />;
     case "ssh_job":
+    case "kaggle_job":
       return <Server size={size} strokeWidth={1.5} />;
     case "slurm_job":
       return <SlurmLogo size={size} />;

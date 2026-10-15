@@ -667,6 +667,111 @@ backend_adapter!(
             .await
 );
 
+pub struct KaggleCompute;
+
+#[async_trait]
+impl ComputeBackend for KaggleCompute {
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            id: "kaggle",
+            label: "Kaggle SSH",
+            remote: true,
+            flavors: true,
+            requires_flavor: false,
+            source_transport: "SSH tar stream",
+        }
+    }
+
+    async fn stage_source(
+        &self,
+        project: &LocalProject,
+        experiment: &LocalExperiment,
+    ) -> Result<StagedSource> {
+        stage_snapshot(project, experiment, false).await
+    }
+
+    async fn preflight(&self, args: &crate::ExpRunArgs) -> Result<Preflight> {
+        let launch =
+            crate::jobs::kaggle::Launch::resolve(args, &uuid::Uuid::nil().to_string(), "")?;
+        if args.image.is_some() {
+            return Err(anyhow!(
+                "Kaggle uses its notebook image; --image is not supported."
+            ));
+        }
+        let check = crate::jobs::kaggle::call(
+            &launch.runtime,
+            serde_json::json!({"action":"readiness", "account":launch.account}),
+            55,
+        )
+        .await?;
+        if check["readiness"] != "verified_idle" {
+            return Ok(not_ready(
+                "Kaggle account must be signed in and idle. Check Kaggle compute settings.",
+            ));
+        }
+        ready()
+    }
+
+    async fn submit(
+        &self,
+        args: &crate::ExpRunArgs,
+        source: StagedSource,
+        run_id: String,
+    ) -> Result<StoredRun> {
+        let store = Store::open()?;
+        let mut run = store
+            .get_run(&run_id)?
+            .ok_or_else(|| anyhow!("Kaggle run was not reserved"))?;
+        if run.command.trim().is_empty() {
+            return Err(anyhow!(
+                "Set the experiment run command before starting Kaggle."
+            ));
+        }
+        let launch = crate::jobs::kaggle::Launch::resolve(args, &run_id, &run.command)?;
+        launch.save()?;
+        let mut descriptor = BackendDescriptor::parse(&run.backend_json)?;
+        descriptor.namespace = Some(launch.account.clone());
+        descriptor.job_id = Some(uuid::Uuid::parse_str(&run_id)?.simple().to_string());
+        descriptor.flavor = Some(launch.accelerator.clone());
+        descriptor.timeout_secs = Some(launch.ttl_seconds);
+        source.0.apply_to_descriptor(&mut descriptor);
+        record_submission_handle(&run_id, &descriptor)?;
+        run.backend_json = descriptor.to_json();
+        crate::commands::exp::spawn_detached_supervise(&run_id)?;
+        Ok(run)
+    }
+
+    async fn status(&self, handle: &StoredRun) -> Result<StoredRun> {
+        let store = Store::open()?;
+        let mut run = store
+            .get_run(&handle.id)?
+            .ok_or_else(|| anyhow!("Run {} not found", handle.id))?;
+        let mut descriptor = BackendDescriptor::parse(&run.backend_json)?;
+        // A network failure during teardown is recoverable even after the job
+        // finished. Reading that run reconciles its original notebook only.
+        if crate::local::is_terminal(&run.status)
+            && descriptor
+                .monitoring_error
+                .as_deref()
+                .is_some_and(|s| s.starts_with("Kaggle shutdown unconfirmed:"))
+        {
+            if let Ok(launch) = crate::jobs::kaggle::Launch::load(&run.id) {
+                if launch.stopped()
+                    || launch
+                        .call("status")
+                        .await
+                        .is_ok_and(|s| s["stopped"] == true)
+                {
+                    descriptor.monitoring_error = None;
+                    run.backend_json = descriptor.to_json();
+                    store.set_backend_json(&run.id, &run.backend_json)?;
+                }
+            }
+        }
+        Ok(run)
+    }
+}
+
 pub fn backend(id: &str) -> Result<Box<dyn ComputeBackend>> {
     match id {
         "local" => Ok(Box::new(LocalCompute)),
@@ -675,6 +780,7 @@ pub fn backend(id: &str) -> Result<Box<dyn ComputeBackend>> {
         "modal" => Ok(Box::new(ModalCompute)),
         "k8s" => Ok(Box::new(KubernetesCompute)),
         "ssh" => Ok(Box::new(SshCompute::default())),
+        "kaggle" => Ok(Box::new(KaggleCompute)),
         "slurm" => Ok(Box::new(SlurmCompute)),
         "ray" => Ok(Box::new(RayCompute)),
         "openresearch" => Ok(Box::new(OpenResearchCompute)),
@@ -763,7 +869,7 @@ pub fn validate_run_args(args: &crate::ExpRunArgs) -> Result<()> {
             return Err(anyhow!(
                 "Unknown --backend '{}'. Local experiments support: hf (Hugging Face Jobs), \
                  modal (Modal serverless GPUs), k8s (your Kubernetes cluster), ssh (your own box), \
-                 slurm (your Slurm cluster), ray (a Ray Jobs cluster), \
+                 slurm (your Slurm cluster), ray (a Ray Jobs cluster), kaggle (a private Kaggle notebook over SSH), \
                  openresearch (an ephemeral OpenResearch box), tinker (local controller with remote model compute), \
                  local (this machine).",
                 backend

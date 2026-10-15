@@ -300,6 +300,27 @@ fn supervise_command(
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+        // A launch from Git Bash otherwise hands its MSYS ssh.exe to native
+        // Rust/Python children. MSYS parses quoted -o/ProxyCommand arguments
+        // differently from CreateProcess, swallowing subsequent SSH options.
+        // Keep all Windows compute supervisors on the native OpenSSH client.
+        if let Some(ssh_dir) = std::env::var_os("SystemRoot")
+            .map(std::path::PathBuf::from)
+            .map(|root| root.join("System32/OpenSSH"))
+            .filter(|dir| dir.join("ssh.exe").is_file())
+        {
+            let current = cmd
+                .get_envs()
+                .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+                .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+                .or_else(crate::local::shell_env::search_path);
+            let mut path = ssh_dir.into_os_string();
+            path.push(";");
+            if let Some(current) = current {
+                path.push(current);
+            }
+            cmd.env("PATH", path);
+        }
     }
     cmd
 }
@@ -396,6 +417,28 @@ fn request_local_run_cancel_with(
 mod tests {
     use super::*;
     use crate::store::StoredRun;
+
+    #[cfg(windows)]
+    #[test]
+    fn supervisor_uses_native_ssh_despite_a_git_bash_launch_path() {
+        let Some(ssh_dir) = std::env::var_os("SystemRoot")
+            .map(std::path::PathBuf::from)
+            .map(|root| root.join("System32/OpenSSH"))
+            .filter(|dir| dir.join("ssh.exe").is_file())
+        else {
+            return;
+        };
+        let log = std::env::temp_dir().join(format!("orx-native-ssh-{}.log", uuid::Uuid::new_v4()));
+        let command = supervise_command(std::path::Path::new("orx.exe"), "run-qa", &log);
+        let path = command
+            .get_envs()
+            .find(|(key, _)| *key == "PATH")
+            .and_then(|(_, value)| value)
+            .expect("supervisor PATH");
+        assert_eq!(std::env::split_paths(path).next().unwrap(), ssh_dir);
+        drop(command);
+        let _ = std::fs::remove_file(log);
+    }
 
     #[test]
     fn supervise_spawn_error_names_the_binary_and_the_manual_attach() {

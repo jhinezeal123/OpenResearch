@@ -511,7 +511,8 @@ pub struct ExpRunArgs {
     /// `ray` (a job on your Ray cluster, via the Ray Jobs API), `openresearch`
     /// (an ephemeral OpenResearch GPU/CPU box billed to your org; needs
     /// `orx login`), `tinker` (a local controller using remote Tinker model
-    /// compute), or `local` (a detached process on this machine). k8s,
+    /// compute), `kaggle` (a private Kaggle notebook over SSH), or `local`
+    /// (a detached process on this machine). k8s,
     /// ssh, slurm, ray, openresearch, tinker, and local are local
     /// experiments only. orx submits the job and a detached supervisor
     /// records status and logs locally. Omitted on a local experiment: launches on
@@ -527,7 +528,8 @@ pub struct ExpRunArgs {
     /// nothing). With `--backend openresearch`: a GPU id from `orx compute`
     /// (h100_sxm, or h100_sxm:2 for two) or a CPU flavor (cpu5c/cpu5g/cpu5m, or
     /// cpu5c:32 for the vCPU tier). Not used by k8s (see --manifest) or ssh
-    /// (see --host).
+    /// (see --host). With `--backend kaggle`: cpu, NvidiaTeslaT4,
+    /// TpuV5E8 or TpuV6E8; omitted uses the saved Kaggle accelerator.
     #[arg(long)]
     pub flavor: Option<String>,
     /// The org to bill the box to (with `--backend openresearch`). Omit when
@@ -563,7 +565,9 @@ pub struct ExpRunArgs {
     /// has no 4h default — unset falls back to the slurm settings, then the
     /// cluster's own limit. With `--backend openresearch` it bounds the run's
     /// wall clock on the box (the box itself is deleted when the run ends).
-    /// Not supported with `--backend ray` (Ray Jobs have no time limit).
+    /// With `--backend kaggle` it bounds the notebook lifetime (default from
+    /// Kaggle compute settings), including startup. Not supported with
+    /// `--backend ray` (Ray Jobs have no time limit).
     #[arg(long)]
     pub timeout: Option<String>,
     /// Cores for the job (with `--backend slurm`): `#SBATCH --cpus-per-task=`.

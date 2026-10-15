@@ -94,6 +94,7 @@ pub const BACKENDS: &[&str] = &[
     "modal",
     "k8s",
     "ssh",
+    "kaggle",
     "slurm",
     "ray",
     "openresearch",
@@ -103,7 +104,7 @@ pub const BACKENDS: &[&str] = &[
 /// one; slurm's is an optional GRES spec; ray's is optional resource hints).
 /// k8s (manifest), ssh (host), and local (this machine's hardware) have no
 /// flavor axis.
-pub const FLAVORED_BACKENDS: &[&str] = &["hf", "modal", "slurm", "ray", "openresearch"];
+pub const FLAVORED_BACKENDS: &[&str] = &["hf", "modal", "slurm", "ray", "openresearch", "kaggle"];
 
 /// The subset whose launches FAIL without a `--flavor` — the playbook warns
 /// about these when they're the default with no saved flavor.
