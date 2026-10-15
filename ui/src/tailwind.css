@@ -15,3 +15,4 @@
 @custom-variant win-titlebar (&:where(.win-titlebar *));
 @source "../index.html";
 @source ".";
+@source "../../downstream";

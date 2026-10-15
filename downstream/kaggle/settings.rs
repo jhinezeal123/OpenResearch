@@ -1,6 +1,6 @@
 //! Kaggle settings are local; no platform account/API or Workbench server.
-use super::*;
-use crate::jobs::kaggle::{self, Settings};
+use crate::downstream::bridge::api::*;
+use crate::downstream::kaggle::runtime::{self as kaggle, Settings};
 
 async fn payload(settings: Settings) -> Value {
     let catalog = if !settings.python.is_empty() && !settings.donor_root.is_empty() {
@@ -18,7 +18,7 @@ async fn payload(settings: Settings) -> Value {
     }
 }
 
-pub(super) async fn get_settings() -> ApiResult {
+pub(crate) async fn get_settings() -> ApiResult {
     let settings = kaggle::load_settings()?.unwrap_or_else(|| Settings {
         accelerator: "cpu".into(),
         ttl_minutes: 10,
@@ -27,11 +27,11 @@ pub(super) async fn get_settings() -> ApiResult {
     Ok(Json(payload(settings).await))
 }
 
-pub(super) async fn discover(Json(settings): Json<Settings>) -> ApiResult {
+pub(crate) async fn discover(Json(settings): Json<Settings>) -> ApiResult {
     Ok(Json(payload(settings).await))
 }
 
-pub(super) async fn save_settings(Json(settings): Json<Settings>) -> ApiResult {
+pub(crate) async fn save_settings(Json(settings): Json<Settings>) -> ApiResult {
     settings.validate().map_err(bad_request)?;
     let catalog = kaggle::call(&settings, json!({"action":"accounts"}), 20)
         .await
@@ -48,7 +48,7 @@ pub(super) async fn save_settings(Json(settings): Json<Settings>) -> ApiResult {
     Ok(Json(payload(settings).await))
 }
 
-pub(super) async fn preflight(Json(settings): Json<Settings>) -> ApiResult {
+pub(crate) async fn preflight(Json(settings): Json<Settings>) -> ApiResult {
     settings.validate().map_err(bad_request)?;
     let result = kaggle::call(
         &settings,
@@ -60,4 +60,15 @@ pub(super) async fn preflight(Json(settings): Json<Settings>) -> ApiResult {
     Ok(Json(
         json!({"ready":result["readiness"] == "verified_idle", "readiness":result["readiness"], "activeSessions":result["active_session_count"], "observedAt":result["observed_at"]}),
     ))
+}
+
+pub(crate) fn summary() -> Value {
+    json!({
+        "id": "kaggle",
+        "configured": crate::downstream::kaggle::runtime::configured(),
+        "summary": crate::downstream::kaggle::runtime::load_settings().ok().flatten()
+            .filter(|s| s.validate().is_ok())
+            .map(|s| format!("{} · {} · {} min", s.account, s.accelerator, s.ttl_minutes))
+            .unwrap_or_else(|| "Connect the existing AI Scientist Kaggle runtime".into()),
+    })
 }

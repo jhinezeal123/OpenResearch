@@ -1,6 +1,6 @@
 //! Notebook provisioning/teardown around OpenResearch's shared SSH job loop.
-use super::*;
-use crate::jobs::kaggle::Launch;
+use crate::downstream::bridge::supervise::*;
+use crate::downstream::kaggle::runtime::Launch;
 
 struct KaggleOwner<'a>(&'a Launch);
 
@@ -24,9 +24,9 @@ impl SshOwner for KaggleOwner<'_> {
     }
 }
 
-pub(super) async fn run(
+pub(crate) async fn run(
     store: Store,
-    stored: crate::store::StoredRun,
+    stored: crate::downstream::bridge::store::StoredRun,
     mut descriptor: BackendDescriptor,
     run_id: String,
 ) -> Result<()> {
@@ -57,7 +57,7 @@ pub(super) async fn run(
 
 async fn execute(
     store: &Store,
-    stored: &crate::store::StoredRun,
+    stored: &crate::downstream::bridge::store::StoredRun,
     descriptor: &mut BackendDescriptor,
     launch: &Launch,
 ) -> Result<()> {
@@ -119,7 +119,7 @@ async fn execute(
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     };
-    let target = crate::jobs::kaggle::ssh_target(&receipt)?;
+    let target = crate::downstream::kaggle::runtime::ssh_target(&receipt)?;
     descriptor.url = receipt["notebook_ref"]
         .as_str()
         .map(|r| format!("https://www.kaggle.com/code/{r}"));
@@ -129,11 +129,12 @@ async fn execute(
     // Do not replay a possibly launched experiment after losing its ACK.
     // The local intent is durable before sending run_job; reattach needs a
     // remote PID/exit receipt, otherwise the result remains an explicit error.
-    let intent = crate::jobs::kaggle::root()
+    let intent = crate::downstream::kaggle::runtime::root()
         .join("runs")
         .join(format!("{run_id}.launch-intent"));
     if !intent.exists() {
-        let source = crate::compute::SourceSnapshot::from_run(stored, descriptor)?;
+        let source =
+            crate::downstream::bridge::compute::SourceSnapshot::from_run(stored, descriptor)?;
         ssh::stage_source(&target, run_id, &source.path, &source.digest, None).await?;
         if local_cancel_requested(store, run_id) {
             return Err(anyhow!("Cancelled before launching the experiment"));
@@ -142,7 +143,9 @@ async fn execute(
             .as_str()
             .ok_or_else(|| anyhow!("Kaggle omitted the notebook environment wrapper"))?;
         let script = openresearch::wrap_with_timeout(payload, launch.ttl_seconds);
-        let env = crate::config::list_synced_env().into_iter().collect();
+        let env = crate::downstream::bridge::config::list_synced_env()
+            .into_iter()
+            .collect();
         std::fs::write(&intent, b"submitted-once\n")?;
         if let Err(error) = ssh::run_job(&ssh::SshJobSpec {
             target: target.clone(),

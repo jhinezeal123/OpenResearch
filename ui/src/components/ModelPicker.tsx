@@ -1,3 +1,4 @@
+import * as downstream from "../../../downstream/ui";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { getHarnessesQuery } from "../queries/settings";
 import { m } from "../paraglide/messages.js";
@@ -48,7 +49,7 @@ export const HARNESS_LABELS: Record<HarnessId, string> = {
   opencode: "OpenCode",
   cursor: "Cursor",
   antigravity: "Google Antigravity",
-  dsh: "DSH",
+  ...downstream.harnessLabels,
 };
 
 /** First harness that can actually run — the fallback when nothing is picked.

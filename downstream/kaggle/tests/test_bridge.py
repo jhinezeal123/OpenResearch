@@ -4,7 +4,7 @@ import tempfile
 import json
 from pathlib import Path
 
-spec = importlib.util.spec_from_file_location('kaggle_bridge', Path(__file__).with_name('kaggle_bridge.py'))
+spec = importlib.util.spec_from_file_location('kaggle_bridge', Path(__file__).resolve().parents[1] / 'python/bridge.py')
 bridge = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bridge)
 

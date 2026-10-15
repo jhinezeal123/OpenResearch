@@ -13,7 +13,7 @@ selection and `session/resume` (verified with `0.2.1-alpha.2`). Configure your
 providers in DSH Web first. Then, from this checkout:
 
 ```powershell
-node scripts/setup-dsh.mjs D:/path/to/node_modules/@deepseek-ai/dsh/lib/bin.js D:/path/to/openresearch-data
+node downstream/dsh/setup.mjs D:/path/to/node_modules/@deepseek-ai/dsh/lib/bin.js D:/path/to/openresearch-data
 ```
 
 An optional third argument selects the source DSH home (default `~/.dsh`).

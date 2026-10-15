@@ -1,7 +1,7 @@
 import { cn } from "./ui/cn";
 import { TARGET_LABELS } from "../computeTargets";
 import { HarnessSetupDialog } from "./HarnessSetupDialog";
-import { KaggleSection } from "./KaggleSection";
+import * as downstream from "../../../downstream/ui";
 import {
   setScopedQueryData,
   workspaceScope,
@@ -1569,7 +1569,7 @@ function OpenResearchSection({ remote }: { remote: boolean }) {
 const TARGET_CARD_DESCRIPTIONS: Record<ComputeTargetId, () => string> = {
   local: m.compute_description_local,
   ssh: m.compute_description_ssh,
-  kaggle: m.kaggle_description,
+  ...downstream.computeDescriptions,
   tinker: m.compute_description_tinker,
   hf: m.compute_description_hf,
   modal: m.compute_description_modal,
@@ -1587,14 +1587,14 @@ const TARGET_KIND: Record<ComputeTargetId, string> = {
   modal: "modal_job",
   k8s: "k8s_job",
   ssh: "ssh_job",
-  kaggle: "kaggle_job",
+  ...downstream.computeKinds,
   slurm: "slurm_job",
   ray: "ray_job",
   openresearch: "openresearch_job",
 };
 
 /** Backends whose launches take --flavor; mirrors the server's validation. */
-const FLAVORED_TARGETS: ComputeTargetId[] = ["hf", "modal", "slurm", "ray", "openresearch", "kaggle"];
+const FLAVORED_TARGETS: ComputeTargetId[] = ["hf", "modal", "slurm", "ray", "openresearch", ...downstream.flavoredTargets];
 /** Of those, the ones where a launch *requires* a flavor. */
 const FLAVOR_REQUIRED: ComputeTargetId[] = ["hf", "modal", "openresearch"];
 
@@ -1604,7 +1604,7 @@ const FLAVOR_SUGGESTIONS: Partial<Record<ComputeTargetId, string[]>> = {
   slurm: ["gpu", "h100:1", "h100:2", "a100:4"],
   ray: ["cpu", "cpu:2", "gpu", "gpu:1", "gpu:1,cpu:4", "gpu:1,mem:8GiB"],
   openresearch: ["h100_sxm", "h100_sxm:2", "cpu5c", "cpu5g", "cpu5m"],
-  kaggle: ["cpu", "NvidiaTeslaT4", "TpuV5E8", "TpuV6E8"],
+  ...downstream.flavorSuggestions,
 };
 
 const QUICK_SETUP_TARGETS: ComputeTargetId[] = ["tinker", "hf", "modal", "ray", "k8s"];
@@ -1923,7 +1923,7 @@ function BackendDetailPage({
       </div>
       <div className="mt-6 font-sans text-base text-text [&_.settings-card]:mb-0 [&_.settings-form]:mt-6 [&_.settings-form]:border-t-0 [&_.settings-form]:pt-0 [&>.settings-form:first-child]:mt-0 [&>div:first-child]:border-t-0">
         {target.id === "ssh" && <SshSection />}
-        {target.id === "kaggle" && <KaggleSection />}
+        <downstream.Settings id={target.id}/>
         {target.id === "slurm" && <SlurmSection />}
         {target.id === "openresearch" && <OpenResearchSection remote={remote} />}
       </div>

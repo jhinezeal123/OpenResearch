@@ -1,3 +1,4 @@
+import * as downstream from "../../../downstream/ui";
 // Brand marks for the compute backends. Most are inline SVGs; Tinker uses the
 // supplied Thinking Machines raster mark.
 
@@ -9,6 +10,8 @@ import { m } from "../paraglide/messages.js";
 
 /** Human name for a backend kind, used as the logo's alt/label. */
 function backendName(kind: string): string {
+  const custom = downstream.backendLabel(kind);
+  if (custom) return custom;
   switch (kind) {
     case "modal_job":
       return "Modal";
@@ -18,8 +21,6 @@ function backendName(kind: string): string {
       return "Kubernetes";
     case "ssh_job":
       return "SSH";
-    case "kaggle_job":
-      return "Kaggle SSH";
     case "slurm_job":
       return "Slurm";
     case "ray_job":
@@ -159,6 +160,8 @@ export function GitHubMark({ size = 16 }: { size?: number }) {
 
 /** The logo glyph for a backend kind. */
 export function BackendLogo({ kind, size = 16 }: { kind: string; size?: number }) {
+  const custom = downstream.backendLogo(kind, size);
+  if (custom) return custom;
   switch (kind) {
     case "modal_job":
       return <ModalLogo size={size} />;
@@ -167,7 +170,6 @@ export function BackendLogo({ kind, size = 16 }: { kind: string; size?: number }
     case "k8s_job":
       return <KubernetesLogo size={size} />;
     case "ssh_job":
-    case "kaggle_job":
       return <Server size={size} strokeWidth={1.5} />;
     case "slurm_job":
       return <SlurmLogo size={size} />;

@@ -50,7 +50,7 @@ use crate::{browser, UpArgs};
 
 pub(crate) mod compute_settings;
 mod harness_setup;
-mod kaggle_settings;
+
 use compute_settings::*;
 
 pub async fn run(args: UpArgs) -> Result<()> {
@@ -380,7 +380,7 @@ async fn persistent_shutdown_signal() {
 }
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     agent: Arc<AgentHost>,
     chat: Arc<ChatHost>,
     claude: Arc<local::claude::ClaudeHost>,
@@ -626,18 +626,7 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
         .route("/api/projects/{id}/terminal", get(project_terminal))
         .route("/api/events", get(events))
         .route("/api/settings/hf", get(hf_settings).post(set_hf_token))
-        .route(
-            "/api/settings/kaggle",
-            get(kaggle_settings::get_settings).post(kaggle_settings::save_settings),
-        )
-        .route(
-            "/api/settings/kaggle/discover",
-            post(kaggle_settings::discover),
-        )
-        .route(
-            "/api/settings/kaggle/preflight",
-            post(kaggle_settings::preflight),
-        )
+        .merge(crate::downstream::routes())
         .route(
             "/api/settings/tinker",
             get(tinker_settings).post(set_tinker_key),
@@ -904,7 +893,7 @@ fn is_remote_callback_route(method: &Method, path: &str) -> bool {
 // --- error plumbing -------------------------------------------------------
 
 /// JSON error responses: `{"error": "..."}` with an explicit status.
-struct ApiError(StatusCode, String);
+pub(crate) struct ApiError(StatusCode, String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -918,7 +907,7 @@ impl From<crate::error::Error> for ApiError {
     }
 }
 
-fn bad_request(err: impl std::fmt::Display) -> ApiError {
+pub(crate) fn bad_request(err: impl std::fmt::Display) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, err.to_string())
 }
 
@@ -926,7 +915,7 @@ fn not_found(what: &str) -> ApiError {
     ApiError(StatusCode::NOT_FOUND, format!("{what} not found"))
 }
 
-type ApiResult = std::result::Result<Json<Value>, ApiError>;
+pub(crate) type ApiResult = std::result::Result<Json<Value>, ApiError>;
 
 // --- wire types -----------------------------------------------------------
 

@@ -17,6 +17,8 @@ mod client;
 mod commands;
 mod compute;
 mod config;
+#[path = "../downstream/mod.rs"]
+mod downstream;
 mod error;
 mod folder_picker;
 mod invocation;

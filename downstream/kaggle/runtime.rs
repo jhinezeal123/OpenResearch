@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 
-use crate::error::{anyhow, Result};
+use crate::downstream::bridge::error::{anyhow, Result};
 
-const BRIDGE: &str = include_str!("../../scripts/kaggle_bridge.py");
+const BRIDGE: &str = include_str!("python/bridge.py");
 pub const ACCELERATORS: &[&str] = &["cpu", "NvidiaTeslaT4", "TpuV5E8", "TpuV6E8"];
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -56,10 +56,10 @@ impl Settings {
 }
 
 fn settings_path() -> PathBuf {
-    crate::store::data_dir().join("kaggle.json")
+    crate::downstream::bridge::store::data_dir().join("kaggle.json")
 }
 pub fn root() -> PathBuf {
-    crate::store::data_dir().join("kaggle")
+    crate::downstream::bridge::store::data_dir().join("kaggle")
 }
 
 pub fn load_settings() -> Result<Option<Settings>> {
@@ -107,7 +107,11 @@ pub struct Launch {
 }
 
 impl Launch {
-    pub fn resolve(args: &crate::ExpRunArgs, run_id: &str, command: &str) -> Result<Self> {
+    pub fn resolve(
+        args: &crate::downstream::bridge::ExpRunArgs,
+        run_id: &str,
+        command: &str,
+    ) -> Result<Self> {
         let runtime = load_settings()?
             .ok_or_else(|| anyhow!("Configure Kaggle in Compute settings first."))?;
         runtime.validate()?;
@@ -124,7 +128,7 @@ impl Launch {
         let ttl_seconds = args
             .timeout
             .as_deref()
-            .map(crate::jobs::huggingface::parse_timeout)
+            .map(crate::downstream::bridge::jobs::huggingface::parse_timeout)
             .transpose()?
             .unwrap_or(runtime.ttl_minutes * 60);
         if !(60..=43_200).contains(&ttl_seconds) {
@@ -265,7 +269,7 @@ pub async fn call(settings: &Settings, mut request: Value, seconds: u64) -> Resu
     Ok(envelope["result"].clone())
 }
 
-pub fn ssh_target(receipt: &Value) -> Result<super::ssh::SshTarget> {
+pub fn ssh_target(receipt: &Value) -> Result<crate::downstream::bridge::jobs::ssh::SshTarget> {
     let config = receipt["ssh_config"]
         .as_str()
         .ok_or_else(|| anyhow!("Kaggle returned no SSH config"))?;
@@ -278,7 +282,7 @@ pub fn ssh_target(receipt: &Value) -> Result<super::ssh::SshTarget> {
     if !Path::new(config).is_absolute() || !Path::new(config).is_file() {
         return Err(anyhow!("Kaggle SSH configuration is missing"));
     }
-    Ok(super::ssh::SshTarget {
+    Ok(crate::downstream::bridge::jobs::ssh::SshTarget {
         dest: alias.into(),
         extra_opts: vec![
             "-F".into(),

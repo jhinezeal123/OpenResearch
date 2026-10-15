@@ -21,9 +21,9 @@ use crate::jobs::ssh;
 use crate::jobs::{is_terminal_stage, stage_to_run_status, BackendDescriptor};
 use crate::store::{log_path, now_ms, RunStatus, Store};
 
-mod kaggle;
+use crate::downstream::kaggle::supervisor as kaggle;
 
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How long a silent log stream is held before re-checking job state.
 const LOG_IDLE: Duration = Duration::from_secs(30);
 /// How long monitoring must keep failing before it is reported on the run.
@@ -248,7 +248,7 @@ pub async fn run(args: crate::SuperviseArgs) -> Result<()> {
 
 /// Local cancel intent from the run row itself. Best-effort — a transient
 /// db error must not kill supervision.
-fn local_cancel_requested(store: &Store, run_id: &str) -> bool {
+pub(crate) fn local_cancel_requested(store: &Store, run_id: &str) -> bool {
     store
         .get_run(run_id)
         .ok()
@@ -273,7 +273,7 @@ fn run_status_for_stage(store: &Store, run_id: &str, cancel_sent: bool, stage: &
     }
 }
 
-fn status_of(stored: &crate::store::StoredRun) -> Result<RunStatus> {
+pub(crate) fn status_of(stored: &crate::store::StoredRun) -> Result<RunStatus> {
     RunStatus::parse(&stored.status)
         .ok_or_else(|| anyhow!("Run {} has unknown status: {}", stored.id, stored.status))
 }
@@ -663,7 +663,7 @@ async fn run_ssh(
 }
 
 #[async_trait::async_trait]
-trait SshOwner: Sync {
+pub(crate) trait SshOwner: Sync {
     /// A provider-confirmed disappearance; transport errors alone are not proof.
     async fn disappeared(&self) -> Option<String>;
 }
@@ -682,7 +682,7 @@ impl SshOwner for OpenResearchOwner<'_> {
 /// The ssh two-half loop, shared by every backend whose job is a run dir on a
 /// box we ssh into (ssh itself, openresearch). Runs until the job is terminal
 /// and returns the final run status after logs are drained.
-async fn watch_ssh_job(
+pub(crate) async fn watch_ssh_job(
     store: &Store,
     initial_status: RunStatus,
     target: ssh::SshTarget,

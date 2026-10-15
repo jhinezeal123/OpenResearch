@@ -1,5 +1,5 @@
 //! DeepSeek Harness through ACP. Catalog and effort choices are owned by DSH.
-//! Configure its local launch descriptor with scripts/setup-dsh.mjs.
+//! Configure its local launch descriptor with downstream/dsh/setup.mjs.
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -10,15 +10,16 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-use super::detect::{HarnessAuthState, HarnessInfo, ModelInfo};
-use super::options::{HarnessOptions, OptionChoice, PermissionMode};
-use super::{Harness, ResumeAction, TurnFailure, TurnOutcome, TurnResult, TURN_WATCHDOG};
-use crate::error::{anyhow, Result};
-use crate::local::chat::{
+use crate::downstream::bridge::error::{anyhow, Result};
+use crate::downstream::bridge::harness::{ensure_playbook, PLAYBOOK_REL};
+use crate::downstream::bridge::harness::{
     harness_log, prepare_env, set_chat_session_env, DeliveryState, PermissionDecision,
     PromptAnswer, ResumeCtx, TurnCtx, WirePart, WirePrompt,
 };
-use crate::local::opencode::{ensure_playbook, PLAYBOOK_REL};
+use crate::downstream::bridge::harness::{
+    Harness, HarnessAuthState, HarnessInfo, HarnessOptions, ModelInfo, OptionChoice,
+    PermissionMode, ResumeAction, TurnFailure, TurnOutcome, TurnResult, TURN_WATCHDOG,
+};
 
 pub struct Dsh;
 
@@ -33,7 +34,7 @@ struct Launch {
 }
 
 fn descriptor_path() -> PathBuf {
-    crate::store::data_dir().join("dsh.json")
+    crate::downstream::bridge::store::data_dir().join("dsh.json")
 }
 
 fn launch() -> Result<Launch> {
@@ -84,7 +85,7 @@ impl Harness for Dsh {
                 info.bin_path = Some(config.executable.to_string_lossy().into_owned());
                 info.version = config.version;
             }
-            Err(_) => info.agent_note = Some("Configure DSH with scripts/setup-dsh.mjs, then Refresh. No automatic package downloads.".into()),
+            Err(_) => info.agent_note = Some("Configure DSH with downstream/dsh/setup.mjs, then Refresh. No automatic package downloads.".into()),
         }
         Some(info)
     }
@@ -362,7 +363,7 @@ fn model_info(id: &str, name: &str, session: &Value) -> ModelInfo {
 }
 
 async fn discover() -> Result<Vec<ModelInfo>> {
-    let cwd = crate::store::data_dir().join("agents/dsh/catalog");
+    let cwd = crate::downstream::bridge::store::data_dir().join("agents/dsh/catalog");
     std::fs::create_dir_all(&cwd)?;
     let mut acp = Acp::start(&cwd, None).await?;
     let session = acp

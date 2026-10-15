@@ -53,7 +53,7 @@ jobs:
         run: python3 scripts/test_release_notes.py
 
       - name: Kaggle bridge receipts and account isolation
-        run: python3 scripts/test_kaggle_bridge.py
+        run: python3 downstream/kaggle/tests/test_bridge.py
 
       - uses: pnpm/action-setup@v4
         with:

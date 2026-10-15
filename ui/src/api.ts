@@ -162,7 +162,7 @@ async function json<T>(res: Response): Promise<T> {
   return data;
 }
 
-const get = <T>(url: string, signal?: AbortSignal) => fetch(url, { signal }).then((r) => json<T>(r));
+export const get = <T>(url: string, signal?: AbortSignal) => fetch(url, { signal }).then((r) => json<T>(r));
 async function writeResponse(url: string, init: RequestInit): Promise<Response> {
   const scope = workspaceScope();
   const response = await fetch(url, init);
@@ -171,7 +171,7 @@ async function writeResponse(url: string, init: RequestInit): Promise<Response> 
   if (response.ok) invalidateWrite(url, scope);
   return response;
 }
-const post = <T>(url: string, body?: unknown, keepalive = false) =>
+export const post = <T>(url: string, body?: unknown, keepalive = false) =>
   writeResponse(url, {
     method: "POST",
     keepalive,
@@ -1182,27 +1182,7 @@ export const rayPreflight = (address?: string) =>
 
 // --- settings: compute targets (unified list + default) ------------------------
 
-export interface KaggleConfig {
-  python: string;
-  donorRoot: string;
-  account: string;
-  accelerator: string;
-  ttlMinutes: number;
-  competitionSources: string[];
-  datasetSources: string[];
-}
-export interface KaggleSettings {
-  settings: KaggleConfig;
-  accounts: { id: string; alias: string; username: string | null; configured: boolean }[];
-  accelerators: string[];
-  configured: boolean;
-  error: string | null;
-}
-export const getKaggleSettings = (signal?: AbortSignal) => get<KaggleSettings>("/api/settings/kaggle", signal);
-export const discoverKaggle = (body: KaggleConfig) => post<KaggleSettings>("/api/settings/kaggle/discover", body);
-export const saveKaggleSettings = (body: KaggleConfig) => post<KaggleSettings>("/api/settings/kaggle", body);
-export const kagglePreflight = (body: KaggleConfig) => post<{ ready: boolean; readiness: string; activeSessions: number | null }>("/api/settings/kaggle/preflight", body);
-
+export type { KaggleConfig, KaggleSettings } from "../../downstream/kaggle/ui/api";
 export type ComputeTargetId =
   | "local"
   | "tinker"
@@ -1210,7 +1190,7 @@ export type ComputeTargetId =
   | "modal"
   | "k8s"
   | "ssh"
-  | "kaggle"
+  | import("../../downstream/catalog").ComputeId
   | "slurm"
   | "ray"
   | "openresearch";
@@ -1547,7 +1527,7 @@ export const reportLocale = (locale: string, signal?: AbortSignal) =>
     body: JSON.stringify({ locale }),
   }).then((r) => json<{ locale: string }>(r));
 
-export type HarnessId = "claude-code" | "codex" | "opencode" | "cursor" | "antigravity" | "dsh";
+export type HarnessId = "claude-code" | "codex" | "opencode" | "cursor" | "antigravity" | import("../../downstream/catalog").HarnessId;
 
 export interface HarnessModel {
   id: string;

@@ -1,3 +1,4 @@
+import * as downstream from "../../downstream/catalog";
 import type { ComputeTargetId } from "./api";
 import { m } from "./paraglide/messages.js";
 
@@ -8,7 +9,7 @@ export const TARGET_LABELS: Record<ComputeTargetId, () => string> = {
   modal: m.compute_target_modal,
   k8s: m.compute_target_k8s,
   ssh: m.compute_target_ssh,
-  kaggle: () => "Kaggle SSH",
+  ...downstream.computeLabels,
   slurm: m.compute_target_slurm,
   ray: m.compute_target_ray,
   openresearch: m.compute_target_openresearch,

@@ -8,7 +8,7 @@ import os from 'node:os';
 
 const [entry, dataDir, sourceHome = path.join(os.homedir(), '.dsh')] = process.argv.slice(2);
 if (!entry || !dataDir || !existsSync(entry)) {
-  throw new Error('Usage: node scripts/setup-dsh.mjs ABSOLUTE_DSH_BIN_JS ORX_DATA_DIR [DSH_HOME]');
+  throw new Error('Usage: node downstream/dsh/setup.mjs ABSOLUTE_DSH_BIN_JS ORX_DATA_DIR [DSH_HOME]');
 }
 const require = createRequire(path.resolve(entry));
 const YAML = require('yaml');

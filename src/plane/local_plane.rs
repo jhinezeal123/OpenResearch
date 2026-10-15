@@ -295,9 +295,9 @@ impl LocalPlane {
                 Some("modal") => crate::local::modal::launch_local_modal(&args).await,
                 Some("k8s") => crate::local::k8s::launch_local_k8s(&args).await,
                 Some("ssh") => crate::local::ssh::launch_local_ssh(&args).await,
-                Some("kaggle") => {
+                Some(id) if crate::downstream::compute_backend(id).is_some() => {
                     let run = crate::compute::submit(&args).await?;
-                    println!("\u{2713} Kaggle SSH run submitted.\n  run  {}", run.id);
+                    println!("\u{2713} {} run submitted.\n  run  {}", crate::compute::backend(id)?.capabilities().label, run.id);
                     println!("{}", crate::invocation::follow_up(&run.experiment_id, &run.id));
                     Ok(())
                 }

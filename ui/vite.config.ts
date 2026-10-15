@@ -62,6 +62,7 @@ export default defineConfig({
     react(),
     tailwindcss(),
   ],
+  resolve: { dedupe: ["react", "react-dom", "@tanstack/react-query", "lucide-react"] },
   build: { outDir },
   // PDF.js's worker is an ES module.
   worker: { format: "es" },
