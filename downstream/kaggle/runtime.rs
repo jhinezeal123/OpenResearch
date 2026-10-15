@@ -9,15 +9,12 @@ use tokio::io::AsyncWriteExt;
 
 use crate::downstream::bridge::error::{anyhow, Result};
 
-const BRIDGE: &str = include_str!("python/bridge.py");
 pub const ACCELERATORS: &[&str] = &["cpu", "NvidiaTeslaT4", "TpuV5E8", "TpuV6E8"];
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
-    pub python: String,
-    pub donor_root: String,
-    pub account: String,
+    pub accounts: Vec<String>,
     pub accelerator: String,
     pub ttl_minutes: u64,
     pub competition_sources: Vec<String>,
@@ -26,20 +23,15 @@ pub struct Settings {
 
 impl Settings {
     pub fn validate(&self) -> Result<()> {
-        if !Path::new(&self.python).is_absolute() || !Path::new(&self.python).is_file() {
+        if !python().is_file() {
             return Err(anyhow!(
-                "Choose the existing AI Scientist Python executable."
+                "Install the packaged Kaggle runtime with downstream/kaggle/setup.ps1."
             ));
         }
-        if !Path::new(&self.donor_root).is_absolute()
-            || !Path::new(&self.donor_root)
-                .join("interface_ai_scientist/bootstrap_service.py")
-                .is_file()
-        {
-            return Err(anyhow!("Choose AI Scientist's bundled Kaggle directory."));
-        }
-        if self.account.is_empty() || !ACCELERATORS.contains(&self.accelerator.as_str()) {
-            return Err(anyhow!("Select a Kaggle account and accelerator."));
+        if self.accounts.is_empty() || !ACCELERATORS.contains(&self.accelerator.as_str()) {
+            return Err(anyhow!(
+                "Enable at least one Kaggle account and select an accelerator."
+            ));
         }
         if !(1..=720).contains(&self.ttl_minutes) {
             return Err(anyhow!("Kaggle notebook lifetime must be 1–720 minutes."));
@@ -64,7 +56,16 @@ pub fn root() -> PathBuf {
 
 pub fn load_settings() -> Result<Option<Settings>> {
     match std::fs::read(settings_path()) {
-        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Ok(bytes) => {
+            let old: Value = serde_json::from_slice(&bytes)?;
+            let mut settings: Settings = serde_json::from_value(old.clone())?;
+            if settings.accounts.is_empty() {
+                if let Some(account) = old["account"].as_str().filter(|s| !s.is_empty()) {
+                    settings.accounts.push(account.into());
+                }
+            }
+            Ok(Some(settings))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -104,6 +105,8 @@ pub struct Launch {
     pub competition_sources: Vec<String>,
     pub dataset_sources: Vec<String>,
     pub command: String,
+    #[serde(default)]
+    pub pooled: bool,
 }
 
 impl Launch {
@@ -136,13 +139,14 @@ impl Launch {
         }
         Ok(Self {
             run_id: run_id.into(),
-            account: runtime.account.clone(),
+            account: String::new(),
             accelerator,
             ttl_seconds,
             competition_sources: runtime.competition_sources.clone(),
             dataset_sources: runtime.dataset_sources.clone(),
             command: command.into(),
             runtime,
+            pooled: true,
         })
     }
     fn path(run_id: &str) -> Result<PathBuf> {
@@ -162,7 +166,7 @@ impl Launch {
     pub async fn call(&self, action: &str) -> Result<Value> {
         let mut value = serde_json::to_value(self)?;
         value["action"] = json!(action);
-        value["command"] = json!(crate::compute::staged_script(&self.command));
+        value["command"] = json!(&self.command);
         call(
             &self.runtime,
             value,
@@ -190,19 +194,30 @@ impl Launch {
     }
 }
 
+pub fn python() -> PathBuf {
+    root().join(if cfg!(windows) {
+        "runtime/Scripts/python.exe"
+    } else {
+        "runtime/bin/python"
+    })
+}
+
 pub async fn call(settings: &Settings, mut request: Value, seconds: u64) -> Result<Value> {
     request["runtime"] = serde_json::to_value(settings)?;
     request["stateRoot"] = json!(root().join("sessions"));
+    request["home"] = json!(root());
+    let package = super::package::extract()?;
     let action = request["action"].as_str().unwrap_or("operation").to_owned();
-    std::fs::create_dir_all(root())?;
+    std::fs::create_dir_all(root().join("tmp"))?;
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(root().join("adapter.log"))?;
-    let mut command = tokio::process::Command::new(&settings.python);
+    let mut command = tokio::process::Command::new(python());
     command
-        .args(["-u", "-c", BRIDGE])
-        .current_dir(&settings.donor_root)
+        .arg("-u")
+        .arg(package.join("bridge.py"))
+        .current_dir(&package)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(log))
@@ -244,6 +259,11 @@ pub async fn call(settings: &Settings, mut request: Value, seconds: u64) -> Resu
         }
     }
     command
+        .env("TEMP", root().join("tmp"))
+        .env("TMP", root().join("tmp"))
+        .env("TMPDIR", root().join("tmp"))
+        .env("PLAYWRIGHT_BROWSERS_PATH", root().join("browsers"))
+        .env("ORX_KAGGLE_HOME", root())
         .env("PYTHONUTF8", "1")
         .env("PYTHONDONTWRITEBYTECODE", "1");
     #[cfg(windows)]
@@ -269,32 +289,6 @@ pub async fn call(settings: &Settings, mut request: Value, seconds: u64) -> Resu
     Ok(envelope["result"].clone())
 }
 
-pub fn ssh_target(receipt: &Value) -> Result<crate::downstream::bridge::jobs::ssh::SshTarget> {
-    let config = receipt["ssh_config"]
-        .as_str()
-        .ok_or_else(|| anyhow!("Kaggle returned no SSH config"))?;
-    let alias = receipt["ssh_alias"]
-        .as_str()
-        .filter(|v| {
-            v.starts_with("kaggle-") && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-        })
-        .ok_or_else(|| anyhow!("Kaggle returned an invalid SSH alias"))?;
-    if !Path::new(config).is_absolute() || !Path::new(config).is_file() {
-        return Err(anyhow!("Kaggle SSH configuration is missing"));
-    }
-    Ok(crate::downstream::bridge::jobs::ssh::SshTarget {
-        dest: alias.into(),
-        extra_opts: vec![
-            "-F".into(),
-            config.into(),
-            "-o".into(),
-            "RemoteCommand=none".into(),
-            "-o".into(),
-            "RequestTTY=no".into(),
-        ],
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,11 +296,5 @@ mod tests {
     fn saved_launch_ids_cannot_escape_the_runtime() {
         assert!(Launch::path("../../other").is_err());
         assert!(Launch::path("9ef38277-9183-47b0-b869-62fe43701b61").is_ok());
-    }
-    #[test]
-    fn ssh_endpoint_requires_a_real_private_config() {
-        assert!(
-            ssh_target(&json!({"ssh_alias":"-oProxyCommand=bad","ssh_config":"missing"})).is_err()
-        );
     }
 }

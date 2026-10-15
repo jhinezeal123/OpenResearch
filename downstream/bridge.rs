@@ -8,6 +8,7 @@ pub(crate) mod compute {
     pub(crate) use crate::local::model::{LocalExperiment, LocalProject};
     pub(crate) use crate::store::{Store, StoredRun};
 }
+#[allow(unused_imports)]
 pub(crate) mod supervise {
     pub(crate) use crate::commands::supervise::{
         local_cancel_requested, status_of, watch_ssh_job, SshOwner, POLL_INTERVAL,

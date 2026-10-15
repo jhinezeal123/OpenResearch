@@ -1,38 +1,26 @@
-# Kaggle SSH (`--backend kaggle`)
+# Kaggle experiments
 
-Use Kaggle only when it is the configured compute default or the user explicitly
-chooses it. The local Kaggle settings already select the account, accelerator,
-notebook lifetime and dataset/competition sources. Credentials stay in that
-account's local profile. Never ask for tokens in chat or copy them to Kaggle.
+Use the normal OpenResearch experiment flow and committed source:
 
 ```sh
-orx exp run <expId> --backend kaggle
-orx exp run <expId> --backend kaggle --flavor cpu --timeout 10m
+orx exp run <experiment-id> --backend kaggle --flavor cpu --timeout 10m
+orx exp status <experiment-id>
+orx logs <run-id>
 ```
 
-`--flavor` overrides the saved accelerator: `cpu`, `NvidiaTeslaT4` (T4 × 2),
-`TpuV5E8` or `TpuV6E8`. `--timeout` overrides the notebook lifetime, including
-startup, and must be between 60 seconds and 12 hours. Do not exceed the user's
-budget. Do not pass `--host`, `--image`, or container flags.
+Accelerators: `cpu`, `NvidiaTeslaT4`, `TpuV5E8`, `TpuV6E8`.
+The configured account pool selects an available account automatically.
+Parallel Runs lease distinct notebooks/accounts; overflow waits. Do not pin a
+project to an account or submit notebooks yourself.
 
-Commit code first. The backend transfers the immutable source snapshot and
-executes the experiment's run command under the notebook's Python/CUDA
-environment. Mounted datasets are under `/kaggle/input`. Prepare dependencies
-in committed scripts. Do not depend on local Windows paths on the remote VM.
+Experiments and notebook Sessions have different lifetimes. A failed Run does
+not close its notebook: fix code in the experiment worktree, commit it, and
+launch another Run. Compatible Runs reuse the notebook and installed packages,
+while each Run gets a fresh immutable source directory. Follow normal immutable
+source rules; editing the local worktree does not alter an in-flight Run.
 
-Use `orx logs <runId>` and `orx exp wait <expId>` as with other compute backends.
-Print metrics with their names to stdout so they remain in the local run log.
-The notebook is ephemeral and is stopped after log collection; do not rely on
-its SSH directory remaining available after completion. Save desired output
-through the project's existing external storage before the command exits.
-
-Only one OpenResearch notebook per selected account is admitted at a time.
-Readiness must also verify that no other Kaggle notebook is using that account.
-If the account needs login, let the user renew its existing local Kaggle profile.
-Do not automatically choose a different account or backend.
-
-Cancel with `orx exp cancel <expId>`. The supervisor cancels the experiment and
-stops its own notebook. Chat cancellation is independent. During a network
-outage, monitoring retries using the same notebook ID; do not launch replacement
-notebooks or repeat an uncertain experiment. Unconfirmed teardown is shown as
-a warning and the configured notebook lifetime remains the final bound.
+`orx exp cancel` cancels the Run, preserving its Session. Close notebooks in
+Compute → Kaggle SSH → Sessions, or let their TTL expire. Lifetime starts at
+reservation and does not reset on reuse; `--timeout` overrides this lifetime.
+Do not repeat an uncertain command under a replacement Run/notebook ID.
+If account login is required, use Recover cookie in Compute settings.

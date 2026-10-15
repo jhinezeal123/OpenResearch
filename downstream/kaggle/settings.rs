@@ -1,74 +1,102 @@
-//! Kaggle settings are local; no platform account/API or Workbench server.
+//! Settings and session controls belong to the Kaggle plugin.
 use crate::downstream::bridge::api::*;
 use crate::downstream::kaggle::runtime::{self as kaggle, Settings};
 
 async fn payload(settings: Settings) -> Value {
-    let catalog = if !settings.python.is_empty() && !settings.donor_root.is_empty() {
-        kaggle::call(&settings, json!({"action":"accounts"}), 20).await
-    } else {
-        Ok(json!({"accounts":[], "accelerators":kaggle::ACCELERATORS}))
-    };
+    let catalog = kaggle::call(&settings, json!({"action":"accounts"}), 20).await;
     match catalog {
         Ok(catalog) => {
-            json!({"settings":settings, "accounts":catalog["accounts"], "accelerators":catalog["accelerators"], "configured":settings.validate().is_ok(), "error":null})
+            json!({"settings":settings,"accounts":catalog["accounts"],"accelerators":kaggle::ACCELERATORS,"configured":settings.validate().is_ok(),"runtimeReady":kaggle::python().is_file(),"error":null})
         }
         Err(error) => {
-            json!({"settings":settings, "accounts":[], "accelerators":kaggle::ACCELERATORS, "configured":false, "error":error.to_string()})
+            json!({"settings":settings,"accounts":[],"accelerators":kaggle::ACCELERATORS,"configured":false,"runtimeReady":kaggle::python().is_file(),"error":error.to_string()})
         }
     }
 }
-
-pub(crate) async fn get_settings() -> ApiResult {
-    let settings = kaggle::load_settings()?.unwrap_or_else(|| Settings {
+fn defaults() -> Settings {
+    Settings {
         accelerator: "cpu".into(),
         ttl_minutes: 10,
         ..Default::default()
-    });
-    Ok(Json(payload(settings).await))
+    }
 }
-
+pub(crate) async fn get_settings() -> ApiResult {
+    Ok(Json(
+        payload(kaggle::load_settings()?.unwrap_or_else(defaults)).await,
+    ))
+}
 pub(crate) async fn discover(Json(settings): Json<Settings>) -> ApiResult {
     Ok(Json(payload(settings).await))
 }
-
 pub(crate) async fn save_settings(Json(settings): Json<Settings>) -> ApiResult {
     settings.validate().map_err(bad_request)?;
     let catalog = kaggle::call(&settings, json!({"action":"accounts"}), 20)
         .await
         .map_err(bad_request)?;
-    if !catalog["accounts"].as_array().is_some_and(|rows| {
-        rows.iter()
-            .any(|row| row["id"] == settings.account && row["configured"] == true)
+    if !settings.accounts.iter().all(|id| {
+        catalog["accounts"].as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|r| r["id"] == *id && r["configured"] == true)
+        })
     }) {
         return Err(bad_request(
-            "Select a configured Kaggle account from the imported profiles.",
+            "Enable configured accounts from the imported profiles.",
         ));
     }
     kaggle::save_settings(&settings)?;
     Ok(Json(payload(settings).await))
 }
-
 pub(crate) async fn preflight(Json(settings): Json<Settings>) -> ApiResult {
     settings.validate().map_err(bad_request)?;
-    let result = kaggle::call(
-        &settings,
-        json!({"action":"readiness", "account":settings.account}),
-        55,
-    )
-    .await
-    .map_err(bad_request)?;
+    let mut rows = Vec::new();
+    for account in &settings.accounts {
+        match kaggle::call(
+            &settings,
+            json!({"action":"readiness","account":account}),
+            55,
+        )
+        .await
+        {
+            Ok(value) => rows.push(value),
+            Err(error) => rows.push(
+                json!({"account":account,"readiness":"unavailable","error":error.to_string()}),
+            ),
+        }
+    }
+    Ok(Json(json!({"accounts":rows})))
+}
+pub(crate) async fn sessions() -> ApiResult {
+    let settings = kaggle::load_settings()?.unwrap_or_else(defaults);
     Ok(Json(
-        json!({"ready":result["readiness"] == "verified_idle", "readiness":result["readiness"], "activeSessions":result["active_session_count"], "observedAt":result["observed_at"]}),
+        kaggle::call(&settings, json!({"action":"sessions"}), 30)
+            .await
+            .map_err(bad_request)?,
     ))
 }
-
+pub(crate) async fn close_session(Json(value): Json<Value>) -> ApiResult {
+    let settings = kaggle::load_settings()?.unwrap_or_else(defaults);
+    Ok(Json(
+        kaggle::call(
+            &settings,
+            json!({"action":"close-session","sessionId":value["sessionId"]}),
+            30,
+        )
+        .await
+        .map_err(bad_request)?,
+    ))
+}
+pub(crate) async fn recover_cookie(Json(value): Json<Value>) -> ApiResult {
+    let settings = kaggle::load_settings()?.unwrap_or_else(defaults);
+    Ok(Json(
+        kaggle::call(
+            &settings,
+            json!({"action":"recover-cookie","account":value["account"]}),
+            240,
+        )
+        .await
+        .map_err(bad_request)?,
+    ))
+}
 pub(crate) fn summary() -> Value {
-    json!({
-        "id": "kaggle",
-        "configured": crate::downstream::kaggle::runtime::configured(),
-        "summary": crate::downstream::kaggle::runtime::load_settings().ok().flatten()
-            .filter(|s| s.validate().is_ok())
-            .map(|s| format!("{} · {} · {} min", s.account, s.accelerator, s.ttl_minutes))
-            .unwrap_or_else(|| "Connect the existing AI Scientist Kaggle runtime".into()),
-    })
+    json!({"id":"kaggle","configured":kaggle::configured(),"summary":kaggle::load_settings().ok().flatten().filter(|s|s.validate().is_ok()).map(|s|format!("{} accounts · {} · {} min",s.accounts.len(),s.accelerator,s.ttl_minutes)).unwrap_or_else(||"Configure the packaged Kaggle account pool".into())})
 }

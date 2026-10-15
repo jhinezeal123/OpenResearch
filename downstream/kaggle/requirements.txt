@@ -1,0 +1,14 @@
+certifi==2026.7.22
+cffi==2.1.1
+charset-normalizer==3.5.2
+cryptography==50.0.2
+idna==3.20
+kagglesdk==0.1.37
+protobuf==7.36.2
+pycparser==3.11
+requests==2.34.2
+urllib3==2.8.0
+patchright==1.63.0
+pyee==13.0.1
+greenlet==3.5.6
+typing-extensions==4.16.0

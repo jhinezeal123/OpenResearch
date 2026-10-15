@@ -1,0 +1,64 @@
+{
+  "source": {
+    "upstream": "https://github.com/jhinezeal123/kaggle_token",
+    "commit": "9bf4c85c8e060ebe022f285c1667a0edf5d4635f",
+    "copied_files": {
+      "account_store.py": "a1c5c76948909c406ac9090683b36543623141bbc5d0fce7e5c0273c1e4327f1",
+      "proxy.py": "4a6838658b242dd8d1fb06caa1c3623f6899530f530ea7a43108597c1cd7ccc3",
+      "proxy_control.py": "b7fe0de061b07e5c64998eec13b72241eb4ee89252ba894c66033bef69529459",
+      "web_session.py": "10014fe73ff7a9319c43567a227debab93a9ef4f9a09f7ba3e1e2f237bb47c55",
+      "auto_login/__init__.py": "5ab1f69d8dc90bfd33c5d54516116b1a6d981179a2b706e40df4ca1aab9cba5c",
+      "auto_login/web_session.py": "cf36eb073e68bcd60f0db7e94124eb41c8b6152ede385063ece15ae4dd990bac",
+      "auto_login/recovery.py": "fb8747d4c26ee40867abfde9e34da87d4014490a70f04f79275f0388cf67d519",
+      "interface_ai_scientist/__init__.py": "29bfd06dad2d07174d80d108b4d54c3cf28894aea2675416f83cc2878cfd9047",
+      "interface_ai_scientist/__main__.py": "ae0a12e517f2df2d7483f31118b89a2246c57d700e32d493fc1a71af31f0f335",
+      "interface_ai_scientist/bootstrap.py": "71fd1148da30256217c299350506328b2dc36ce8849d431c01a6bed6971e36b1",
+      "interface_ai_scientist/mcp_tools.py": "f6a621de95b8d55b2917ef92f394d409d56b85bca7d94ecf4480b0030bb3c529",
+      "interface_ai_scientist/session.py": "d8880eaf13c4ddfcd6c8375f698b80088b66ca15a086c70215f1e62f6ff39211",
+      "interface_ai_scientist/terminal_remote.py": "1cb98843ac3ddb18aa283c44064186ccf9d6741bd6a6b6af6b73daabdf0b832d"
+    },
+    "extracted_from": [
+      "interface_old/kaggle_pool.py: _IClient and _client_for",
+      "interface_old/kaggle_pool.py: selected quota parser, ListKernelSessions and GetKernel reference resolution adapted as account_admin",
+      "interface_old/workbench.py: workbench_account_idle validation",
+      "interface_old/sdk_client.py: pinned SDK version guard",
+      "interface_ai_scientist/mcp_tools.py: orchestration as bootstrap_service.start, registration removed"
+    ],
+    "adaptations": [
+      "Native CLI start/idle operations called by Workbench; no MCP registration or server",
+      "Independent proxy port 8013 with service-root identity",
+      "SDK endpoint uses bundled proxy",
+      "Cookie recovery imports slim account_runtime instead of old tool suite",
+      "Quote OpenSSH known-hosts path for bundle folders containing spaces",
+      "MVP3 copies all seven registered token/cookie profiles into ignored local bundle profiles",
+      "Noninteractive readiness action reports expired cookies without launching login",
+      "Readiness preserves active provider session identities for the two-session Workbench capacity gate; missing references remain counted",
+      "Parallel bootstrap processes atomically persist JSON and serialize shared Tailcat installation; session and request IDs remain independent",
+      "Workbench Settings owns account CRUD and explicit cookie check jobs; removal permanently deletes the bundled profile and its credential/registry entries",
+      "Proxy refreshes local token files after account additions, removals or rotations without a restart",
+      "SDK proxy, cookie API and native status reads record per-account aggregate payload bytes/attempt latency into ignored .runtime SQLite",
+      "Benchmark publication reuses selected profile tokens with KaggleHub GCS upload and pinned SDK public create, validates name availability before sessions/upload, and returns immutable public dataset receipts",
+      "Persistent Bash resets inherited errexit before each command so a nonzero exit can be reported without losing cwd/exports or replaying commands"
+    ]
+  },
+  "files": {
+    "account_store.py": "a1c5c76948909c406ac9090683b36543623141bbc5d0fce7e5c0273c1e4327f1",
+    "account_runtime.py": "967883b26a2d9d14718137610b272b583b23c0a2125f847f514babc02508cc40",
+    "account_admin.py": "1a09b9a584e21b9c6738e6666c9d99ec3b4286b54b5dc095371eb25bd595a04f",
+    "cookie_client.py": "9cf86ef122aa1a3d4db25a3f786c115ead608f6abb473cf94bd588ee54d1613f",
+    "provider_metrics.py": "e3097365d939a56fead7d05b9f01230bb27151a09cf23b1bb79e82b1af2301c0",
+    "proxy.py": "c879fc5e9f0677edd2269bbf7f2f96211943f73621bf1cc6ffc223b43820f186",
+    "proxy_control.py": "77bad3d14217f4a0b97a6e7ccf328e0ccf2f24d5d2382d80be5128378a6efc5a",
+    "sdk_version.py": "1bddd966d43ee8b84e1d7e81cf53bd2ab9c96526dad9c553ead12b6ca574c177",
+    "web_session.py": "10014fe73ff7a9319c43567a227debab93a9ef4f9a09f7ba3e1e2f237bb47c55",
+    "auto_login/__init__.py": "5ab1f69d8dc90bfd33c5d54516116b1a6d981179a2b706e40df4ca1aab9cba5c",
+    "auto_login/recovery.py": "6d152bca51fa6e515f1c57effb74f26a50821be9481246c9f292babf8ca2b0cd",
+    "auto_login/web_session.py": "6c9f06eb0e3837f57f6939d7429f4abe8a9609e9ce8b6f31109f2b95b411d60f",
+    "interface_ai_scientist/__init__.py": "29bfd06dad2d07174d80d108b4d54c3cf28894aea2675416f83cc2878cfd9047",
+    "interface_ai_scientist/bootstrap.py": "71fd1148da30256217c299350506328b2dc36ce8849d431c01a6bed6971e36b1",
+    "interface_ai_scientist/bootstrap_service.py": "0d571e65a4bb1dae8f6d06ec6a116da776062a44dfee684d986e1844a20a8690",
+    "interface_ai_scientist/session.py": "39a84cb1e536126aca6c80acced963512fa1d3438927d1a908d7ff533acb3d9a",
+    "interface_ai_scientist/terminal_remote.py": "f83af49100e55b08352a118e4e509c99f470023553da82f8892f2ad37a4b96a0"
+  },
+  "changes": "Private ORX_KAGGLE_HOME storage; lifecycle and transport owned by OpenResearch downstream."
+}

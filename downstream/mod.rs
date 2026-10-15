@@ -5,6 +5,7 @@ pub(crate) mod dsh {
 }
 pub(crate) mod kaggle {
     pub(crate) mod compute;
+    pub(crate) mod package;
     pub(crate) mod runtime;
     pub(crate) mod settings;
     pub(crate) mod supervisor;
@@ -32,6 +33,18 @@ pub(crate) fn routes() -> axum::Router<crate::commands::up::AppState> {
         .route(
             "/api/settings/kaggle/preflight",
             post(kaggle::settings::preflight),
+        )
+        .route(
+            "/api/settings/kaggle/sessions",
+            get(kaggle::settings::sessions),
+        )
+        .route(
+            "/api/settings/kaggle/close-session",
+            post(kaggle::settings::close_session),
+        )
+        .route(
+            "/api/settings/kaggle/recover-cookie",
+            post(kaggle::settings::recover_cookie),
         )
 }
 

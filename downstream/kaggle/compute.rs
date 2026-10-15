@@ -24,7 +24,7 @@ impl ComputeBackend for KaggleCompute {
     }
 
     async fn preflight(&self, args: &crate::downstream::bridge::ExpRunArgs) -> Result<Preflight> {
-        let launch = crate::downstream::kaggle::runtime::Launch::resolve(
+        let _launch = crate::downstream::kaggle::runtime::Launch::resolve(
             args,
             &uuid::Uuid::nil().to_string(),
             "",
@@ -32,17 +32,6 @@ impl ComputeBackend for KaggleCompute {
         if args.image.is_some() {
             return Err(anyhow!(
                 "Kaggle uses its notebook image; --image is not supported."
-            ));
-        }
-        let check = crate::downstream::kaggle::runtime::call(
-            &launch.runtime,
-            serde_json::json!({"action":"readiness", "account":launch.account}),
-            55,
-        )
-        .await?;
-        if check["readiness"] != "verified_idle" {
-            return Ok(not_ready(
-                "Kaggle account must be signed in and idle. Check Kaggle compute settings.",
             ));
         }
         ready()
@@ -67,7 +56,7 @@ impl ComputeBackend for KaggleCompute {
             crate::downstream::kaggle::runtime::Launch::resolve(args, &run_id, &run.command)?;
         launch.save()?;
         let mut descriptor = BackendDescriptor::parse(&run.backend_json)?;
-        descriptor.namespace = Some(launch.account.clone());
+        descriptor.namespace = None;
         descriptor.job_id = Some(uuid::Uuid::parse_str(&run_id)?.simple().to_string());
         descriptor.flavor = Some(launch.accelerator.clone());
         descriptor.timeout_secs = Some(launch.ttl_seconds);
