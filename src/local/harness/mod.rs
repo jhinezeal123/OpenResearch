@@ -22,6 +22,7 @@ pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod cursor;
 mod detect;
+pub(crate) mod dsh;
 pub(crate) mod opencode;
 mod options;
 mod plan_gate;
@@ -526,6 +527,7 @@ pub fn registry() -> Vec<Box<dyn Harness>> {
         Box::new(opencode::OpenCode),
         Box::new(cursor::Cursor),
         Box::new(antigravity::Antigravity),
+        Box::new(dsh::Dsh),
     ]
 }
 

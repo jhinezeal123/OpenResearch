@@ -5,6 +5,9 @@ import type { HarnessId } from "../api";
 
 export function HarnessLogo({ harness, size = 16 }: { harness: HarnessId; size?: number }) {
   const cls = "block shrink-0";
+  if (harness === "dsh") {
+    return <svg className={cls} width={size} height={size} viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M4 4h7a8 8 0 0 1 0 16H4V4Zm4 4v8h3a4 4 0 0 0 0-8H8Z" /></svg>;
+  }
   if (harness === "claude-code") {
     return (
       <svg className={cls} width={size} height={size} viewBox="0 0 24 24" fill="#d97757" aria-hidden="true">

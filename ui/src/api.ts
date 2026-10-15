@@ -1525,7 +1525,7 @@ export const reportLocale = (locale: string, signal?: AbortSignal) =>
     body: JSON.stringify({ locale }),
   }).then((r) => json<{ locale: string }>(r));
 
-export type HarnessId = "claude-code" | "codex" | "opencode" | "cursor" | "antigravity";
+export type HarnessId = "claude-code" | "codex" | "opencode" | "cursor" | "antigravity" | "dsh";
 
 export interface HarnessModel {
   id: string;
