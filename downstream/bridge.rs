@@ -25,12 +25,13 @@ pub(crate) mod api {
 }
 pub(crate) mod harness {
     pub(crate) use crate::local::chat::{
-        harness_log, prepare_env, set_chat_session_env, DeliveryState, PermissionDecision,
-        PromptAnswer, ResumeCtx, TurnCtx, WirePart, WirePrompt,
+        harness_log, prepare_env, set_chat_session_env, ContextUsage, DeliveryState,
+        PermissionDecision, PromptAnswer, ResumeCtx, TurnCtx, WirePart, WirePrompt,
     };
     pub(crate) use crate::local::harness::{
-        Harness, HarnessAuthState, HarnessInfo, HarnessOptions, ModelInfo, OptionChoice,
-        PermissionMode, ResumeAction, TurnFailure, TurnOutcome, TurnResult, TURN_WATCHDOG,
+        CompactCtx, CompactOutcome, Harness, HarnessAuthState, HarnessInfo, HarnessOptions,
+        ModelInfo, OptionChoice, PermissionMode, ResumeAction, TurnFailure, TurnOutcome,
+        TurnResult, TURN_WATCHDOG,
     };
     pub(crate) use crate::local::opencode::{ensure_playbook, PLAYBOOK_REL};
 }

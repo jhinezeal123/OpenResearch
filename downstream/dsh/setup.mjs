@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { configureFullAccess } from './configure-access.mjs';
 
 const [entry, dataDir, sourceHome = path.join(os.homedir(), '.dsh')] = process.argv.slice(2);
 if (!entry || !dataDir || !existsSync(entry)) {
@@ -37,6 +38,7 @@ overlay.contents.add(overlay.createNode({
   id: 'acp', config: { provider: selection.provider, model: selection.model },
 }));
 writeFileSync(path.join(profile, 'cordis.patch.yml'), overlay.toString(), { mode: 0o600 });
+configureFullAccess(profile, YAML);
 const credentials = YAML.parse(readFileSync(path.join(sourceHome, '.credentials.yaml'), 'utf8'));
 const serialized = overlay.toString();
 const refs = Object.fromEntries(

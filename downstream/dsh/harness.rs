@@ -13,12 +13,13 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use crate::downstream::bridge::error::{anyhow, Result};
 use crate::downstream::bridge::harness::{ensure_playbook, PLAYBOOK_REL};
 use crate::downstream::bridge::harness::{
-    harness_log, prepare_env, set_chat_session_env, DeliveryState, PermissionDecision,
-    PromptAnswer, ResumeCtx, TurnCtx, WirePart, WirePrompt,
+    harness_log, prepare_env, set_chat_session_env, ContextUsage, DeliveryState,
+    PermissionDecision, PromptAnswer, ResumeCtx, TurnCtx, WirePart, WirePrompt,
 };
 use crate::downstream::bridge::harness::{
-    Harness, HarnessAuthState, HarnessInfo, HarnessOptions, ModelInfo, OptionChoice,
-    PermissionMode, ResumeAction, TurnFailure, TurnOutcome, TurnResult, TURN_WATCHDOG,
+    CompactCtx, CompactOutcome, Harness, HarnessAuthState, HarnessInfo, HarnessOptions, ModelInfo,
+    OptionChoice, PermissionMode, ResumeAction, TurnFailure, TurnOutcome, TurnResult,
+    TURN_WATCHDOG,
 };
 
 pub struct Dsh;
@@ -70,11 +71,8 @@ impl Harness for Dsh {
     }
     fn options(&self) -> HarnessOptions {
         let mut options = HarnessOptions::none();
-        options.permission_modes = vec![
-            OptionChoice::new("ask", "Ask for approval"),
-            OptionChoice::new("bypass", "Bypass permissions"),
-        ];
-        options.default_permission_mode = Some("ask");
+        options.permission_modes = vec![OptionChoice::new("bypass", "Full access")];
+        options.default_permission_mode = Some("bypass");
         options
     }
     async fn detect_snapshot(&self) -> Option<HarnessInfo> {
@@ -122,6 +120,14 @@ impl Harness for Dsh {
             .await
             .map(|()| TurnOutcome::Completed)
             .map_err(|error| TurnFailure::adapter(error, ctx.delivery_state()))
+    }
+    async fn compact(&self, ctx: &CompactCtx) -> Result<CompactOutcome> {
+        let sid = ctx
+            .native_session_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("DSH has no native session to compact; send a message first"))?;
+        native_compact(sid, ctx.model.as_deref()).await?;
+        Ok(CompactOutcome::Native)
     }
     async fn resume_from_prompt(
         &self,
@@ -592,14 +598,110 @@ fn apply_update(ctx: &mut TurnCtx, update: &Value) {
                 ctx.upsert_part(part);
             }
         }
+        "usage_update" => {
+            if let Some(usage) = context_usage(update) {
+                ctx.report_usage(usage);
+            }
+        }
         _ => {}
     }
     ctx.maybe_flush();
 }
 
+fn context_usage(update: &Value) -> Option<ContextUsage> {
+    Some(ContextUsage {
+        used_tokens: update["used"].as_u64()?,
+        context_window: update["size"].as_u64().filter(|size| *size > 0),
+    })
+}
+
+/// ACP intentionally omits command dispatch. Boot the same profile with its
+/// transport disabled and invoke DSH's public command registry on the native
+/// persisted session. No model prompt, transcript reseed or provider client.
+async fn native_compact(sid: &str, model: Option<&str>) -> Result<()> {
+    let config = launch()?;
+    let entry = config
+        .args
+        .first()
+        .ok_or_else(|| anyhow!("DSH entrypoint is missing"))?;
+    let root = crate::downstream::bridge::store::data_dir()
+        .join("agents/dsh/control")
+        .join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&root)?;
+    let files = CompactFiles(root);
+    let script = files.0.join("native-compact.mjs");
+    let overlay = files.0.join("compact.patch.yml");
+    std::fs::write(&script, include_str!("native-compact.mjs"))?;
+    std::fs::write(
+        &overlay,
+        "- id: acp\n  disabled: true\n- id: acp-app-startup\n  disabled: true\n",
+    )?;
+    let mut cmd = Command::new(&config.executable);
+    cmd.arg(&script)
+        .arg(entry)
+        .arg(&overlay)
+        .arg(sid)
+        .arg(model.unwrap_or(""))
+        .current_dir(&files.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(harness_log("dsh")?))
+        .kill_on_drop(true);
+    prepare_env(&mut cmd);
+    cmd.env("DSH_HOME", &config.home).env("NO_COLOR", "1");
+    #[cfg(windows)]
+    cmd.creation_flags(0x08000000);
+    let output = tokio::time::timeout(Duration::from_secs(300), cmd.output())
+        .await
+        .map_err(|_| anyhow!("DSH native /compact timed out"))??;
+    let reply: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| anyhow!("DSH native /compact returned invalid output; see agent-dsh.log"))?;
+    if !output.status.success() || reply["ok"] != true {
+        return Err(anyhow!(
+            "DSH native /compact: {}",
+            reply["error"]
+                .as_str()
+                .unwrap_or("failed; see agent-dsh.log")
+        ));
+    }
+    Ok(())
+}
+
+/// Only the newly created control request directory is owned by this guard.
+struct CompactFiles(PathBuf);
+impl Drop for CompactFiles {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn acp_usage_preserves_native_capacity_and_does_not_accumulate() {
+        assert_eq!(
+            context_usage(&json!({"used":12345,"size":1000000})),
+            Some(ContextUsage {
+                used_tokens: 12345,
+                context_window: Some(1000000),
+            })
+        );
+        assert_eq!(
+            context_usage(&json!({"used":99,"size":1000000}))
+                .unwrap()
+                .used_tokens,
+            99
+        );
+        assert!(context_usage(&json!({"used":-1,"size":1000000})).is_none());
+        assert!(context_usage(&json!({"size":1000000})).is_none());
+        assert_eq!(
+            context_usage(&json!({"used":0,"size":0}))
+                .unwrap()
+                .context_window,
+            None
+        );
+    }
     #[test]
     fn grouped_catalog_and_exact_model_efforts() {
         let session = json!({"configOptions":[{"id":"model","options":[{"group":"Provider","options":[{"value":"[\"p\",\"m\"]","name":"Model"}]}]},{"id":"reasoning_effort","options":[{"value":"high","name":"High"}]}]});

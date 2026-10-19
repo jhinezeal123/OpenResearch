@@ -23,8 +23,9 @@ DSH in Settings → Harnesses.
 The script imports only provider/default-model entries and their credential
 references into `<data>/agents/dsh`, and writes `<data>/dsh.json`. No secrets
 belong in Git. Existing DSH profiles are not changed. Re-run the command after
-changing providers in the source profile. No runtime is downloaded by detection
-or by a chat turn.
+changing providers in the source profile, and after upgrading OpenResearch so
+the generated profile picks up adapter plugins such as `orx-full-access.mjs`.
+No runtime is downloaded by detection or by a chat turn.
 
 ## Model and reasoning selection
 
@@ -47,8 +48,19 @@ credentials are not configured. A real chat verifies access to that route.
 - Model and effort are selected before the prompt is sent. Unsupported values
   fail before inference rather than silently falling back.
 - ACP text, reasoning and tool events become standard OpenResearch wire parts.
-- DSH permission requests use OpenResearch's existing approval cards. Catalog
-  probes deny permissions. The default is Ask for approval.
+- ACP `usage_update` supplies the current token count and model context capacity
+  to the shared context meter. These values come from DSH, not a guessed catalog.
+- The shared **Compact** control invokes DSH's installed `/compact` command via
+  its public profile/command APIs. ACP itself exposes no command dispatch, so a
+  short-lived Node child boots the same ACP profile with only its ACP transport
+  disabled, resumes the same native session, executes the native command, flushes
+  persistence and disposes. It does not send `/compact` as a model prompt or
+  replace the session with a separately summarized transcript. Automatic native
+  compaction remains owned by DSH.
+- This downstream adapter runs with the native DSH `danger-full-access` preset:
+  no file sandbox and no approval prompts. The profile plugin applies the preset
+  to new and resumed agents, including native children. Catalog probes still
+  never submit model prompts and deny any unexpected permission requests.
 - This adapter does not advertise Plan mode, steering, image attachments or
   one-shot title generation. Native DSH text/file tools remain available.
 - Protocol errors and incomplete turns remain visible; the adapter does not
@@ -56,6 +68,23 @@ credentials are not configured. A real chat verifies access to that route.
 
 The adapter is registered in `src/local/harness/mod.rs`. Settings and the model
 picker discover it through that registry, alongside the upstream harnesses.
+
+## Windows terminal troubleshooting
+
+The adapter's full-access profile does not invoke the Windows file sandbox,
+so `orx` can reach its shared store, Git metadata and project artifacts outside
+the worktree. The following diagnosis applies only to a custom restricted DSH
+profile with the full-access plugin removed.
+
+`pwsh` is a native DSH tool, not a client-terminal ACP capability. A
+`SetNamedSecurityInfoW ... grantWrite` failure happens before the shell starts:
+DSH cannot provision the Windows sandbox for that worktree. Modify permission
+alone is insufficient; the sandbox also needs effective `WRITE_DAC` and
+`WRITE_OWNER`. Keep sandbox confinement enabled and use the installed DSH
+`dsh-sandbox-windows-acl/assets/diagnose-windows-sandbox-acl` skill's bundled
+repair command after user approval. Bound `AllowRoot` to the OpenResearch
+worktrees directory and keep its recovery files outside the worktrees. Repeat
+the original command confined afterwards. Do not silently switch to full access.
 
 ## Local verification (2026-10-15)
 
