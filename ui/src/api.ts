@@ -321,6 +321,7 @@ export const searchPapers = (q: string, signal?: AbortSignal) =>
 /** The signed-in GitHub login, for naming the account a new repo lands on.
  * `login` is null when there's no usable token. */
 export const githubAccount = (signal?: AbortSignal) => get<{ login: string | null }>("/api/github/account", signal);
+export const githubOrganizations = (signal?: AbortSignal) => get<{ organizations: string[] }>("/api/github/organizations", signal);
 
 export const githubProjectRepoPreview = (name: string, signal?: AbortSignal) =>
   get<{ repo: string }>(`/api/github/project-repo-preview?name=${encodeURIComponent(name)}`, signal);
@@ -941,6 +942,8 @@ export const saveModalToken = (tokenId: string, tokenSecret: string) =>
 export interface EnvVar {
   key: string;
   maskedValue: string;
+  /** Set only for non-secret keys, which are shown and edited in the clear. */
+  value?: string | null;
   inProcessEnv: boolean;
 }
 
@@ -1179,6 +1182,31 @@ export interface RayPreflight {
 /** Live-test a Ray Jobs / Dashboard endpoint. */
 export const rayPreflight = (address?: string) =>
   post<RayPreflight>("/api/settings/ray/preflight", { address: address ?? null });
+
+export interface TrackioSettings {
+  serverUrl: string | null;
+  project: string | null;
+}
+
+export const getTrackioSettings = (signal?: AbortSignal) =>
+  get<TrackioSettings>("/api/settings/trackio", signal);
+
+export interface TrackioPreflight {
+  reachable: boolean;
+  version: string | null;
+  writeAccess: boolean | null;
+  error: string | null;
+}
+
+export const trackioPreflight = () => post<TrackioPreflight>("/api/settings/trackio/preflight", {});
+
+/** The run on the saved Trackio dashboard; hf runs never receive the Trackio variables. */
+export function trackioRunUrl(settings: TrackioSettings | undefined, run: Pick<Run, "id" | "backend">) {
+  if (!settings?.serverUrl || backendKind(run.backend) === "hf_job") return null;
+  if (!settings.project) return settings.serverUrl;
+  const query = new URLSearchParams({ project: settings.project, runs: run.id });
+  return `${settings.serverUrl}/?${query}`;
+}
 
 // --- settings: compute targets (unified list + default) ------------------------
 
@@ -1470,8 +1498,10 @@ export const getProjectGitStatus = (projectId: string, signal?: AbortSignal) =>
 export const initializeProjectGit = (projectId: string) =>
   post<ProjectGitStatus>(`/api/projects/${projectId}/git/init`);
 
-export const enableProjectGithub = (projectId: string) =>
-  post<{ project: Project; git: ProjectGitStatus }>(`/api/projects/${projectId}/github`);
+export const enableProjectGithub = (projectId: string, organization?: string) =>
+  post<{ project: Project; git: ProjectGitStatus }>(`/api/projects/${projectId}/github`, {
+    ...(organization ? { organization } : {}),
+  });
 
 export const disableProjectGithub = (projectId: string) =>
   post<{ project: Project; git: ProjectGitStatus }>(`/api/projects/${projectId}/github/disable`);
@@ -1527,7 +1557,14 @@ export const reportLocale = (locale: string, signal?: AbortSignal) =>
     body: JSON.stringify({ locale }),
   }).then((r) => json<{ locale: string }>(r));
 
-export type HarnessId = "claude-code" | "codex" | "opencode" | "cursor" | "antigravity" | import("../../downstream/catalog").HarnessId;
+export type HarnessId =
+  | "claude-code"
+  | "codex"
+  | "opencode"
+  | "cursor"
+  | "antigravity"
+  | `acp:${string}`
+  | import("../../downstream/catalog").HarnessId;
 
 export interface HarnessModel {
   id: string;
@@ -1558,6 +1595,7 @@ export interface HarnessModel {
 /** Display label for a harness model: the catalog's own name when it has one,
  * else prettified from the id. */
 export function harnessModelLabel(model: HarnessModel): string {
+  if (model.id === "default" && !model.displayName) return m.model_picker_default_model();
   if (!model.id.startsWith("orx-local-")) return model.displayName ?? modelLabel(model.id);
   const provider = model.displayName?.split(" · ").slice(1).join(" · ").replace(/ \(local\)$/, "");
   const endpoint = provider === "OpenAI-compatible server" || provider === "Custom endpoint" || provider === "Custom Endpoint"
@@ -1705,6 +1743,11 @@ export interface Harness {
   plan?: string;
   agentReady: boolean;
   agentNote?: string;
+  setupUrl?: string;
+  authEnvKey?: string;
+  needsConnectionAdapter?: boolean;
+  adapterMissing?: boolean;
+  logo?: string;
   /** Setup is blocked by something no install/update/login command repairs —
    * an environment credential overriding the saved login, a database the CLI
    * will not open. `agentNote` carries the repair; offer no setup button. */
@@ -1741,6 +1784,23 @@ export const getHarnesses = (refresh = false, retryRejected = false, signal?: Ab
   const query = params.size > 0 ? `?${params.toString()}` : "";
   return get<{ harnesses: Harness[] }>(`/api/harnesses${query}`, signal).then((r) => r.harnesses);
 };
+
+export interface AcpDefinition {
+  id: `acp:${string}`;
+  name: string;
+  executable: string;
+  arguments: string[];
+}
+
+export const listAcpHarnesses = () => get<AcpDefinition[]>("/api/harnesses/acp");
+export interface AcpPreset extends AcpDefinition { setupUrl: string; needsConnectionAdapter: boolean }
+export const listAcpPresets = () => get<AcpPreset[]>("/api/harnesses/acp/presets");
+export const saveAcpHarness = (definition: Omit<AcpDefinition, "id">, id?: string) => id
+  ? put<AcpDefinition>(`/api/harnesses/acp/${encodeURIComponent(id)}`, definition)
+  : post<AcpDefinition>("/api/harnesses/acp", definition);
+export const removeAcpHarness = (id: string) => writeResponse(`/api/harnesses/acp/${encodeURIComponent(id)}`, { method: "DELETE" }).then((response) => json<{ ok: boolean }>(response));
+export const testAcpHarness = (definition: Omit<AcpDefinition, "id">) => post<{ status: string; agentInfo?: { version?: string } }>("/api/harnesses/acp/test", definition);
+export const setChatConfiguration = (sessionId: string, optionId: string, value: string) => post<ChatSession>(`/api/chat/sessions/${sessionId}/configuration`, { optionId, value });
 
 /** Slash-skill offered in the composer's `/` dropdown; expanded server-side. */
 export interface SkillInfo {
@@ -1859,6 +1919,7 @@ export interface ChatQuestionOption {
 
 /** An interactive request the user acts on before the harness continues. */
 export interface ChatPrompt {
+  nativeChoices?: { id: string; label: string; kind: string }[];
   kind: "plan" | "permission" | "question";
   resolved: boolean;
   plan?: string;
@@ -1916,9 +1977,12 @@ export interface ContextUsage {
 }
 
 export interface ChatSession {
+  awaitingInput?: boolean;
   id: string;
   projectId: string;
   harness: HarnessId;
+  harnessName?: string | null;
+  nativeConfiguration?: unknown;
   title: string | null;
   /** Who wrote `title`: `"fallback"` (first-line placeholder), `"generated"`
    * (harness auto-title), `"user"` (explicitly chosen — a rename, or an agent's
