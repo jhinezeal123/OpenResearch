@@ -4,7 +4,6 @@ Runtime state and generated notebook contain ephemeral keys. Keep state private;
 the Kaggle notebook is private. No Codex credential goes to Kaggle.
 """
 
-import argparse
 from contextlib import contextmanager
 import base64
 from datetime import datetime, timezone
@@ -16,7 +15,6 @@ from pathlib import Path
 import re
 import shlex
 import shutil
-import socket
 import subprocess
 import sys
 import time
@@ -157,6 +155,12 @@ def prepare(args):
     if not re.fullmatch('[0-9a-f]{32}', run_id):
         raise ValueError('Expected a UUID request ID')
     root = args.state_root / run_id
+    # Callers hold request_lock and only prepare when state.json is absent, so a
+    # leftover folder is an earlier attempt that failed before submission.
+    if root.exists():
+        if (root / 'submit-intent.json').exists() or (root / 'state.json').exists():
+            raise RuntimeError('This request already has saved state; reconnect instead')
+        shutil.rmtree(root)
     root.mkdir(parents=True)
     # Two first runs may need the same bundled binary. Serialize installation
     # across CLI processes without serializing their sessions or agent work.
@@ -212,16 +216,6 @@ def prepare(args):
     save(args.state_root / "latest.json", {"state": str(root / "state.json")})
     write_ssh_config(state)
     return state
-
-
-def selected_state(args):
-    path = args.state or Path(load(args.state_root / "latest.json")["state"])
-    state = load(path)
-    if not re.fullmatch(r"tc[A-Za-z0-9_-]{40,}", state["address"]):
-        raise ValueError("Invalid Tailcat address")
-    return state
-
-
 
 
 def client(state):
@@ -355,40 +349,11 @@ def connect(state, wait_seconds=240):
     raise TimeoutError("SSH bootstrap not ready; reconnect to this session without submitting again")
 
 
-def copy(state, source, destination):
-    result = subprocess.run([shutil.which("scp") or "scp", *ssh_options(state), source, destination],
-                            cwd=state["root"], capture_output=True, timeout=45)
-    if result.returncode:
-        raise RuntimeError("SFTP copy failed: " + result.stderr.decode("utf-8", "replace").replace(state["address"], "<tailcat-address>"))
-
-
-
-
 def stop(state):
     result, elapsed = remote(state, "touch " + shlex.quote(state["remote_root"] + "/STOP"), record="stop.json")
     if result.returncode:
         raise RuntimeError("SSH stop failed; notebook still has bounded TTL")
     print(json.dumps({"stop_requested_over_ssh": True, "elapsed_sec": elapsed}))
-
-
-def shell(state):
-    command = "cd " + shlex.quote(state["remote_root"]) + " && exec bash --noprofile --norc"
-    result = subprocess.run([shutil.which("ssh") or "ssh", *ssh_options(state), "-q", "-tt",
-                             state["address"], notebook_environment_command(command)])
-    raise SystemExit(result.returncode)
-
-
-def bridge(state, branch=None):
-    """Keep one native SSH connection for the backend's terminal protocol."""
-    source = Path(__file__).with_name('terminal_remote.py').read_text(encoding='utf-8')
-    if branch is not None and not re.fullmatch(r'[a-f0-9]{32}', branch):
-        raise ValueError('Invalid experiment branch')
-    source += '\nserve(' + repr(state['remote_root']) + ', branch=' + repr(branch) + ')\n'
-    encoded = base64.b64encode(source.encode('utf-8')).decode('ascii')
-    command = 'python3 -u -c ' + shlex.quote('import base64;exec(base64.b64decode(' + repr(encoded) + '))')
-    result = subprocess.run([shutil.which('ssh') or 'ssh', *ssh_options(state), '-T',
-                             state['address'], notebook_environment_command(command)])
-    raise SystemExit(result.returncode)
 
 
 def status(state):
@@ -419,19 +384,6 @@ def notebook_status(account, kernel_ref, session_id=None):
     return {'session_id': session_id, 'notebook_ref': kernel_ref,
             'status': current, 'stopped': current in {'complete', 'completed', 'error', 'cancelled', 'canceled'},
             'observed_at': datetime.now(timezone.utc).isoformat()}
-
-
-def network(state):
-    result = subprocess.run([state["tailcat"], "ping", "--until-direct", "--timeout=10s", state["address"]],
-                            capture_output=True, text=True, timeout=20)
-    evidence = {"direct_path_established": result.returncode == 0,
-                "stdout": result.stdout, "stderr": result.stderr.replace(state["address"], "<tailcat-address>")}
-    save(Path(state["root"]) / "network.json", evidence)
-    print(json.dumps(evidence))
-
-
-
-
 
 
 def write_ssh_config(state):
@@ -477,86 +429,3 @@ def state_for(session_id, state_root=None):
     if state['run_id'] != session_id:
         raise ValueError('Saved SSH session identity mismatch')
     return state
-
-
-def main():
-    parser = argparse.ArgumentParser(description='Kaggle SDK bootstrap and Tailcat SSH')
-    parser.add_argument('action', choices=('start', 'idle', 'readiness', 'account-overview', 'cookie-check', 'account-add', 'account-remove', 'benchmark-name', 'benchmark-publish', 'prepare', 'push', 'connect', 'ssh', 'shell', 'bridge', 'status', 'inspect', 'stop', 'network'))
-    parser.add_argument('--account')
-    parser.add_argument('--config', type=Path)
-    parser.add_argument('--state-root', type=Path, default=DEFAULT_STATE)
-    parser.add_argument('--state', type=Path)
-    parser.add_argument('--session')
-    parser.add_argument('--kernel-ref')
-    parser.add_argument('--branch')
-    parser.add_argument('--ttl', type=int, default=480)
-    parser.add_argument('--accelerator', type=accelerator_name, choices=ACCELERATORS, default='cpu',
-                        help='GPU/gpu/NvidiaT4 select T4 x2; TPU/tpu selects TPU v5e-8')
-    parser.add_argument('--wait-seconds', type=int, default=240)
-    parser.add_argument('--competition-source', dest='competition_sources', action='append', default=[])
-    parser.add_argument('--dataset-source', dest='dataset_sources', action='append', default=[])
-    parser.add_argument('--command', default='pwd')
-    args = parser.parse_args()
-    args.state_root = args.state_root.resolve()
-    if args.ttl < 60:
-        parser.error('Choose a bootstrap TTL of at least 60 seconds')
-    if args.wait_seconds < 1:
-        parser.error('SSH wait must be a positive number of seconds')
-    if args.action in {'account-overview', 'cookie-check', 'account-add', 'account-remove'}:
-        from account_admin import dispatch
-        arguments = json.load(sys.stdin) if args.action == 'account-add' else None
-        print(json.dumps(dispatch(args.action, args.account, arguments), ensure_ascii=False))
-        return
-    if args.action in {'benchmark-name', 'benchmark-publish'}:
-        from benchmark_publish import check_name, publish
-        operation = check_name if args.action == 'benchmark-name' else publish
-        print(json.dumps(operation(args.account, json.load(sys.stdin)), ensure_ascii=False))
-        return
-    if args.action == 'start':
-        from .bootstrap_service import start
-        arguments = json.load(sys.stdin)
-        if not isinstance(arguments, dict) or arguments.get('account') != args.account:
-            parser.error('Bootstrap account must match the selected account')
-        print(json.dumps(start(**arguments), ensure_ascii=False))
-        return
-    if args.action == 'idle':
-        from account_runtime import account_idle
-        print(json.dumps(account_idle(args.account), ensure_ascii=False))
-        return
-    if args.action == 'readiness':
-        from account_runtime import account_readiness
-        print(json.dumps(account_readiness(args.account), ensure_ascii=False))
-        return
-    if args.action == 'prepare':
-        state = prepare(args)
-        print(json.dumps(descriptor(state), ensure_ascii=False))
-        return
-    if args.action == 'inspect':
-        print(json.dumps(notebook_status(args.account, args.kernel_ref)))
-        return
-    if args.session and args.action in {'stop', 'status'}:
-        print(json.dumps(control(args.action, args.session, args.account)))
-        return
-    state = state_for(args.session, args.state_root) if args.session else selected_state(args)
-    if args.action == 'ssh':
-        result, _ = remote(state, args.command, wait=60)
-        print(result.stdout.decode('utf-8', 'replace'), end='')
-        print(result.stderr.decode('utf-8', 'replace').replace(state['address'], '<tailcat-address>'), end='')
-        raise SystemExit(result.returncode)
-    if args.action == 'push':
-        push(state)
-        print(json.dumps(descriptor(load(Path(state['root']) / 'state.json')), ensure_ascii=False))
-        return
-    if args.action == 'connect':
-        readiness = connect(state, args.wait_seconds)
-        print(json.dumps({**descriptor(state), **readiness}, ensure_ascii=False))
-        return
-    if args.action == 'status':
-        print(json.dumps(status(state)))
-        return
-    if args.branch and args.action != 'bridge':
-        parser.error('Branch is only available for an existing SSH bridge')
-    if args.action == 'bridge':
-        bridge(state, args.branch)
-    else:
-        globals()[args.action](state)

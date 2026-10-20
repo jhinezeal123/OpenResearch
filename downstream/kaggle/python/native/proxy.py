@@ -94,9 +94,7 @@ class _UpstreamPool:
         Conn được release vào pool (hoặc đóng nếu stale)."""
         # Saving a notebook can launch a paid/quota-consuming session. A lost
         # response does not prove rejection: never replay that POST in the pool.
-        save = method == 'POST' and urllib.parse.urlsplit(path).path in {
-            '/api/v1/kernels.KernelsApiService/SaveKernel', '/api/v1/kernels/push',
-            '/v1/kernels.KernelsApiService/SaveKernel'}
+        save = is_save(method, path)
         attempts = 1 if save else 2
         for attempt in range(attempts):
             # Avoid stale idle connections for the single allowed save attempt.
@@ -133,17 +131,32 @@ class _UpstreamPool:
 
 POOL = _UpstreamPool(UPSTREAM)
 
+
+def is_save(method, path):
+    return method == 'POST' and urllib.parse.urlsplit(path).path in {
+        '/api/v1/kernels.KernelsApiService/SaveKernel', '/api/v1/kernels/push',
+        '/v1/kernels.KernelsApiService/SaveKernel'}
+
+
+def enabled_accounts():
+    """Accounts enabled in OpenResearch's Kaggle settings, or None outside OpenResearch.
+
+    The settings file sits beside ORX_KAGGLE_HOME. Profiles imported but not enabled
+    there must never lend their token to a pooled request."""
+    home = os.environ.get('ORX_KAGGLE_HOME')
+    if not home:
+        return None
+    try:
+        import json
+        with open(os.path.join(os.path.dirname(home), 'kaggle.json'), encoding='utf-8') as f:
+            accounts = json.load(f).get('accounts')
+    except (OSError, ValueError):
+        return set()
+    return set(accounts) if isinstance(accounts, list) else set()
+
 # tokens: [name, token, n_requests, blocked_until]
 tokens = []
 token_errors = []
-for f, token_path in account_store.token_files():
-    try:
-        t = token_path.read_text(encoding='utf-8-sig').strip()
-    except OSError:
-        token_errors.append(f + ' (unreadable profile token)')
-        continue
-    if t.startswith('KGAT_'):
-        tokens.append([f, t, 0, 0.0])
 
 def pick_token(pool=None):
     now = time.time()
@@ -161,8 +174,10 @@ def refresh_tokens():
     """Pick up account additions/removals and token rotation without restarting."""
     global tokens, token_errors, _token_signature
     with _token_lock:
-        paths = list(account_store.token_files())
-        signature = []
+        allowed = enabled_accounts()
+        paths = [(name, path) for name, path in account_store.token_files()
+                 if allowed is None or name in allowed]
+        signature = [tuple(sorted(allowed)) if allowed is not None else None]
         for name, path in paths:
             try:
                 info = path.stat()
@@ -251,13 +266,12 @@ class H(http.server.BaseHTTPRequestHandler):
                 self._log('%s %s -> %d (token %s, %d reqs%s)' %
                           (self.command, self.path, status, tk[0], tk[2], ', reuse' if reused else ''))
                 return
-            except urllib.error.URLError as ex:
-                self._log('UPSTREAM FAIL %s: %s' % (tk[0], ex))
-                last_err = (502, ('upstream fail (token %s): %s' % (tk[0], ex)).encode('utf-8', 'replace'))
-                continue
             except Exception as ex:
                 self._log('UPSTREAM FAIL %s: %s' % (tk[0], ex))
                 last_err = (502, ('upstream fail (token %s): %s' % (tk[0], ex)).encode('utf-8', 'replace'))
+                if is_save(self.command, self.path):
+                    # The save may have reached Kaggle; another account must not repeat it.
+                    break
                 continue
         code, body = last_err if last_err else (502, b'no token available')
         self._respond_err(code, body)
@@ -300,6 +314,7 @@ class H(http.server.BaseHTTPRequestHandler):
 
 def main():
     srv = http.server.ThreadingHTTPServer(('127.0.0.1', PORT), H)
+    refresh_tokens()
     print('kaggle-proxy: http://127.0.0.1:%d  tokens=%d -> %s (upstream keep-alive pool)' % (PORT, len(tokens), UPSTREAM), flush=True)
     srv.serve_forever()
     return 0

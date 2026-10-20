@@ -68,11 +68,14 @@ def dispatch(r):
         seconds=max(1,int(r['seconds']))
         script='''#!/bin/bash
 cd "$(dirname "$0")"
-trap 'code=$?; echo "$code" > exit_code' EXIT
+trap 'code=$?; echo "$code" > exit_code; trap - TERM; kill -KILL 0' EXIT
 cd repo || exit 97
 '''+f'exec_env_placeholder\ntimeout --foreground --signal=TERM --kill-after=5s {seconds}s bash -c '+shlex.quote(r['command'])+'\n'
         exports='\n'.join('export '+k+'='+shlex.quote(v) for k,v in r.get('env',{}).items() if re.fullmatch('[A-Za-z_][A-Za-z0-9_]*',k))
-        # exit_code lives beside the run log, independent of command cwd.
+        # exit_code lives beside the run log, independent of command cwd. run.sh
+        # leads its own session, so the EXIT trap's `kill 0` also reaps anything the
+        # command left behind (timeout --foreground signals only its direct child),
+        # keeping GPU memory free for the next Run on this reused notebook.
         script=script.replace("echo \"$code\" > exit_code",'echo "$code" > '+shlex.quote(str(directory/'exit_code'))).replace('exec_env_placeholder',exports)
         (directory/'run.sh').write_text(script)
         (directory/'launch-intent').write_text(str(time.time()))

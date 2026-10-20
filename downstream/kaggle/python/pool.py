@@ -74,9 +74,9 @@ class Pool:
     def release(self, sid, run_id):
         with self.db() as db:
             db.execute("UPDATE sessions SET state='idle',active_run=NULL WHERE id=? AND active_run=? AND state IN ('busy','provisioning')",(sid,run_id))
-    def close(self, sid):
+    def close(self, sid, note=None):
         self.get(sid)
-        with self.db() as db: db.execute("UPDATE sessions SET state='closing' WHERE id=? AND state!='stopped'",(sid,))
+        with self.db() as db: db.execute("UPDATE sessions SET state='closing',note=COALESCE(?,note) WHERE id=? AND state!='stopped'",(note,sid))
     def stopped(self, sid):
         # Only a caller holding a provider stop receipt may call this.
         with self.db() as db: db.execute("UPDATE sessions SET state='stopped',active_run=NULL WHERE id=?",(sid,))

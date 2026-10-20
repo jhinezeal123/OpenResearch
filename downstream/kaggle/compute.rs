@@ -68,32 +68,8 @@ impl ComputeBackend for KaggleCompute {
     }
 
     async fn status(&self, handle: &StoredRun) -> Result<StoredRun> {
-        let store = Store::open()?;
-        let mut run = store
+        Store::open()?
             .get_run(&handle.id)?
-            .ok_or_else(|| anyhow!("Run {} not found", handle.id))?;
-        let mut descriptor = BackendDescriptor::parse(&run.backend_json)?;
-        // A network failure during teardown is recoverable even after the job
-        // finished. Reading that run reconciles its original notebook only.
-        if crate::downstream::bridge::local::is_terminal(&run.status)
-            && descriptor
-                .monitoring_error
-                .as_deref()
-                .is_some_and(|s| s.starts_with("Kaggle shutdown unconfirmed:"))
-        {
-            if let Ok(launch) = crate::downstream::kaggle::runtime::Launch::load(&run.id) {
-                if launch.stopped()
-                    || launch
-                        .call("status")
-                        .await
-                        .is_ok_and(|s| s["stopped"] == true)
-                {
-                    descriptor.monitoring_error = None;
-                    run.backend_json = descriptor.to_json();
-                    store.set_backend_json(&run.id, &run.backend_json)?;
-                }
-            }
-        }
-        Ok(run)
+            .ok_or_else(|| anyhow!("Run {} not found", handle.id))
     }
 }

@@ -18,20 +18,20 @@ class PackagingTests(unittest.TestCase):
             (profile/'token.txt').write_text('KGAT_PRIVATE')
             (profile/'web-session.json').write_text('{"private":"cookie"}')
             module.import_profiles(source,home)
-            registry=json.loads((home/'profiles/accounts.json').read_text())
+            registry=json.loads((home/'profiles/accounts.json').read_text(encoding="utf-8"))
             self.assertEqual(registry['accounts']['qa.txt']['cookie_file'],'profiles/qa/web-session.json')
-            self.assertEqual((home/'profiles/qa/token.txt').read_text(),'KGAT_PRIVATE')
-            self.assertEqual((home/'profiles/qa/web-session.json').read_text(),'{"private":"cookie"}')
+            self.assertEqual((home/'profiles/qa/token.txt').read_text(encoding="utf-8"),'KGAT_PRIVATE')
+            self.assertEqual((home/'profiles/qa/web-session.json').read_text(encoding="utf-8"),'{"private":"cookie"}')
             self.assertNotIn('C:/external',json.dumps(registry))
     def test_binary_package_manifest_embeds_every_python_runtime_file(self):
-        manifest=(ROOT/'package.rs').read_text()
+        manifest=(ROOT/'package.rs').read_text(encoding="utf-8")
         for file in (ROOT/'python').rglob('*.py'):
             self.assertIn('python/'+file.relative_to(ROOT/'python').as_posix(),manifest)
     def test_auto_login_uses_private_home_and_its_own_script(self):
-        recovery=(ROOT/'python/native/auto_login/recovery.py').read_text()
+        recovery=(ROOT/'python/native/auto_login/recovery.py').read_text(encoding="utf-8")
         self.assertIn('web_session.__file__',recovery)
         self.assertNotIn("os.path.join(web_session.BASE, 'web_session.py')",recovery)
-        web=(ROOT/'python/native/auto_login/web_session.py').read_text()
+        web=(ROOT/'python/native/auto_login/web_session.py').read_text(encoding="utf-8")
         self.assertIn('BASE = os.environ["ORX_KAGGLE_HOME"]',web)
     def test_bridge_has_no_runtime_donor_directory_requirement(self):
         with tempfile.TemporaryDirectory() as home:

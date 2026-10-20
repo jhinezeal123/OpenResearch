@@ -4,15 +4,9 @@ No Workbench server or MCP transport is involved. Credentials remain in the
 donor's account profiles; OpenResearch owns only its ephemeral session state.
 """
 import contextlib
-import hashlib
 import json
 from pathlib import Path
 import sys
-
-
-def session_id(run_id):
-    import uuid
-    return uuid.UUID(run_id).hex
 
 
 def accounts(account_store):
@@ -39,14 +33,6 @@ def control(session, action, sid, account, state_root):
         result["account"] = account
         session.save(receipt, result)
     return result
-
-
-def previous_stopped(session, state_root, sid, account):
-    # The account lease can survive a child exiting before prepare/submit. The
-    # donor always journals submit intent BEFORE making a provider request.
-    if not (state_root / sid / "submit-intent.json").exists():
-        return True
-    return control(session, "status", sid, account, state_root).get("stopped") is True
 
 
 def configure(request):
@@ -137,9 +123,6 @@ def dispatch(request):
     if action=='close-session':
         row=pool.get(request['sessionId']);pool.close(row['id']);ensure_worker(session,pool,row,request)
         return {'closing':True}
-    # Historical one-Run notebooks remain inspectable after the migration.
-    if action in ('stop','status'):
-        return control(session,action,session_id(request['runId']),request['account'],home/'sessions')
     row=pool.assigned(request['runId'])
     if action=='acquire' and row is None:
         from account_runtime import account_readiness
@@ -156,8 +139,8 @@ def dispatch(request):
             row=pool.acquire(request,free)
         if row is None: return {'queued':True,'detail':'Waiting for a compatible idle notebook or a ready account from the pool.'}
     if row is None: raise ValueError('Run has no session assignment')
-    if row['state']=='stopped': return {'stopped':True,'sessionId':row['id']}
-    if row['state']=='closing' and action in ('acquire','launch'): return {'pending':True,'closing':True,'sessionId':row['id']}
+    if row['state']=='stopped': return {'stopped':True,'sessionId':row['id'],'error':row.get('note')}
+    if row['state']=='closing' and action in ('acquire','launch'): return {'pending':True,'closing':True,'sessionId':row['id'],'error':row.get('note')}
     ensure_worker(session,pool,row,request)
     folder=pool.worker_dir(row['id'])
     if action=='acquire':

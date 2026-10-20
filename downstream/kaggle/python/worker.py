@@ -74,7 +74,7 @@ def serve(config):
     folder=pool.worker_dir(sid)
     folder.mkdir(parents=True,exist_ok=True)
     token=secrets.token_urlsafe(32)
-    state={'receipt':None,'channel':None,'error':None}
+    state={'receipt':None,'channel':None,'error':None,'fatal':False}
     from proxy_control import ensure_proxy
     proxy=ensure_proxy()
     log=(folder/'ssh.log').open('ab')
@@ -87,7 +87,7 @@ def serve(config):
                 size=int(self.headers.get('Content-Length','0'))
                 if not 0<size<=2*1024*1024: raise ValueError('Invalid packet size')
                 r=json.loads(self.rfile.read(size))
-                if r['action']=='health': result={'ready':state['channel'] is not None,'error':state['error'],'receipt':state['receipt'],'connections':state['channel'].connections if state['channel'] else 0}
+                if r['action']=='health': result={'ready':state['channel'] is not None,'error':state['error'],'fatal':state['fatal'],'receipt':state['receipt'],'connections':state['channel'].connections if state['channel'] else 0}
                 elif r['action']=='close': pool.close(sid);result={'closing':True}
                 elif r['action']=='launch' and pool.get(sid)['state']=='closing': result={'pending':True,'closing':True}
                 elif state['channel'] is None: result={'pending':True,'error':state['error']}
@@ -107,8 +107,14 @@ def serve(config):
     session.save(folder/'worker.json',{'pid':os.getpid(),'port':server.server_port,'token':token})
     from auto_login.web_session import protect_acl
     protect_acl(str(folder/'worker.json'))
+    def give_up(message):
+        # Closing stops any submitted notebook and lets the supervisor fail the
+        # Run with this reason instead of waiting for the session deadline.
+        state['error']=message;state['fatal']=True
+        pool.close(sid,message)
     def provision():
         from interface_ai_scientist.bootstrap_service import start
+        failures=0
         while pool.get(sid)['state']!='closing' and time.time()<row['deadline']:
             try:
                 r=start(account=row['account'],request_id=sid,ttl_seconds=config['ttlSeconds'],accelerator=config['accelerator'],
@@ -120,10 +126,15 @@ def serve(config):
                     state['channel'].rpc({'action':'ping'})
                     state['error']=None
                     pool.ready(sid,os.getpid());return
-                if r.get('submission_status')=='NOT_SUBMITTED': state['error']='Notebook was not submitted';return
+                if r.get('submission_status')=='NOT_SUBMITTED':
+                    give_up('Kaggle notebook was not submitted ('+str(r.get('error_type') or 'no detail')+')');return
+                failures=0
             except Exception as e:
-                state['error']=type(e).__name__
+                failures+=1
+                state['error']=type(e).__name__+': '+str(e)[:300]
                 print('Provision: '+str(e),file=sys.stderr,flush=True)
+                if failures>=5:
+                    give_up('Kaggle bootstrap failed 5 times in a row: '+state['error']);return
             time.sleep(2)
     threading.Thread(target=provision,daemon=True).start()
     last_poll=0

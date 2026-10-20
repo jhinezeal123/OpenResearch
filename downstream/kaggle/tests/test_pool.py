@@ -32,6 +32,13 @@ class PoolTests(unittest.TestCase):
         self.assertEqual(len(rows),2)
         self.assertEqual({r['account'] for r in rows},{'a','b'})
         self.assertEqual(len({r['id'] for r in rows}),2)
+    def test_failed_bootstrap_closes_with_a_reason_that_survives_later_closes(self):
+        r=request();row=self.pool.acquire(r,['a'])
+        self.pool.close(row['id'],'Kaggle bootstrap failed 5 times in a row: OSError')
+        self.pool.close(row['id'])
+        closed=self.pool.get(row['id'])
+        self.assertEqual(closed['state'],'closing')
+        self.assertEqual(closed['note'],'Kaggle bootstrap failed 5 times in a row: OSError')
     def test_reconnect_keeps_account_even_when_the_pool_order_changes(self):
         r=request();first=self.pool.acquire(r,['a','b'])
         r['runtime']['accounts']=['b']

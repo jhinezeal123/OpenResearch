@@ -5,6 +5,10 @@ use base64::Engine;
 use serde_json::{json, Value};
 use std::io::{Seek, SeekFrom, Write};
 
+/// Continuous monitoring failure after which the Run is failed. The notebook
+/// owner keeps enforcing its own deadline, so giving up never leaks compute.
+const GIVE_UP_AFTER: Duration = Duration::from_secs(15 * 60);
+
 pub(crate) async fn run(
     store: Store,
     stored: crate::downstream::bridge::store::StoredRun,
@@ -27,6 +31,9 @@ pub(crate) async fn run(
         .collect::<std::collections::HashMap<_, _>>());
     let mut acquired = false;
     let mut launched = false;
+    // A launch whose acknowledgement was lost may still have started remotely.
+    let mut launch_attempted = false;
+    let mut failing_since: Option<std::time::Instant> = None;
     let mut offset = 0u64;
     let mut last_error = None;
     let mut log = std::fs::OpenOptions::new()
@@ -37,7 +44,18 @@ pub(crate) async fn run(
     loop {
         let cancelled = local_cancel_requested(&store, &run_id);
         if cancelled && !launched {
-            let _ = operation(&launch, &request, "release").await;
+            if launch_attempted && operation(&launch, &request, "cancel").await.is_err() {
+                // Retry until the remote cancel is acknowledged or monitoring gives up.
+                if failing_since
+                    .get_or_insert_with(std::time::Instant::now)
+                    .elapsed()
+                    < GIVE_UP_AFTER
+                {
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
+                }
+            }
+            release(&launch, &request).await;
             store.update_status(&run_id, RunStatus::Cancelled, Some(now_ms()), None)?;
             return Ok(());
         }
@@ -51,10 +69,14 @@ pub(crate) async fn run(
             "inspect"
         };
         request["offset"] = json!(offset);
+        if action == "launch" {
+            launch_attempted = true;
+        }
         let observed = operation(&launch, &request, action).await;
         let observed = match observed {
             Ok(value) => {
                 last_error = None;
+                failing_since = None;
                 value
             }
             Err(error) => {
@@ -62,6 +84,19 @@ pub(crate) async fn run(
                 if last_error.as_ref() != Some(&text) {
                     eprintln!("{text}");
                     last_error = Some(text.clone());
+                }
+                if failing_since
+                    .get_or_insert_with(std::time::Instant::now)
+                    .elapsed()
+                    >= GIVE_UP_AFTER
+                {
+                    release(&launch, &request).await;
+                    store.update_status(&run_id, RunStatus::Failed, Some(now_ms()), None)?;
+                    store.set_result_markdown(
+                        &run_id,
+                        &format!("Kaggle monitoring failed for 15 minutes and stopped: {error}. The notebook still stops at its own deadline."),
+                    )?;
+                    return Ok(());
                 }
                 descriptor.monitoring_error = Some(text);
                 store.set_backend_json(&run_id, &descriptor.to_json())?;
@@ -77,9 +112,13 @@ pub(crate) async fn run(
                 RunStatus::Failed
             };
             store.update_status(&run_id, status, Some(now_ms()), None)?;
+            let reason = observed["error"]
+                .as_str()
+                .map(|e| format!(" Reason: {e}"))
+                .unwrap_or_default();
             store.set_result_markdown(
                 &run_id,
-                "Kaggle session ended before this run completed. Its command was not replayed.",
+                &format!("Kaggle session ended before this run completed. Its command was not replayed.{reason}"),
             )?;
             return Ok(());
         }
@@ -92,6 +131,10 @@ pub(crate) async fn run(
                     .as_str()
                     .map(|r| format!("https://www.kaggle.com/code/{r}"));
                 descriptor.monitoring_error = None;
+                store.set_backend_json(&run_id, &descriptor.to_json())?;
+            } else if let Some(error) = observed["error"].as_str() {
+                // Surface bootstrap trouble while the notebook owner keeps retrying.
+                descriptor.monitoring_error = Some(format!("Kaggle notebook not ready: {error}"));
                 store.set_backend_json(&run_id, &descriptor.to_json())?;
             }
             tokio::time::sleep(POLL_INTERVAL).await;
@@ -141,10 +184,22 @@ pub(crate) async fn run(
                 Some(now_ms()),
                 observed["exitCode"].as_i64(),
             )?;
-            let _ = operation(&launch, &request, "release").await;
+            release(&launch, &request).await;
             return Ok(());
         }
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Free the pool lease. The notebook owner also releases a finished Run, so a
+/// failure here only delays reuse; retry briefly and log rather than fail.
+async fn release(launch: &Launch, request: &Value) {
+    for attempt in 1..=3 {
+        match operation(launch, request, "release").await {
+            Ok(_) => return,
+            Err(error) if attempt == 3 => eprintln!("Kaggle release unconfirmed: {error}"),
+            Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
+        }
     }
 }
 async fn operation(launch: &Launch, request: &Value, action: &str) -> Result<Value> {

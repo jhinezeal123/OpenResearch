@@ -273,7 +273,7 @@ fn run_status_for_stage(store: &Store, run_id: &str, cancel_sent: bool, stage: &
     }
 }
 
-pub(crate) fn status_of(stored: &crate::store::StoredRun) -> Result<RunStatus> {
+fn status_of(stored: &crate::store::StoredRun) -> Result<RunStatus> {
     RunStatus::parse(&stored.status)
         .ok_or_else(|| anyhow!("Run {} has unknown status: {}", stored.id, stored.status))
 }
@@ -662,34 +662,17 @@ async fn run_ssh(
     Ok(())
 }
 
-#[async_trait::async_trait]
-pub(crate) trait SshOwner: Sync {
-    /// A provider-confirmed disappearance; transport errors alone are not proof.
-    async fn disappeared(&self) -> Option<String>;
-}
-
-struct OpenResearchOwner<'a>(&'a Credentials, &'a str);
-
-#[async_trait::async_trait]
-impl SshOwner for OpenResearchOwner<'_> {
-    async fn disappeared(&self) -> Option<String> {
-        openresearch::box_deleted(self.0, self.1)
-            .await
-            .then(|| format!("box {} was deleted while the run was active", self.1))
-    }
-}
-
 /// The ssh two-half loop, shared by every backend whose job is a run dir on a
 /// box we ssh into (ssh itself, openresearch). Runs until the job is terminal
 /// and returns the final run status after logs are drained.
-pub(crate) async fn watch_ssh_job(
+async fn watch_ssh_job(
     store: &Store,
     initial_status: RunStatus,
     target: ssh::SshTarget,
     dir: String,
     run_id: &str,
     descriptor: &mut BackendDescriptor,
-    owner: Option<&dyn SshOwner>,
+    sandbox: Option<(&Credentials, &str)>,
 ) -> Result<RunStatus> {
     let container = descriptor.ssh_container.clone();
     let path = log_path(run_id);
@@ -762,21 +745,17 @@ pub(crate) async fn watch_ssh_job(
         }
         let job = match observed {
             Ok(job) => job,
-            Err(_) => {
-                if let Some(message) = match owner {
-                    Some(owner) => owner.disappeared().await,
-                    None => None,
-                } {
-                    ssh::JobState {
-                        stage: "ERROR".into(),
-                        message: Some(message),
-                    }
-                } else {
+            Err(_) => match sandbox {
+                Some((creds, id)) if openresearch::box_deleted(creds, id).await => ssh::JobState {
+                    stage: "ERROR".into(),
+                    message: Some(format!("box {id} was deleted while the run was active")),
+                },
+                _ => {
                     missing_polls = 0;
                     tokio::time::sleep(POLL_INTERVAL).await;
                     continue;
                 }
-            }
+            },
         };
         // A home directory can blink out (stale NFS); end the run only once it stays missing.
         if job.message.as_deref() == Some(ssh::RUN_DIR_MISSING) {
@@ -1096,7 +1075,7 @@ async fn run_openresearch(
         dir,
         &run_id,
         &mut descriptor,
-        Some(&OpenResearchOwner(&lifecycle, &sandbox_id)),
+        Some((&lifecycle, &sandbox_id)),
     )
     .await;
     teardown_box(&store, &lifecycle, &sandbox_id, &run_id).await;

@@ -163,35 +163,6 @@ impl Launch {
         }
         Ok(value)
     }
-    pub async fn call(&self, action: &str) -> Result<Value> {
-        let mut value = serde_json::to_value(self)?;
-        value["action"] = json!(action);
-        value["command"] = json!(&self.command);
-        call(
-            &self.runtime,
-            value,
-            if action == "start" { 150 } else { 55 },
-        )
-        .await
-    }
-
-    pub fn stopped(&self) -> bool {
-        let Ok(id) = uuid::Uuid::parse_str(&self.run_id) else {
-            return false;
-        };
-        let receipt = root()
-            .join("sessions")
-            .join(id.simple().to_string())
-            .join("stop-confirmed.json");
-        std::fs::read(receipt)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .is_some_and(|v| {
-                v["session_id"] == id.simple().to_string()
-                    && v["account"] == self.account
-                    && v["stopped"] == true
-            })
-    }
 }
 
 pub fn python() -> PathBuf {

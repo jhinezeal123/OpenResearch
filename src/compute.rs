@@ -680,7 +680,6 @@ pub fn backend(id: &str) -> Result<Box<dyn ComputeBackend>> {
         "modal" => Ok(Box::new(ModalCompute)),
         "k8s" => Ok(Box::new(KubernetesCompute)),
         "ssh" => Ok(Box::new(SshCompute::default())),
-
         "slurm" => Ok(Box::new(SlurmCompute)),
         "ray" => Ok(Box::new(RayCompute)),
         "openresearch" => Ok(Box::new(OpenResearchCompute)),

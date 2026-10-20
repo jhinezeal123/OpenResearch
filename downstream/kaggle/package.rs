@@ -49,10 +49,6 @@ const FILES: &[(&str, &str)] = &[
         include_str!("python/native/interface_ai_scientist/session.py"),
     ),
     (
-        "native/interface_ai_scientist/terminal_remote.py",
-        include_str!("python/native/interface_ai_scientist/terminal_remote.py"),
-    ),
-    (
         "native/provider_metrics.py",
         include_str!("python/native/provider_metrics.py"),
     ),

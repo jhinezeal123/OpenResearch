@@ -11,11 +11,9 @@
       "auto_login/web_session.py": "cf36eb073e68bcd60f0db7e94124eb41c8b6152ede385063ece15ae4dd990bac",
       "auto_login/recovery.py": "fb8747d4c26ee40867abfde9e34da87d4014490a70f04f79275f0388cf67d519",
       "interface_ai_scientist/__init__.py": "29bfd06dad2d07174d80d108b4d54c3cf28894aea2675416f83cc2878cfd9047",
-      "interface_ai_scientist/__main__.py": "ae0a12e517f2df2d7483f31118b89a2246c57d700e32d493fc1a71af31f0f335",
       "interface_ai_scientist/bootstrap.py": "71fd1148da30256217c299350506328b2dc36ce8849d431c01a6bed6971e36b1",
       "interface_ai_scientist/mcp_tools.py": "f6a621de95b8d55b2917ef92f394d409d56b85bca7d94ecf4480b0030bb3c529",
-      "interface_ai_scientist/session.py": "d8880eaf13c4ddfcd6c8375f698b80088b66ca15a086c70215f1e62f6ff39211",
-      "interface_ai_scientist/terminal_remote.py": "1cb98843ac3ddb18aa283c44064186ccf9d6741bd6a6b6af6b73daabdf0b832d"
+      "interface_ai_scientist/session.py": "d8880eaf13c4ddfcd6c8375f698b80088b66ca15a086c70215f1e62f6ff39211"
     },
     "extracted_from": [
       "interface_old/kaggle_pool.py: _IClient and _client_for",
@@ -38,7 +36,8 @@
       "Proxy refreshes local token files after account additions, removals or rotations without a restart",
       "SDK proxy, cookie API and native status reads record per-account aggregate payload bytes/attempt latency into ignored .runtime SQLite",
       "Benchmark publication reuses selected profile tokens with KaggleHub GCS upload and pinned SDK public create, validates name availability before sessions/upload, and returns immutable public dataset receipts",
-      "Persistent Bash resets inherited errexit before each command so a nonzero exit can be reported without losing cwd/exports or replaying commands"
+      "Persistent Bash resets inherited errexit before each command so a nonzero exit can be reported without losing cwd/exports or replaying commands",
+      "Unused donor CLI entrypoints removed: session.main/bridge/shell/copy/network, terminal_remote.py and account_admin CRUD; hashes record the original donor files"
     ]
   },
   "files": {
