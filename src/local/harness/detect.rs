@@ -166,7 +166,7 @@ pub struct ModelInfo {
 impl ModelInfo {
     /// A model with no per-model reasoning metadata (falls back to the
     /// harness-wide list).
-    pub(crate) fn new(id: impl Into<String>) -> Self {
+    pub(super) fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
             reasoning_levels: None,
@@ -190,7 +190,7 @@ impl ModelInfo {
     }
 
     /// Attach the catalog's display name / description, when it has them.
-    pub(crate) fn with_label(
+    pub(super) fn with_label(
         mut self,
         display_name: Option<&str>,
         description: Option<&str>,
@@ -293,7 +293,7 @@ pub struct HarnessInfo {
 }
 
 impl HarnessInfo {
-    pub(crate) fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+    pub(super) fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             id: id.into(),
             name: name.into(),

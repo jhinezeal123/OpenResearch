@@ -1557,14 +1557,7 @@ export const reportLocale = (locale: string, signal?: AbortSignal) =>
     body: JSON.stringify({ locale }),
   }).then((r) => json<{ locale: string }>(r));
 
-export type HarnessId =
-  | "claude-code"
-  | "codex"
-  | "opencode"
-  | "cursor"
-  | "antigravity"
-  | `acp:${string}`
-  | import("../../downstream/catalog").HarnessId;
+export type HarnessId = "claude-code" | "codex" | "opencode" | "cursor" | "antigravity" | `acp:${string}`;
 
 export interface HarnessModel {
   id: string;

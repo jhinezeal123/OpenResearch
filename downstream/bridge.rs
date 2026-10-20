@@ -23,18 +23,6 @@ pub(crate) mod api {
     pub(crate) use axum::Json;
     pub(crate) use serde_json::{json, Value};
 }
-pub(crate) mod harness {
-    pub(crate) use crate::local::chat::{
-        harness_log, prepare_env, set_chat_session_env, ContextUsage, DeliveryState,
-        PermissionDecision, PromptAnswer, ResumeCtx, TurnCtx, WirePart, WirePrompt,
-    };
-    pub(crate) use crate::local::harness::{
-        CompactCtx, CompactOutcome, Harness, HarnessAuthState, HarnessInfo, HarnessOptions,
-        ModelInfo, OptionChoice, PermissionMode, ResumeAction, TurnFailure, TurnOutcome,
-        TurnResult, TURN_WATCHDOG,
-    };
-    pub(crate) use crate::local::opencode::{ensure_playbook, PLAYBOOK_REL};
-}
 pub(crate) fn spawn_supervisor(id: &str) -> crate::error::Result<()> {
     crate::commands::exp::spawn_detached_supervise(id)
 }

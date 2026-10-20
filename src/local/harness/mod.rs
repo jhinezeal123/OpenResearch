@@ -23,7 +23,6 @@ pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod cursor;
 mod detect;
-
 pub(crate) mod opencode;
 mod options;
 mod plan_gate;
@@ -50,7 +49,6 @@ pub(crate) use detect::{
     ProbeTiming, ProbeTimingSink,
 };
 pub use detect::{HarnessAuthState, HarnessInfo, ModelInfo};
-pub(crate) use options::OptionChoice;
 pub use options::{HarnessOptions, PermissionMode};
 pub use plan_gate::command_is_readonly;
 pub use plan_gate::decide as plan_gate_decide;
@@ -530,7 +528,6 @@ pub fn registry() -> Vec<Box<dyn Harness>> {
         Box::new(cursor::Cursor),
         Box::new(antigravity::Antigravity),
     ];
-    harnesses.extend(crate::downstream::harnesses());
     harnesses.extend(
         crate::local::acp::registered_definitions()
             .into_iter()

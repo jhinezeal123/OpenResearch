@@ -1,4 +1,3 @@
-import * as downstream from "../../../downstream/ui";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { getHarnessesQuery } from "../queries/settings";
 import { m } from "../paraglide/messages.js";
@@ -50,7 +49,6 @@ export const HARNESS_LABELS: Record<HarnessId, string> = {
   opencode: "OpenCode",
   cursor: "Cursor",
   antigravity: "Google Antigravity",
-  ...downstream.harnessLabels,
 };
 
 export function harnessLabel(id: HarnessId, name?: string | null): string {

@@ -55,9 +55,6 @@ jobs:
       - name: Kaggle bridge receipts and account isolation
         run: python3 -m unittest discover -s downstream/kaggle/tests -p 'test_*.py'
 
-      - name: DSH profile and native compact bridge
-        run: node --test downstream/dsh/*.test.mjs
-
       - uses: pnpm/action-setup@v4
         with:
           version: 10

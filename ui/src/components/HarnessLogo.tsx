@@ -1,7 +1,6 @@
 // Brand mark for a harness/provider, rendered inline because the UI is
 // rust-embedded and CSP-locked.
 
-import * as downstream from "../../../downstream/ui";
 import type { HarnessId } from "../api";
 import { Plug } from "lucide-react";
 import deepseek from "../assets/harnesses/deepseek.png";
@@ -29,8 +28,6 @@ export function HarnessLogo({ harness, logo, size = 16 }: { harness: HarnessId; 
   if (image) return <span className="block shrink-0 bg-current" style={{ width: size, height: size, maskImage: `url(${JSON.stringify(image)})`, maskSize: "contain", maskPosition: "center", maskRepeat: "no-repeat" }} aria-hidden="true" />;
   if (harness.startsWith("acp:")) return <Plug size={size} className="block shrink-0" aria-hidden="true" />;
   const cls = "block shrink-0";
-  const custom = downstream.harnessLogo(harness, size);
-  if (custom) return custom;
   if (harness === "claude-code") {
     return (
       <svg className={cls} width={size} height={size} viewBox="0 0 24 24" fill="#d97757" aria-hidden="true">

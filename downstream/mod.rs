@@ -1,8 +1,5 @@
 //! Downstream integrations. Upstream hooks register this module only.
 pub(crate) mod bridge;
-pub(crate) mod dsh {
-    pub(crate) mod harness;
-}
 pub(crate) mod kaggle {
     pub(crate) mod compute;
     pub(crate) mod package;
@@ -15,9 +12,6 @@ pub(crate) fn compute_backend(id: &str) -> Option<Box<dyn crate::compute::Comput
         "kaggle" => Some(Box::new(kaggle::compute::KaggleCompute)),
         _ => None,
     }
-}
-pub(crate) fn harnesses() -> Vec<Box<dyn crate::local::harness::Harness>> {
-    vec![Box::new(dsh::harness::Dsh)]
 }
 pub(crate) fn routes() -> axum::Router<crate::commands::up::AppState> {
     use axum::routing::{get, post};
