@@ -720,8 +720,7 @@ pub(super) async fn spawn(
         let _ = process.child.wait().await;
         let _ = closed_sender.send(true);
     });
-    let initialized =
-        tokio::time::timeout(std::time::Duration::from_secs(15), ready_receiver).await;
+    let initialized = tokio::time::timeout(super::STARTUP_TIMEOUT, ready_receiver).await;
     match initialized {
         Ok(Ok(Ok((connection, initialized)))) => Ok(Arc::new(Client {
             configuration_lock: tokio::sync::Mutex::new(()),

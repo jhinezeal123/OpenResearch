@@ -5,6 +5,11 @@ use crate::error::{bail, Result};
 mod delegated;
 pub mod host;
 
+/// Spawn-to-`initialize` deadline. Profile-based agents such as DeepSeek
+/// Harness load hundreds of plugins before answering; a cold start after an
+/// update or profile change was measured at 75–99s on Windows.
+pub(crate) const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 struct OwnedProcess {
     child: tokio::process::Child,
     id: Option<u32>,
@@ -269,7 +274,7 @@ pub async fn test_connection(definition: &Definition) -> Result<serde_json::Valu
         process.child.stdout.take().expect("piped stdout").compat(),
     );
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
+        STARTUP_TIMEOUT,
         agent_client_protocol::Client.builder().connect_with(
             transport,
             |connection: ConnectionTo<Agent>| async move {
