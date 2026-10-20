@@ -57,7 +57,7 @@ def dispatch(r):
     directory=run_dir(r['runId'])
     if action=='launch':
         directory.mkdir(parents=True,exist_ok=True,mode=0o700)
-        if (directory/'launch-intent').exists(): return inspect(directory)
+        if (directory/'launch-intent').exists() or (directory/'cancel-intent').exists(): return inspect(directory)
         repo=directory/'repo';repo.mkdir(exist_ok=True)
         digest=r['digest']
         if not re.fullmatch('[0-9a-f]{64}',digest): raise ValueError('Invalid source digest')
@@ -70,7 +70,7 @@ def dispatch(r):
 cd "$(dirname "$0")"
 trap 'code=$?; echo "$code" > exit_code; trap - TERM; kill -KILL 0' EXIT
 cd repo || exit 97
-'''+f'exec_env_placeholder\ntimeout --foreground --signal=TERM --kill-after=5s {seconds}s bash -c '+shlex.quote(r['command'])+'\n'
+'''+f'exec_env_placeholder\ntimeout --foreground --signal=TERM --kill-after=5s {seconds}s bash -eo pipefail -c '+shlex.quote(r['command'])+'\n'
         exports='\n'.join('export '+k+'='+shlex.quote(v) for k,v in r.get('env',{}).items() if re.fullmatch('[A-Za-z_][A-Za-z0-9_]*',k))
         # exit_code lives beside the run log, independent of command cwd. run.sh
         # leads its own session, so the EXIT trap's `kill 0` also reaps anything the
@@ -84,6 +84,9 @@ cd repo || exit 97
         (directory/'pid').write_text(str(process.pid))
         return inspect(directory)
     if action=='cancel':
+        directory.mkdir(parents=True,exist_ok=True,mode=0o700)
+        # A durable tombstone also blocks a delayed launch after cancellation.
+        (directory/'cancel-intent').write_text(str(time.time()))
         if (directory/'pid').exists() and not (directory/'exit_code').exists():
             pid=int((directory/'pid').read_text())
             try: os.killpg(pid,signal.SIGTERM)
@@ -92,6 +95,8 @@ cd repo || exit 97
             time.sleep(.3)
             try: os.killpg(pid,signal.SIGKILL)
             except ProcessLookupError: pass
+            (directory/'exit_code').write_text('143')
+        elif not (directory/'launch-intent').exists() and not (directory/'exit_code').exists():
             (directory/'exit_code').write_text('143')
         return inspect(directory,r.get('offset',0))
     if action=='inspect': return inspect(directory,r.get('offset',0))

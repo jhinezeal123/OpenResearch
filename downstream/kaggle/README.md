@@ -67,6 +67,11 @@ when a notebook is reused. A later Run is bounded by the remaining lifetime.
 - **Stop Run** cancels only that Run's process group. The notebook is retained.
   **Close session** or TTL shuts down the notebook. An account is released only
   after a provider stop receipt. Unknown stop outcomes remain reserved.
+- Stop also reconciles the remote Run after a supervisor restart. If monitoring
+  fails for 15 minutes, the local Run fails but its session stays reserved until
+  the owner confirms completion or the notebook reaches its deadline.
+- Commands stop on failed steps and pipelines. Each Run receives `ORX_RUN_ID`
+  alongside the synced environment so metric trackers can identify it.
 - The session list restarts a missing owner using the saved notebook identity.
   Remote bootstrap TTL bounds compute even if the local machine goes offline.
 

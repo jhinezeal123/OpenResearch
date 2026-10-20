@@ -3,6 +3,13 @@ import unittest
 import tempfile
 import json
 from pathlib import Path
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
+import uuid
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'python'))
+from pool import Pool
 
 spec = importlib.util.spec_from_file_location('kaggle_bridge', Path(__file__).resolve().parents[1] / 'python/bridge.py')
 bridge = importlib.util.module_from_spec(spec)
@@ -43,6 +50,76 @@ class BridgeTests(unittest.TestCase):
             self.assertTrue(bridge.control(session, 'status', 'qa-session', 'qa', root)['stopped'])
             session.control = lambda *a: self.fail('Confirmed immutable session must not need the network')
             self.assertTrue(bridge.control(session, 'stop', 'qa-session', 'qa', root)['stopped'])
+
+class BridgeLeaseTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.home = Path(self.temporary.name)
+        self.pool = Pool(self.home)
+        self.request = {'home':str(self.home),'runId':str(uuid.uuid4()),
+                        'projectId':'review-project','accelerator':'cpu','ttlSeconds':3600,
+                        'competitionSources':[],'datasetSources':[],
+                        'runtime':{'accounts':['account-a']}}
+        for mocked in (patch.object(bridge, 'configure', return_value=None),
+                       patch.object(bridge, 'ensure_worker'),
+                       patch.dict(sys.modules, {'account_store':SimpleNamespace()})):
+            mocked.start()
+            self.addCleanup(mocked.stop)
+        mocked = patch.object(bridge, 'contact')
+        self.contact = mocked.start()
+        self.addCleanup(mocked.stop)
+
+    def reserve(self):
+        self.row = self.pool.acquire(self.request, ['account-a'])
+        self.pool.ready(self.row['id'], 123)
+
+    def test_stop_after_restart_contacts_the_assigned_run_before_releasing(self):
+        self.reserve()
+        self.contact.return_value = {'stage':'ERROR','exitCode':143}
+        result = bridge.dispatch({**self.request,'action':'cancel'})
+        self.assertEqual(result['exitCode'], 143)
+        self.assertEqual(self.contact.call_args.args[1]['action'], 'cancel')
+        self.assertEqual(self.contact.call_args.args[1]['runId'], self.request['runId'])
+        # The supervisor's terminal release must still check the remote receipt.
+        self.assertEqual(self.pool.get(self.row['id'])['active_run'], self.request['runId'])
+        self.assertTrue(bridge.dispatch({**self.request,'action':'release'})['released'])
+        self.assertEqual(self.contact.call_args.args[1]['action'], 'inspect')
+
+    def test_unconfirmed_remote_state_never_releases_a_live_lease(self):
+        self.reserve()
+        for observed in ({'stage':'RUNNING'}, {'stage':'UNKNOWN'}, {'pending':True}):
+            with self.subTest(observed=observed):
+                self.contact.return_value = observed
+                self.assertFalse(bridge.dispatch({**self.request,'action':'release'})['released'])
+                self.assertEqual(self.pool.get(self.row['id'])['active_run'], self.request['runId'])
+                self.assertIsNone(self.pool.acquire({**self.request,'runId':str(uuid.uuid4())}, []))
+
+    def test_ssh_failure_keeps_the_lease_until_the_owner_confirms_completion(self):
+        self.reserve()
+        self.contact.side_effect = ConnectionError('offline')
+        with self.assertRaises(ConnectionError):
+            bridge.dispatch({**self.request,'action':'release'})
+        self.assertEqual(self.pool.get(self.row['id'])['state'], 'busy')
+        self.contact.side_effect = None
+        self.contact.return_value = {'stage':'COMPLETE','exitCode':0}
+        self.assertTrue(bridge.dispatch({**self.request,'action':'release'})['released'])
+        replacement = self.pool.acquire({**self.request,'runId':str(uuid.uuid4())}, [])
+        self.assertEqual(replacement['id'], self.row['id'])
+
+    def test_stop_during_provisioning_waits_without_releasing(self):
+        self.reserve()
+        self.contact.return_value = {'pending':True}
+        self.assertTrue(bridge.dispatch({**self.request,'action':'cancel'})['pending'])
+        self.assertEqual(self.pool.get(self.row['id'])['state'], 'busy')
+
+    def test_queued_stop_does_not_allocate_a_notebook_or_contact_a_worker(self):
+        result = bridge.dispatch({**self.request,'action':'cancel'})
+        self.assertEqual((result['stage'], result['exitCode']), ('ERROR', 143))
+        self.assertTrue(bridge.dispatch({**self.request,'action':'release'})['released'])
+        self.assertEqual(self.pool.list(), [])
+        self.contact.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

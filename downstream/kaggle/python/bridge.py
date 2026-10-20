@@ -138,6 +138,10 @@ def dispatch(request):
                 except Exception: pass
             row=pool.acquire(request,free)
         if row is None: return {'queued':True,'detail':'Waiting for a compatible idle notebook or a ready account from the pool.'}
+    if row is None and action=='cancel':
+        # A queued Run owns no notebook and must not acquire one just to cancel.
+        return {'stage':'ERROR','exitCode':143,'log':'','offset':request.get('offset',0),'logSize':0}
+    if row is None and action=='release': return {'released':True}
     if row is None: raise ValueError('Run has no session assignment')
     if row['state']=='stopped': return {'stopped':True,'sessionId':row['id'],'error':row.get('note')}
     if row['state']=='closing' and action in ('acquire','launch'): return {'pending':True,'closing':True,'sessionId':row['id'],'error':row.get('note')}
@@ -147,7 +151,13 @@ def dispatch(request):
         try: health=contact(folder,{'action':'health'},timeout=3)
         except (OSError,ValueError): return {'pending':True,'sessionId':row['id'],'account':row['account']}
         return {**health,'sessionId':row['id'],'account':row['account'],'deadline':row['deadline']}
-    if action=='release': pool.release(row['id'],request['runId']);return {'released':True}
+    if action=='release':
+        # A supervisor can time out or restart while its remote process lives.
+        # Never make the notebook reusable on the strength of local state alone.
+        observed=contact(folder,{**request,'action':'inspect'})
+        terminal=observed.get('stage') in ('COMPLETE','ERROR')
+        if terminal: pool.release(row['id'],request['runId'])
+        return {'released':terminal}
     if action=='launch':
         source=Path(request['sourcePath'])
         import base64

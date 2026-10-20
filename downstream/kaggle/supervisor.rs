@@ -9,6 +9,20 @@ use std::io::{Seek, SeekFrom, Write};
 /// owner keeps enforcing its own deadline, so giving up never leaks compute.
 const GIVE_UP_AFTER: Duration = Duration::from_secs(15 * 60);
 
+fn next_action(acquired: bool, launched: bool, cancelled: bool) -> &'static str {
+    // Local progress is lost on restart. A cancel must reconcile the remote Run
+    // even if this supervisor has never acquired or launched it itself.
+    if cancelled {
+        "cancel"
+    } else if !acquired {
+        "acquire"
+    } else if !launched {
+        "launch"
+    } else {
+        "inspect"
+    }
+}
+
 pub(crate) async fn run(
     store: Store,
     stored: crate::downstream::bridge::store::StoredRun,
@@ -26,13 +40,9 @@ pub(crate) async fn run(
     request["experimentId"] = json!(stored.experiment_id);
     request["sourcePath"] = json!(source.path);
     request["digest"] = json!(source.digest);
-    request["env"] = json!(crate::downstream::bridge::config::list_synced_env()
-        .into_iter()
-        .collect::<std::collections::HashMap<_, _>>());
+    request["env"] = json!(crate::downstream::bridge::config::run_env(&run_id));
     let mut acquired = false;
     let mut launched = false;
-    // A launch whose acknowledgement was lost may still have started remotely.
-    let mut launch_attempted = false;
     let mut failing_since: Option<std::time::Instant> = None;
     let mut offset = 0u64;
     let mut last_error = None;
@@ -43,35 +53,8 @@ pub(crate) async fn run(
         .open(crate::downstream::bridge::store::log_path(&run_id))?;
     loop {
         let cancelled = local_cancel_requested(&store, &run_id);
-        if cancelled && !launched {
-            if launch_attempted && operation(&launch, &request, "cancel").await.is_err() {
-                // Retry until the remote cancel is acknowledged or monitoring gives up.
-                if failing_since
-                    .get_or_insert_with(std::time::Instant::now)
-                    .elapsed()
-                    < GIVE_UP_AFTER
-                {
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                    continue;
-                }
-            }
-            release(&launch, &request).await;
-            store.update_status(&run_id, RunStatus::Cancelled, Some(now_ms()), None)?;
-            return Ok(());
-        }
-        let action = if !acquired {
-            "acquire"
-        } else if !launched {
-            "launch"
-        } else if cancelled {
-            "cancel"
-        } else {
-            "inspect"
-        };
+        let action = next_action(acquired, launched, cancelled);
         request["offset"] = json!(offset);
-        if action == "launch" {
-            launch_attempted = true;
-        }
         let observed = operation(&launch, &request, action).await;
         let observed = match observed {
             Ok(value) => {
@@ -90,11 +73,12 @@ pub(crate) async fn run(
                     .elapsed()
                     >= GIVE_UP_AFTER
                 {
-                    release(&launch, &request).await;
+                    // Monitoring failure does not prove the process stopped.
+                    // Its owner retains the lease until a terminal receipt or TTL.
                     store.update_status(&run_id, RunStatus::Failed, Some(now_ms()), None)?;
                     store.set_result_markdown(
                         &run_id,
-                        &format!("Kaggle monitoring failed for 15 minutes and stopped: {error}. The notebook still stops at its own deadline."),
+                        &format!("Kaggle monitoring failed for 15 minutes and stopped: {error}. The session remains reserved until the remote Run finishes or the notebook stops at its own deadline."),
                     )?;
                     return Ok(());
                 }
@@ -196,7 +180,9 @@ pub(crate) async fn run(
 async fn release(launch: &Launch, request: &Value) {
     for attempt in 1..=3 {
         match operation(launch, request, "release").await {
-            Ok(_) => return,
+            Ok(value) if value["released"] == true || value["stopped"] == true => return,
+            Ok(_) if attempt == 3 => eprintln!("Kaggle release awaits a remote terminal receipt"),
+            Ok(_) => tokio::time::sleep(Duration::from_secs(2)).await,
             Err(error) if attempt == 3 => eprintln!("Kaggle release unconfirmed: {error}"),
             Err(_) => tokio::time::sleep(Duration::from_secs(2)).await,
         }
@@ -211,4 +197,23 @@ async fn operation(launch: &Launch, request: &Value, action: &str) -> Result<Val
         if action == "launch" { 300 } else { 90 },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_reconciles_remote_state_after_restart_or_a_lost_launch_ack() {
+        for (acquired, launched) in [(false, false), (true, false), (true, true)] {
+            assert_eq!(next_action(acquired, launched, true), "cancel");
+        }
+    }
+
+    #[test]
+    fn normal_progress_acquires_then_launches_then_inspects() {
+        assert_eq!(next_action(false, false, false), "acquire");
+        assert_eq!(next_action(true, false, false), "launch");
+        assert_eq!(next_action(true, true, false), "inspect");
+    }
 }
