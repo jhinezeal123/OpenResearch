@@ -27,6 +27,7 @@ def ensure_proxy():
     with (logs / 'proxy.log').open('ab') as output:
         process = subprocess.Popen([sys.executable, str(root / 'proxy.py'), str(PROXY_PORT)], cwd=root,
             stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
+            env={**os.environ, 'ORX_KAGGLE_PROXY_OWNER': str(os.getpid())},
             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
