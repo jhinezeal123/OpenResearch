@@ -540,6 +540,7 @@
   "status_running": "実行中",
   "status_starting": "開始中",
   "status_cancelling": "キャンセル中",
+  "status_lost": "結果を取得できません",
   "status_cancelled": "キャンセル済み",
   "status_editing": "編集中",
   "status_idle": "待機中",
@@ -619,6 +620,7 @@
   "activity_closed_agent": "エージェントを閉じました",
   "activity_subagent_started": "サブエージェントが開始しました",
   "activity_agent_reported_back": "エージェントが結果を報告しました",
+  "activity_sent_update_to_parent": "親エージェントに更新を送信しました",
   "activity_subagent_interrupted": "サブエージェントが中断されました",
   "activity_subagent": "サブエージェント",
   "activity_compacted_context": "コンテキストを圧縮しました",
@@ -1161,6 +1163,10 @@
   "remote_reconnecting_description": "接続が切れました。OpenResearch が再接続する間も、リモートの作業は実行を続けます。",
   "remote_connecting_title": "{host} に接続中",
   "remote_connecting_description": "リモートワークスペースを準備中…",
+  "remote_repair_run": "Run in terminal",
+  "remote_repair_copy": "Copy command",
+  "remote_repair_copied": "Copied",
+  "remote_repair_terminal": "Repair terminal",
   "remote_reconnect": "再接続",
   "remote_check_again": "再確認",
   "remote_preparing": "リモートワークスペースを準備中…",
@@ -1407,5 +1413,9 @@
   "acp_sign_in_help": "下のターミナルで{name}にサインインしてください。",
   "acp_get_api_key": "DeepSeek APIキーを取得",
   "acp_sign_in_bigmodel": "BigModelでサインイン",
-  "acp_adapter_required": "ACP アダプターが必要です"
+  "acp_adapter_required": "ACP アダプターが必要です",
+  "chat_experiment_running": "実験を実行中",
+  "chat_experiment_starting": "実験を開始中",
+  "chat_experiment_cancelling": "実験をキャンセル中",
+  "chat_experiments_running": "{count} 件の実験を実行中"
 }

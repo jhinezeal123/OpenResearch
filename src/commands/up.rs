@@ -771,6 +771,7 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
                 .patch(update_chat_session),
         )
         .route("/api/chat/sessions/{id}/messages", get(chat_messages))
+        .route("/api/chat/sessions/{id}/subagent", get(chat_subagent))
         .route(
             "/api/chat/sessions/{id}/configuration",
             post(set_chat_configuration),
@@ -782,6 +783,7 @@ fn router(state: AppState, remote_auth: Option<RemoteAuth>) -> Router {
             "/api/chat/sessions/{id}/compact",
             post(compact_chat_session),
         )
+        .route("/api/chat/active-runs", get(chat_active_runs))
         .route("/api/chat/native-sessions", get(list_native_chats))
         .route("/api/chat/native-sessions/import", post(import_native_chat))
         .route(
@@ -961,7 +963,7 @@ impl From<&StoredRun> for ApiRun {
             experiment_id: run.experiment_id.clone(),
             project_id: run.project_id.clone(),
             status: run.status.clone(),
-            backend: serde_json::from_str(&run.backend_json).ok(),
+            backend: crate::store::public_backend(&run.backend_json),
             command: Some(run.command.clone()).filter(|c| !c.is_empty()),
             commit_sha: run.commit_sha.clone(),
             result_markdown: run.result_markdown.clone(),
@@ -5858,6 +5860,28 @@ pub(crate) async fn ssh_connect_to_target(
     })
 }
 
+/// Open a terminal that SSHes to `target` and runs a fixed `command`. Used by
+/// the remote gateway's repair flow: the command is server-derived, so unlike
+/// [`ssh_connect_to_target`] the client never supplies it, and no preflight
+/// runs afterwards.
+pub(crate) async fn ssh_run_to_target(
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+    host: String,
+    target: crate::jobs::ssh::SshTarget,
+    command: String,
+) -> Response {
+    if !same_origin(&headers) {
+        return ApiError(StatusCode::FORBIDDEN, "SSH terminal origin rejected".into())
+            .into_response();
+    }
+    let active = Active::new();
+    ws.on_upgrade(move |socket| async move {
+        let _active = active;
+        ssh_run_socket(socket, host, target, command).await
+    })
+}
+
 const DEFAULT_PTY_SIZE: PtySize = PtySize {
     rows: 24,
     cols: 80,
@@ -5983,7 +6007,7 @@ async fn ssh_connect_socket(
     backend: SshConnectBackend,
     target: crate::jobs::ssh::SshTarget,
 ) {
-    let connection = match crate::jobs::ssh::interactive_args(&target, None).await {
+    let connection = match crate::jobs::ssh::interactive_args(&target, None, None).await {
         Ok(connection) => connection,
         Err(error) => {
             send_ssh_connect_error(&mut socket, &host, backend, error.to_string()).await;
@@ -6066,6 +6090,81 @@ async fn ssh_connect_socket(
             record_ssh_host_test(&test).await;
         }
         close_socket(&mut socket).await;
+    }
+}
+
+async fn send_ws_error(socket: &mut WebSocket, error: String) {
+    let _ = socket
+        .send(Message::Text(
+            json!({ "type": "error", "error": error })
+                .to_string()
+                .into(),
+        ))
+        .await;
+    close_socket(socket).await;
+}
+
+async fn ssh_run_socket(
+    mut socket: WebSocket,
+    host: String,
+    target: crate::jobs::ssh::SshTarget,
+    command: String,
+) {
+    let connection = match crate::jobs::ssh::interactive_args(&target, None, Some(command)).await {
+        Ok(connection) => connection,
+        Err(error) => {
+            send_ws_error(&mut socket, error.to_string()).await;
+            return;
+        }
+    };
+    let args = connection.args.clone();
+    let session = match tokio::task::spawn_blocking(move || start_pty("ssh", args)).await {
+        Ok(Ok(session)) => session,
+        Ok(Err(error)) => {
+            send_ws_error(&mut socket, error.to_string()).await;
+            return;
+        }
+        Err(error) => {
+            send_ws_error(&mut socket, format!("SSH terminal task failed: {error}")).await;
+            return;
+        }
+    };
+    let mut size = DEFAULT_PTY_SIZE;
+    let Some(status) = relay_pty(&mut socket, session, None, &mut size, None).await else {
+        return;
+    };
+
+    match status {
+        Ok(status) if status.success() => {
+            if let Some(warning) = crate::jobs::ssh::setup_connection_sharing(&target).await {
+                let _ = socket
+                    .send(Message::Binary(
+                        format!("\r\norx: warning: {warning}\r\n")
+                            .into_bytes()
+                            .into(),
+                    ))
+                    .await;
+            }
+            if socket
+                .send(Message::Text(
+                    json!({ "type": "complete" }).to_string().into(),
+                ))
+                .await
+                .is_ok()
+            {
+                close_socket(&mut socket).await;
+            }
+        }
+        Ok(status) => {
+            send_ws_error(
+                &mut socket,
+                format!("ssh {host} exited with code {}", status.exit_code()),
+            )
+            .await;
+        }
+        Err(error) => {
+            send_ws_error(&mut socket, error).await;
+        }
     }
 }
 
@@ -7422,6 +7521,40 @@ fn sidebar_session_json(store: &Store, session: &StoredChatSession, busy: bool) 
     Ok(value)
 }
 
+fn chat_active_runs_json(store: &Store) -> Result<Value> {
+    let mut associations: Vec<_> = store
+        .list_active_run_wakeups()?
+        .into_iter()
+        .map(|wakeup| (wakeup.chat_session_id, wakeup.run))
+        .collect();
+    for run in store.list_active_runs()? {
+        if let Some(session_id) = run.chat_session_id.clone() {
+            associations.push((session_id, run));
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut rows = Vec::new();
+    for (session_id, run) in associations {
+        if !seen.insert((session_id.clone(), run.id.clone())) {
+            continue;
+        }
+        let experiment_name = store
+            .get_local_experiment(&run.experiment_id)?
+            .map(|experiment| experiment.display_name().to_string());
+        rows.push(json!({
+            "sessionId": session_id,
+            "run": ApiRun::from(&run),
+            "experimentName": experiment_name,
+        }));
+    }
+    rows.sort_by_key(|row| (row["sessionId"].to_string(), row["run"]["id"].to_string()));
+    Ok(json!(rows))
+}
+
+async fn chat_active_runs() -> ApiResult {
+    Ok(Json(chat_active_runs_json(&Store::open()?)?))
+}
+
 async fn list_chat_sessions(
     State(state): State<AppState>,
     Query(q): Query<SessionsQuery>,
@@ -7911,6 +8044,26 @@ async fn update_chat_session(
     Ok(Json(
         json!({ "session": local::chat::session_json(&session, busy) }),
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubagentQuery {
+    part_id: String,
+}
+
+async fn chat_subagent(Path(id): Path<String>, Query(query): Query<SubagentQuery>) -> ApiResult {
+    let session = Store::open()?
+        .get_chat_session(&id)?
+        .ok_or_else(|| not_found("chat session"))?;
+    let mut messages = local::chat::list_messages(&id)?;
+    let spawn = messages
+        .iter_mut()
+        .find_map(|message| local::chat::find_part_mut(&mut message.parts, &query.part_id))
+        .ok_or_else(|| not_found("subagent"))?;
+    Ok(Json(json!(local::chat::subagent::snapshot(
+        &session, spawn
+    )?)))
 }
 
 async fn chat_messages(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult {
@@ -8449,6 +8602,7 @@ struct EventCursor {
     files: HashMap<String, u64>,
     runs: HashMap<String, (String, i64)>,
     log_offsets: HashMap<String, u64>,
+    chat_active_runs: Option<Value>,
     /// Last update status sent. Unlike the rest of the cursor this isn't store
     /// state — the updater is a separate process, so its progress reaches the UI
     /// through the same diff the store changes do.
@@ -8570,6 +8724,11 @@ fn collect_events(cursor: &mut EventCursor, first: bool) -> Result<Vec<Event>> {
         }
         // Terminal runs were seeded at EOF above, so this is a no-op for them.
         push_log_delta(&run, cursor, &mut out, &mut log_budget);
+    }
+    let active_runs = chat_active_runs_json(&store)?;
+    if cursor.chat_active_runs.as_ref() != Some(&active_runs) {
+        out.push(json_event("chat.runs", &json!({})));
+        cursor.chat_active_runs = Some(active_runs);
     }
     // Committed only now that the batch is certain to be returned.
     if let Some(update) = sampled_update {
@@ -8708,6 +8867,41 @@ pub(crate) async fn spa(uri: Uri) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_active_runs_tracks_owners_and_watchers_until_terminal() {
+        let dir = std::env::temp_dir().join(format!("orx-chat-runs-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let mut run = StoredRun {
+            id: "run-1".into(),
+            experiment_id: "experiment-1".into(),
+            project_id: "project-1".into(),
+            status: "running".into(),
+            backend_json: "{}".into(),
+            command: String::new(),
+            created_at: 1,
+            updated_at: 2,
+            ended_at: None,
+            exit_code: None,
+            commit_sha: None,
+            result_markdown: None,
+            cancel_requested: false,
+            cancel_reason: None,
+            chat_session_id: Some("owner".into()),
+        };
+        store.upsert_run(&run).unwrap();
+        store.register_run_wakeup(&run.id, "owner").unwrap();
+        store.register_run_wakeup(&run.id, "watcher").unwrap();
+        let rows = chat_active_runs_json(&store).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 2);
+        assert_eq!(rows[0]["sessionId"], "owner");
+        assert_eq!(rows[1]["sessionId"], "watcher");
+        run.status = "done".into();
+        store.upsert_run(&run).unwrap();
+        assert_eq!(chat_active_runs_json(&store).unwrap(), json!([]));
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn new_chat_uses_saved_preferences_and_normalizes_model_settings() {
@@ -9313,12 +9507,19 @@ mod tests {
 
     #[test]
     fn api_run_exposes_cancel_intent() {
+        let mut backend =
+            crate::jobs::BackendDescriptor::parse(r#"{"kind":"openresearch_job"}"#).unwrap();
+        backend.rental_lease = Some(crate::jobs::rental::Rental {
+            api_url: "https://example.invalid".into(),
+            sandbox_id: "synthetic-only".into(),
+            token: "private-rental-token".into(),
+        });
         let run = StoredRun {
             id: "run-1".into(),
             experiment_id: "experiment-1".into(),
             project_id: "project-1".into(),
             status: "running".into(),
-            backend_json: "{}".into(),
+            backend_json: backend.to_json(),
             command: String::new(),
             created_at: 1,
             updated_at: 2,
@@ -9333,6 +9534,11 @@ mod tests {
 
         let value = serde_json::to_value(ApiRun::from(&run)).unwrap();
         assert_eq!(value["cancelRequested"], true);
+        assert_eq!(value["backend"]["kind"], "openresearch_job");
+        assert!(!value.to_string().contains("private-rental-token"));
+        let legacy = serde_json::to_value(&run).unwrap();
+        assert!(!legacy.to_string().contains("private-rental-token"));
+        assert!(run.backend_json.contains("private-rental-token"));
     }
 
     #[test]

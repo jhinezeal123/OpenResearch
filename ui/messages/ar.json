@@ -539,6 +539,7 @@
   "status_running": "قيد التشغيل",
   "status_starting": "جارٍ البدء",
   "status_cancelling": "جارٍ الإلغاء",
+  "status_lost": "النتيجة غير متاحة",
   "status_cancelled": "ملغى",
   "status_editing": "قيد التعديل",
   "status_idle": "خامل",
@@ -617,6 +618,7 @@
   "activity_waiting_on_agent": "في انتظار وكيل",
   "activity_closed_agent": "أغلق وكيلًا",
   "activity_subagent_started": "بدأ الوكيل الفرعي",
+  "activity_sent_update_to_parent": "أرسل تحديثًا إلى الوكيل الرئيسي",
   "activity_agent_reported_back": "أبلغ الوكيل بالنتيجة",
   "activity_subagent_interrupted": "قُوطع الوكيل الفرعي",
   "activity_subagent": "وكيل فرعي",
@@ -1160,6 +1162,10 @@
   "remote_reconnecting_description": "انقطع الاتصال. يبقى عملك البعيد قيد التشغيل بينما يعيد OpenResearch الاتصال.",
   "remote_connecting_title": "جارٍ الاتصال بـ {host}",
   "remote_connecting_description": "جارٍ تحضير مساحة عملك البعيدة…",
+  "remote_repair_run": "Run in terminal",
+  "remote_repair_copy": "Copy command",
+  "remote_repair_copied": "Copied",
+  "remote_repair_terminal": "Repair terminal",
   "remote_reconnect": "إعادة الاتصال",
   "remote_check_again": "تحقق مجددًا",
   "remote_preparing": "جارٍ تحضير مساحة العمل البعيدة…",
@@ -1407,5 +1413,9 @@
   "acp_sign_in_help": "سجّل الدخول إلى {name} في الطرفية أدناه.",
   "acp_get_api_key": "الحصول على مفتاح DeepSeek API",
   "acp_sign_in_bigmodel": "تسجيل الدخول باستخدام BigModel",
-  "acp_adapter_required": "يلزم محوّل ACP"
+  "acp_adapter_required": "يلزم محوّل ACP",
+  "chat_experiment_running": "التجربة قيد التشغيل",
+  "chat_experiment_starting": "جارٍ بدء التجربة",
+  "chat_experiment_cancelling": "جارٍ إلغاء التجربة",
+  "chat_experiments_running": "{count} تجارب قيد التشغيل"
 }

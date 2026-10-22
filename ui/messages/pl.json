@@ -540,6 +540,7 @@
   "status_running": "W toku",
   "status_starting": "Uruchamianie",
   "status_cancelling": "Anulowanie",
+  "status_lost": "Wynik niedostępny",
   "status_cancelled": "Anulowano",
   "status_editing": "Edytowanie",
   "status_idle": "Bezczynny",
@@ -619,6 +620,7 @@
   "activity_closed_agent": "Zamknięto agenta",
   "activity_subagent_started": "Uruchomiono podagenta",
   "activity_agent_reported_back": "Agent przekazał wyniki",
+  "activity_sent_update_to_parent": "Wysłano aktualizację do agenta nadrzędnego",
   "activity_subagent_interrupted": "Przerwano działanie podagenta",
   "activity_subagent": "Podagent",
   "activity_compacted_context": "Skrócono kontekst",
@@ -1161,6 +1163,10 @@
   "remote_reconnecting_description": "Połączenie zostało przerwane. Zdalne zadania nadal działają podczas ponownego łączenia OpenResearch.",
   "remote_connecting_title": "Łączenie z {host}",
   "remote_connecting_description": "Przygotowywanie zdalnego obszaru roboczego…",
+  "remote_repair_run": "Run in terminal",
+  "remote_repair_copy": "Copy command",
+  "remote_repair_copied": "Copied",
+  "remote_repair_terminal": "Repair terminal",
   "remote_reconnect": "Połącz ponownie",
   "remote_check_again": "Sprawdź ponownie",
   "remote_preparing": "Przygotowywanie zdalnego obszaru roboczego…",
@@ -1407,5 +1413,9 @@
   "acp_sign_in_help": "Zaloguj się do {name} w terminalu poniżej.",
   "acp_get_api_key": "Uzyskaj klucz API DeepSeek",
   "acp_sign_in_bigmodel": "Zaloguj się przez BigModel",
-  "acp_adapter_required": "Wymagany adapter ACP"
+  "acp_adapter_required": "Wymagany adapter ACP",
+  "chat_experiment_running": "Eksperyment trwa",
+  "chat_experiment_starting": "Uruchamianie eksperymentu",
+  "chat_experiment_cancelling": "Anulowanie eksperymentu",
+  "chat_experiments_running": "Trwające eksperymenty: {count}"
 }

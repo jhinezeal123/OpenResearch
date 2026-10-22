@@ -89,7 +89,7 @@ export interface Experiment {
   archived: boolean;
 }
 
-export type RunStatus = "starting" | "running" | "done" | "failed" | "cancelled";
+export type RunStatus = "starting" | "running" | "done" | "failed" | "cancelled" | "lost";
 export type RunDisplayStatus = RunStatus | "cancelling";
 
 export interface Run {
@@ -1051,6 +1051,9 @@ export interface RemoteSessionInfo {
   dashboardProtocol: number | null;
   gatewayUrl: string;
   error: string | null;
+  /** Server-derived repair command for a permission rejection, shown inline so
+   * the user can copy it or run it in the terminal. */
+  repairCommand: string | null;
   installPaths: RemoteInstallPaths | null;
   uiPreferences: { theme: string | null; locale: string | null };
   canStartNewHost: boolean;
@@ -2322,3 +2325,15 @@ export const discoverLocalModels = (request: { baseUrl: string; apiKey: string }
 export const connectLocalModel = (request: { name: string; baseUrl: string; apiKey: string; model: string; contextWindow: number }) => post<{ model: string }>("/api/local-models", request);
 export const checkLocalModel = (id: string) => post<{ models: string[] }>(`/api/local-models/${encodeURIComponent(id)}/check`, {});
 export const removeLocalModel = (id: string) => writeResponse(`/api/local-models/${encodeURIComponent(id)}`, { method: "DELETE" }).then((r) => json<{ ok: boolean }>(r));
+
+export interface ChatActiveRun {
+  sessionId: string;
+  run: Run;
+  experimentName: string | null;
+}
+
+export const listChatActiveRuns = (signal?: AbortSignal) =>
+  get<ChatActiveRun[]>("/api/chat/active-runs", signal);
+
+export const getSubagentTranscript = (sessionId: string, partId: string, signal?: AbortSignal) =>
+  get<ChatPart | null>(`/api/chat/sessions/${sessionId}/subagent?partId=${encodeURIComponent(partId)}`, signal);

@@ -540,6 +540,7 @@
   "status_running": "En ejecución",
   "status_starting": "Iniciando",
   "status_cancelling": "Cancelando",
+  "status_lost": "Resultado no disponible",
   "status_cancelled": "Cancelado",
   "status_editing": "Editando",
   "status_idle": "Inactivo",
@@ -618,6 +619,7 @@
   "activity_waiting_on_agent": "Esperando a un agente",
   "activity_closed_agent": "Cerró un agente",
   "activity_subagent_started": "Subagente iniciado",
+  "activity_sent_update_to_parent": "Envió una actualización al agente principal",
   "activity_agent_reported_back": "El agente informó de los resultados",
   "activity_subagent_interrupted": "Subagente interrumpido",
   "activity_subagent": "Subagente",
@@ -1161,6 +1163,10 @@
   "remote_reconnecting_description": "Se perdió la conexión. Tu trabajo remoto sigue en ejecución mientras OpenResearch se reconecta.",
   "remote_connecting_title": "Conectando a {host}",
   "remote_connecting_description": "Preparando tu espacio de trabajo remoto…",
+  "remote_repair_run": "Run in terminal",
+  "remote_repair_copy": "Copy command",
+  "remote_repair_copied": "Copied",
+  "remote_repair_terminal": "Repair terminal",
   "remote_reconnect": "Reconectar",
   "remote_check_again": "Volver a comprobar",
   "remote_preparing": "Preparando el espacio de trabajo remoto…",
@@ -1407,5 +1413,9 @@
   "acp_sign_in_help": "Inicia sesión en {name} en el terminal de abajo.",
   "acp_get_api_key": "Obtener una clave API de DeepSeek",
   "acp_sign_in_bigmodel": "Iniciar sesión con BigModel",
-  "acp_adapter_required": "Se necesita un adaptador ACP"
+  "acp_adapter_required": "Se necesita un adaptador ACP",
+  "chat_experiment_running": "Experimento en ejecución",
+  "chat_experiment_starting": "Iniciando experimento",
+  "chat_experiment_cancelling": "Cancelando experimento",
+  "chat_experiments_running": "{count} experimentos en ejecución"
 }

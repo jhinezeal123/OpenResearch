@@ -540,6 +540,7 @@
   "status_running": "실행 중",
   "status_starting": "시작 중",
   "status_cancelling": "취소 중",
+  "status_lost": "결과를 확인할 수 없음",
   "status_cancelled": "취소됨",
   "status_editing": "편집 중",
   "status_idle": "대기 중",
@@ -619,6 +620,7 @@
   "activity_closed_agent": "에이전트 종료 완료",
   "activity_subagent_started": "하위 에이전트 시작됨",
   "activity_agent_reported_back": "에이전트 결과 보고됨",
+  "activity_sent_update_to_parent": "상위 에이전트에 업데이트를 보냈습니다",
   "activity_subagent_interrupted": "하위 에이전트 중단됨",
   "activity_subagent": "하위 에이전트",
   "activity_compacted_context": "컨텍스트 압축 완료",
@@ -1161,6 +1163,10 @@
   "remote_reconnecting_description": "연결이 끊어졌습니다. OpenResearch가 다시 연결하는 동안 원격 작업은 계속 실행됩니다.",
   "remote_connecting_title": "{host}에 연결 중",
   "remote_connecting_description": "원격 작업 공간 준비 중…",
+  "remote_repair_run": "Run in terminal",
+  "remote_repair_copy": "Copy command",
+  "remote_repair_copied": "Copied",
+  "remote_repair_terminal": "Repair terminal",
   "remote_reconnect": "다시 연결",
   "remote_check_again": "다시 확인",
   "remote_preparing": "원격 작업 공간 준비 중…",
@@ -1407,5 +1413,9 @@
   "acp_sign_in_help": "아래 터미널에서 {name}에 로그인하세요.",
   "acp_get_api_key": "DeepSeek API 키 발급",
   "acp_sign_in_bigmodel": "BigModel로 로그인",
-  "acp_adapter_required": "ACP 어댑터 필요"
+  "acp_adapter_required": "ACP 어댑터 필요",
+  "chat_experiment_running": "실험 실행 중",
+  "chat_experiment_starting": "실험 시작 중",
+  "chat_experiment_cancelling": "실험 취소 중",
+  "chat_experiments_running": "실험 {count}개 실행 중"
 }

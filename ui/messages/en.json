@@ -540,6 +540,7 @@
   "status_running": "Running",
   "status_starting": "Starting",
   "status_cancelling": "Cancelling",
+  "status_lost": "Outcome unavailable",
   "status_cancelled": "Cancelled",
   "status_editing": "Editing",
   "status_idle": "Idle",
@@ -618,6 +619,7 @@
   "activity_waiting_on_agent": "Waiting on an agent",
   "activity_closed_agent": "Closed an agent",
   "activity_subagent_started": "Sub-agent started",
+  "activity_sent_update_to_parent": "Sent update to parent",
   "activity_agent_reported_back": "Agent reported back",
   "activity_subagent_interrupted": "Sub-agent interrupted",
   "activity_subagent": "Sub-agent",
@@ -1161,6 +1163,10 @@
   "remote_reconnecting_description": "The connection dropped. Your remote work remains running while OpenResearch reconnects.",
   "remote_connecting_title": "Connecting to {host}",
   "remote_connecting_description": "Preparing your remote workspace…",
+  "remote_repair_run": "Run in terminal",
+  "remote_repair_copy": "Copy command",
+  "remote_repair_copied": "Copied",
+  "remote_repair_terminal": "Repair terminal",
   "remote_reconnect": "Reconnect",
   "remote_check_again": "Check again",
   "remote_preparing": "Preparing remote workspace…",
@@ -1407,5 +1413,9 @@
   "acp_sign_in_help": "Sign in to {name} in the terminal below.",
   "acp_get_api_key": "Get a DeepSeek API key",
   "acp_sign_in_bigmodel": "Sign in with BigModel",
-  "acp_adapter_required": "ACP adapter needed"
+  "acp_adapter_required": "ACP adapter needed",
+  "chat_experiment_running": "Experiment running",
+  "chat_experiment_starting": "Experiment starting",
+  "chat_experiment_cancelling": "Cancelling experiment",
+  "chat_experiments_running": "{count} experiments running"
 }
