@@ -375,7 +375,10 @@ def notebook_status(account, kernel_ref, session_id=None):
     try:
         response = requests.get('https://www.kaggle.com/api/v1/kernels/status',
             params={'user_name': owner, 'kernel_slug': slug},
-            headers={'Authorization': 'Bearer ' + account_store.read_token(key)}, timeout=(10, 20))
+            # Kaggle can return a misleading 404 for a library's default agent.
+            # Identify this client independently of the bundled requests version.
+            headers={'Authorization': 'Bearer ' + account_store.read_token(key),
+                     'User-Agent': 'OpenResearch-Kaggle'}, timeout=(10, 20))
     finally:
         record_metrics(key, 0, len(response.content) if response is not None else 0, started,
                        response is None or response.status_code >= 400)

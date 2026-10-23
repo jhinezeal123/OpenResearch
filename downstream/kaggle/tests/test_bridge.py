@@ -2,10 +2,11 @@ import importlib.util
 import unittest
 import tempfile
 import json
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'python'))
@@ -16,6 +17,29 @@ bridge = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bridge)
 
 class BridgeTests(unittest.TestCase):
+    def test_provider_status_identifies_client_and_recognizes_completed_notebook(self):
+        session_path=Path(__file__).resolve().parents[1]/'python/native/interface_ai_scientist/session.py'
+        store=SimpleNamespace(resolve=lambda a:('qa',{'username':'qa-user'}),read_token=lambda a:'KGAT_FIXTURE')
+        response=SimpleNamespace(content=b'{"status":"complete"}',status_code=200,
+                                 raise_for_status=lambda:None,json=lambda:{'status':'complete'})
+        def get(url, *, params, headers, timeout):
+            # The provider rejected the runtime library's default User-Agent.
+            self.assertEqual(headers['User-Agent'],'OpenResearch-Kaggle')
+            self.assertEqual(headers['Authorization'],'Bearer KGAT_FIXTURE')
+            self.assertEqual(params,{'user_name':'qa-user','kernel_slug':'notebook'})
+            return response
+        with patch.dict(os.environ,{'ORX_KAGGLE_HOME':'unused-fixture'}), patch.dict(sys.modules,{
+            'account_store':store,
+            'proxy_control':SimpleNamespace(ensure_proxy=lambda:None,PROXY_PORT=0),
+            'provider_metrics':SimpleNamespace(record=Mock()),
+            'requests':SimpleNamespace(get=get),
+        }):
+            spec=importlib.util.spec_from_file_location('test_provider_session',session_path)
+            session=importlib.util.module_from_spec(spec);spec.loader.exec_module(session)
+            result=session.notebook_status('qa','qa-user/notebook','session-id')
+        self.assertTrue(result['stopped'])
+        self.assertEqual(result['session_id'],'session-id')
+
     def test_catalog_returns_metadata_without_credentials(self):
         class Store:
             def load_registry(self):

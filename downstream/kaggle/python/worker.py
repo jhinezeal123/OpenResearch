@@ -189,6 +189,15 @@ def serve(config):
                 if current['state']!='closing': pool.close(sid,'Notebook lifetime expired')
                 stopping.set()
                 if state['channel']: state['channel'].close()
+                # A shared scheduler retains uncertain stop reservations;
+                # do not keep one local worker alive per expired notebook.
+                from scheduler import ensure_scheduler, healthy
+                try:
+                    ensure_scheduler(pool)
+                    if healthy(load(pool.home/'scheduler-owner.json'), load(pool.home/'scheduler-heartbeat.json')):
+                        break
+                except OSError:
+                    pass
                 if time.monotonic()<next_stop: continue
                 # Keep ownership until the provider confirms stop, including offline periods.
                 stopped,stop_requested=shutdown(session,sid,row['account'],Path(config['home'])/'sessions',stop_requested)

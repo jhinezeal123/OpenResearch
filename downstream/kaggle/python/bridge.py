@@ -43,9 +43,10 @@ def configure(request):
     os.environ['ORX_KAGGLE_HOME']=str(home)
     if os.name=='nt':
         native_ssh=Path(os.environ.get('SYSTEMROOT','C:/Windows'))/'System32/OpenSSH'
-        os.environ['PATH']=str(native_ssh)+os.pathsep+os.environ.get('PATH','')
+        if str(native_ssh) not in os.environ.get('PATH','').split(os.pathsep):
+            os.environ['PATH']=str(native_ssh)+os.pathsep+os.environ.get('PATH','')
     native=Path(__file__).resolve().parent/'native'
-    sys.path.insert(0,str(native))
+    if str(native) not in sys.path: sys.path.insert(0,str(native))
     os.environ['PYTHONPATH']=str(native)
     # Each owner gets its own local token proxy; never borrow another checkout's service.
     with socket.socket() as sock:
@@ -68,11 +69,15 @@ def contact(folder,request,timeout=55):
 
 
 def ensure_worker(session,pool,row,request):
-    import os,subprocess
-    from processes import alive, load, lock, owner, save, terminate
+    import subprocess
+    from processes import alive, load, lock, owner, save, spawn_python, terminate
     from scheduler import ensure_scheduler, healthy
     if not request.get('_scheduler'):
         ensure_scheduler(pool)
+    row=pool.get(row['id'])
+    # Closing reservations need a retry record, not a resident interpreter.
+    # The shared scheduler performs bounded cleanup one session at a time.
+    if row['state'] in ('closing','stopped'): return
     folder=pool.worker_dir(row['id'])
     with lock(folder/'launch.lock') as acquired:
         if not acquired: return
@@ -109,9 +114,8 @@ def ensure_worker(session,pool,row,request):
         config={**json.loads(row['spec']), 'home':str(pool.home),'sessionId':row['id'],'account':row['account']}
         save(folder/'worker-config.json',config)
         with (folder/'worker.log').open('ab') as log:
-            child=subprocess.Popen([sys.executable,str(Path(__file__).with_name('worker.py')),str(folder/'worker-config.json')],
-                stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,cwd=Path(__file__).parent,
-                creationflags=(getattr(subprocess,'DETACHED_PROCESS',0)|getattr(subprocess,'CREATE_NEW_PROCESS_GROUP',0)|getattr(subprocess,'CREATE_NO_WINDOW',0)),start_new_session=os.name!='nt')
+            child=spawn_python(Path(__file__).with_name('worker.py'),folder/'worker-config.json',
+                stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,cwd=Path(__file__).parent)
         failures=min(6,metadata.get('failures',0)+1)
         save(folder/'owner.json',{**owner(child.pid),'failures':failures,
              'restart_after':time.time()+min(120,5*2**(failures-1))})

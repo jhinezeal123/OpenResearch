@@ -54,15 +54,56 @@ class SchedulerTests(unittest.TestCase):
         row=self.pool.acquire(request,['a'])
         self.pool.ready(row['id'],123);self.pool.release(row['id'],row['active_run'])
         with self.pool.db() as db: db.execute('UPDATE sessions SET idle_since=0')
-        with patch('bridge.ensure_worker') as ensure:
+        with patch('bridge.ensure_worker') as ensure, patch.object(scheduler,'cleanup') as cleanup:
             self.assertTrue(scheduler.sweep(self.pool))
-            self.assertEqual(ensure.call_args.args[2]['state'],'closing')
-            self.assertTrue(ensure.call_args.args[3]['_scheduler'])
+            ensure.assert_not_called()
+            self.assertEqual(cleanup.call_args.args[1]['state'],'closing')
         self.assertEqual(self.pool.get(row['id'])['state'],'closing')
         self.pool.stopped(row['id'])
         with patch('bridge.ensure_worker') as ensure:
             self.assertFalse(scheduler.sweep(self.pool))
             ensure.assert_not_called()
+
+    def test_many_closing_sessions_share_bounded_cleanup_and_backoff(self):
+        import uuid
+        rows=[]
+        for account in ('a','b','c','d','e','f'):
+            row=self.pool.acquire({'runId':str(uuid.uuid4()),'projectId':'p','accelerator':'cpu',
+                                  'ttlSeconds':3600,'runtime':{'accounts':[account]}},[account])
+            self.pool.close(row['id']);rows.append(row)
+        with patch('bridge.ensure_worker') as ensure, patch('bridge.configure'), \
+                patch('worker.shutdown',return_value=(False,False)) as shutdown:
+            for _ in rows:
+                self.assertTrue(scheduler.sweep(self.pool))
+            ensure.assert_not_called()
+            self.assertEqual(shutdown.call_count,6)
+            self.assertEqual({c.args[1] for c in shutdown.call_args_list},{r['id'] for r in rows})
+            scheduler.sweep(self.pool)
+            self.assertEqual(shutdown.call_count,6,'backoff must survive repeated dashboard polls')
+        self.assertTrue(all(r['state']=='closing' for r in self.pool.live()))
+
+    def test_cleanup_persists_stop_request_and_releases_only_with_receipt(self):
+        import uuid
+        row=self.pool.acquire({'runId':str(uuid.uuid4()),'projectId':'p','accelerator':'cpu',
+                               'ttlSeconds':3600,'runtime':{'accounts':['a']}},['a'])
+        self.pool.close(row['id'])
+        with patch('bridge.configure'), patch('worker.shutdown',side_effect=[(False,True),(True,True)]) as shutdown:
+            scheduler.cleanup(self.pool,row)
+            self.assertEqual(self.pool.get(row['id'])['state'],'closing')
+            self.assertTrue(processes.load(self.pool.worker_dir(row['id'])/'stop-requested.json')['requested'])
+            scheduler.cleanup(self.pool,row)
+            self.assertTrue(shutdown.call_args.args[-1])
+        self.assertEqual(self.pool.get(row['id'])['state'],'stopped')
+
+    def test_cleanup_waits_for_existing_worker_to_release_lifetime_lock(self):
+        import uuid
+        row=self.pool.acquire({'runId':str(uuid.uuid4()),'projectId':'p','accelerator':'cpu',
+                               'ttlSeconds':3600,'runtime':{'accounts':['a']}},['a'])
+        self.pool.close(row['id'])
+        with processes.lock(self.pool.worker_dir(row['id'])/'worker.lock'), patch('worker.shutdown') as shutdown:
+            scheduler.cleanup(self.pool,row)
+            shutdown.assert_not_called()
+        self.assertGreater(processes.load(self.pool.worker_dir(row['id'])/'cleanup.json')['retry_at'],time.time())
 
 
 if __name__=='__main__': unittest.main()

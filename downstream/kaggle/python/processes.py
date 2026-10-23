@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import time
 import uuid
 
@@ -25,6 +26,23 @@ def load(path):
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def spawn_python(script, *args, **kwargs):
+    """Start one background interpreter, preserving the current virtualenv.
+
+    Windows venv python.exe is a launcher: its PID differs from the interpreter
+    heartbeat, and its child may allocate a console after DETACHED_PROCESS.
+    Use the base interpreter with the same venv hint as CPython's launcher.
+    """
+    executable = sys.executable
+    if os.name == 'nt':
+        executable = getattr(sys, '_base_executable', None) or executable
+        kwargs['env'] = {**kwargs.get('env', os.environ), '__PYVENV_LAUNCHER__': sys.executable}
+        kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs['start_new_session'] = True
+    return subprocess.Popen([executable, str(script), *map(str, args)], **kwargs)
 
 
 @contextmanager

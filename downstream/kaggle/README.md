@@ -100,7 +100,7 @@ spawning another interpreter on every poll.
 | Remote confirms `NOT_STARTED` and no acquisition/upload activity for 2 minutes | Close the abandoned lease. Large ongoing uploads refresh this grace, never the notebook TTL. |
 | Worker heartbeat absent for 180 seconds | Verify PID **and creation time**, terminate that owner, and recover the same session. A running remote experiment is inspected, never replayed. |
 | Provider reports the notebook already stopped | Persist the receipt, free the account, and exit the worker. |
-| Stop outcome or remote state is unknown | Keep the account reserved; retry shutdown with backoff up to 60 seconds. A lost connection alone never releases a lease. |
+| Stop outcome or remote state is unknown | Keep the account reserved; the shared scheduler retries shutdown with backoff up to 5 minutes. A lost connection alone never releases a lease. |
 
 `processes.py` owns local tree cleanup. On Windows, SSH starts suspended and is
 assigned to a kill-on-close Job before being resumed, so its Tailcat
@@ -115,8 +115,19 @@ Token proxies run only during bootstrap. Idle notebooks hold no persistent
 SSH/Tailcat pipe. One active notebook still needs a worker, SSH and Tailcat,
 plus one scheduler shared by the pool; the Run supervisor and short bridge
 calls are separate processes. These are background processes, and internal
-Windows commands run without opening terminal windows. After the last
-notebook's stop is confirmed, its worker and the pool scheduler exit.
+Windows commands run without opening terminal windows. Windows workers and the
+scheduler launch the underlying interpreter directly while preserving their
+virtualenv, so launcher PIDs cannot cause false stale-heartbeat recovery or
+extra console windows. Closing sessions hand off to the shared scheduler and
+release their workers. The scheduler attempts at most one closing session per
+sweep; six uncertain stop receipts therefore need one background scheduler,
+rather than six resident workers. After the last notebook's stop is confirmed,
+the pool scheduler exits.
+
+Provider status requests identify the client as `OpenResearch-Kaggle` rather
+than inheriting a requests-library User-Agent. This avoids misleading 404
+responses observed with the bundled requests version, which otherwise prevent
+confirmed completed notebooks from releasing their account reservations.
 
 The upgrade migrates `pool.sqlite3` in place. Workers started by an older binary
 are authenticated through their existing private endpoint and allowed to

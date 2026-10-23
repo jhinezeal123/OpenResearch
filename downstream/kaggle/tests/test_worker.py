@@ -81,6 +81,8 @@ class WorkerLifecycleTests(unittest.TestCase):
         for mocked in (
             patch.object(bridge,'configure',return_value=session),
             patch.object(bridge,'control',return_value={'stopped':True}),
+            patch('scheduler.ensure_scheduler'),
+            patch('scheduler.healthy',return_value=False),
             patch.object(worker,'Channel',return_value=self.channel),
             patch.dict(sys.modules,{
                 'interface_ai_scientist.bootstrap_service':SimpleNamespace(start=self.start),
@@ -114,6 +116,13 @@ class WorkerLifecycleTests(unittest.TestCase):
         self.begin();self.future.result(timeout=5)
         self.start.assert_not_called();self.proxy.assert_not_called()
         self.assertEqual(self.pool.get(self.row['id'])['state'],'stopped')
+
+    def test_closing_owner_hands_off_to_shared_scheduler_without_releasing_account(self):
+        self.pool.close(self.row['id'])
+        with patch('scheduler.healthy', return_value=True):
+            self.begin();self.future.result(timeout=5)
+        self.start.assert_not_called();self.proxy.assert_not_called()
+        self.assertEqual(self.pool.get(self.row['id'])['state'],'closing')
 
     def test_external_stop_receipt_ends_the_owner_and_closes_its_channel(self):
         self.begin()
@@ -152,6 +161,17 @@ class WorkerLifecycleTests(unittest.TestCase):
 
 
 class OwnerRecoveryTests(unittest.TestCase):
+    def test_closing_sessions_never_spawn_an_individual_worker(self):
+        with tempfile.TemporaryDirectory() as home:
+            pool=Pool(home)
+            request={'runId':str(uuid.uuid4()),'projectId':'p','accelerator':'cpu','ttlSeconds':600,
+                     'runtime':{'accounts':['a']}}
+            row=pool.acquire(request,['a'])
+            pool.close(row['id'])
+            with patch('scheduler.ensure_scheduler') as ensure, patch('subprocess.Popen') as spawn:
+                bridge.ensure_worker(None,pool,row,{})
+                ensure.assert_called_once();spawn.assert_not_called()
+
     def test_repeated_startup_failures_back_off_instead_of_spawning_on_every_request(self):
         with tempfile.TemporaryDirectory() as home:
             pool=Pool(home)
