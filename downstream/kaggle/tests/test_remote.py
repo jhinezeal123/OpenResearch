@@ -27,6 +27,14 @@ class RemoteRunTests(unittest.TestCase):
         self.run_id = str(uuid.uuid4())
         self.directory = remote.run_dir(self.run_id)
 
+    def test_unlaunched_lease_is_distinct_from_a_running_or_uncertain_command(self):
+        self.assertEqual(remote.dispatch({'action':'inspect','runId':self.run_id})['stage'],'NOT_STARTED')
+        self.directory.mkdir(parents=True)
+        (self.directory/'launch-intent').write_text('uncertain')
+        self.assertEqual(remote.dispatch({'action':'inspect','runId':self.run_id})['stage'],'UNKNOWN')
+        (self.directory/'pid').write_text('123')
+        self.assertEqual(remote.dispatch({'action':'inspect','runId':self.run_id})['stage'],'RUNNING')
+
     def test_cancel_before_launch_survives_a_lost_ack_and_blocks_delayed_launch(self):
         result = remote.dispatch({'action':'cancel','runId':self.run_id})
         self.assertEqual((result['stage'], result['exitCode']), ('ERROR', 143))

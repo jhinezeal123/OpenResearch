@@ -65,7 +65,7 @@ def protect_acl(path, recursive=False):
         sid = subprocess.check_output(
             ['powershell.exe', '-NoProfile', '-Command',
              '[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value'],
-            text=True).strip()
+            text=True, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)).strip()
     except Exception:
         return
     rules = ['*%s:(F)' % sid, '*S-1-5-18:(F)', '*S-1-5-32-544:(F)']
@@ -76,7 +76,8 @@ def protect_acl(path, recursive=False):
     if recursive:
         cmd.append('/T')
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        subprocess.run(cmd, check=True, capture_output=True, text=True,
+                       creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     except Exception as exc:
         # ACL hardening is best-effort for compatibility with non-Windows
         # callers, but retain a diagnostic for the caller/debugger instead of

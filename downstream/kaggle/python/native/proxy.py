@@ -312,35 +312,17 @@ class H(http.server.BaseHTTPRequestHandler):
 
     do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = _do
 
-def _owner_alive(pid):
-    if os.name == 'nt':
-        import ctypes
-        from ctypes import wintypes
-        k = ctypes.WinDLL('kernel32', use_last_error=True)
-        k.OpenProcess.restype = wintypes.HANDLE
-        handle = k.OpenProcess(0x1000, False, pid)
-        if not handle:
-            return False
-        try:
-            status = wintypes.DWORD()
-            return bool(k.GetExitCodeProcess(handle, ctypes.byref(status))) and status.value == 259
-        finally:
-            k.CloseHandle(handle)
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-
-
 def _exit_with_owner():
     # Each bridge call or worker starts its own proxy; exit when that owner is gone,
     # even if it crashed, so short-lived calls do not leave proxies behind.
-    owner = int(os.environ.get('ORX_KAGGLE_PROXY_OWNER') or 0)
-    if not owner:
+    raw = os.environ.get('ORX_KAGGLE_PROXY_OWNER_ID')
+    if not raw:
         return
+    import json
+    from processes import alive
+    owner = json.loads(raw)
     def watch():
-        while _owner_alive(owner):
+        while alive(owner):
             time.sleep(2)
         os._exit(0)
     threading.Thread(target=watch, daemon=True).start()

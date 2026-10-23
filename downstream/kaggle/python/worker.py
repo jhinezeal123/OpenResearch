@@ -12,7 +12,8 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from pool import Pool
+from pool import Pool, LAUNCH_SECONDS
+from processes import guard_worker, load, lock, owner, save, spawn_tree, stop_tree
 
 class Channel:
     def __init__(self, session, state, log):
@@ -21,18 +22,23 @@ class Channel:
         self.lock=threading.Lock()
         self.connections=0
     def connect(self):
+        self._disconnect()
         source=Path(__file__).with_name('remote.py').read_bytes()
         code='import base64;exec(base64.b64decode('+repr(base64.b64encode(source).decode())+'))'
         command=self.session.notebook_environment_command('python3 -u -c '+shlex.quote(code))
         ssh=str(Path(os.environ.get('SYSTEMROOT','C:/Windows'))/'System32/OpenSSH/ssh.exe') if os.name=='nt' else 'ssh'
-        self.process=subprocess.Popen([ssh,*self.session.ssh_options(self.state),'-T',self.state['address'],command],
-            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=self.log,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
+        self.process=spawn_tree([ssh,*self.session.ssh_options(self.state),'-T',self.state['address'],command],
+            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=self.log)
         self.lines=queue.Queue()
         process=self.process
         lines=self.lines
         def reader():
-            for line in process.stdout: lines.put(line)
-            lines.put(None)
+            try:
+                for line in process.stdout: lines.put(line)
+            except (OSError, ValueError):
+                pass
+            finally:
+                lines.put(None)
         threading.Thread(target=reader,daemon=True).start()
         self.connections+=1
     def rpc(self, request):
@@ -45,13 +51,16 @@ class Channel:
                 value=json.loads(line)
                 if not value['ok']: raise RuntimeError(value.get('error','Remote operation failed'))
                 return value['result']
-            except (OSError,queue.Empty,ValueError):
-                self.process.kill();self.process.wait(timeout=5);self.process=None
+            except (OSError,queue.Empty,ValueError,KeyError,TypeError):
+                self._disconnect()
                 # Never replay a command whose acknowledgement was lost.
                 raise ConnectionError('SSH interrupted; inspect the same Run ID before retrying') from None
+    def _disconnect(self):
+        process,self.process=self.process,None
+        stop_tree(process)
     def close(self):
-        if self.process and self.process.poll() is None:
-            self.process.kill();self.process.wait(timeout=5)
+        with self.lock:
+            self._disconnect()
 
 def shutdown(session,sid,account,root,requested):
     from bridge import control
@@ -70,16 +79,20 @@ def serve(config):
     session=configure(config)
     pool=Pool(config['home'])
     sid=config['sessionId']
+    pool.reconcile()
     row=pool.get(sid)
+    if row['state']=='stopped': return
     folder=pool.worker_dir(sid)
     folder.mkdir(parents=True,exist_ok=True)
     token=secrets.token_urlsafe(32)
     state={'receipt':None,'channel':None,'error':None,'fatal':False}
-    from proxy_control import ensure_proxy
-    proxy=ensure_proxy()
+    stopping=threading.Event()
     log=(folder/'ssh.log').open('ab')
     class Handler(BaseHTTPRequestHandler):
         def log_message(self,*args): pass
+        def setup(self):
+            super().setup()
+            self.connection.settimeout(10)
         def do_POST(self):
             if self.headers.get('Authorization')!='Bearer '+token:
                 self.send_error(403);return
@@ -89,7 +102,7 @@ def serve(config):
                 r=json.loads(self.rfile.read(size))
                 if r['action']=='health': result={'ready':state['channel'] is not None,'error':state['error'],'fatal':state['fatal'],'receipt':state['receipt'],'connections':state['channel'].connections if state['channel'] else 0}
                 elif r['action']=='close': pool.close(sid);result={'closing':True}
-                elif r['action']=='launch' and pool.get(sid)['state']=='closing': result={'pending':True,'closing':True}
+                elif pool.get(sid)['state'] in ('closing','stopped'): result={'pending':True,'closing':True}
                 elif state['channel'] is None: result={'pending':True,'error':state['error']}
                 else:
                     if 'runId' in r:
@@ -114,51 +127,107 @@ def serve(config):
         pool.close(sid,message)
     def provision():
         from interface_ai_scientist.bootstrap_service import start
+        from proxy_control import ensure_proxy, stop_proxies
+        proxy=None
         failures=0
-        while pool.get(sid)['state']!='closing' and time.time()<row['deadline']:
-            try:
-                r=start(account=row['account'],request_id=sid,ttl_seconds=config['ttlSeconds'],accelerator=config['accelerator'],
-                    competition_sources=config.get('competitionSources',[]),dataset_sources=config.get('datasetSources',[]),wait_seconds=5)
-                state['receipt']=r
-                if r.get('ssh_status')=='READY':
-                    saved=session.state_for(sid)
-                    state['channel']=Channel(session,saved,log)
-                    state['channel'].rpc({'action':'ping'})
-                    state['error']=None
-                    pool.ready(sid,os.getpid());return
-                if r.get('submission_status')=='NOT_SUBMITTED':
-                    give_up('Kaggle notebook was not submitted ('+str(r.get('error_type') or 'no detail')+')');return
-                failures=0
-            except Exception as e:
-                failures+=1
-                state['error']=type(e).__name__+': '+str(e)[:300]
-                print('Provision: '+str(e),file=sys.stderr,flush=True)
-                if failures>=5:
-                    give_up('Kaggle bootstrap failed 5 times in a row: '+state['error']);return
-            time.sleep(2)
-    threading.Thread(target=provision,daemon=True).start()
+        try:
+            while not stopping.is_set() and pool.get(sid)['state'] not in ('closing','stopped') and time.time()<row['deadline']:
+                try:
+                    if proxy is None or proxy.poll() is not None: proxy=ensure_proxy()
+                    r=start(account=row['account'],request_id=sid,ttl_seconds=config['ttlSeconds'],accelerator=config['accelerator'],
+                        competition_sources=config.get('competitionSources',[]),dataset_sources=config.get('datasetSources',[]),wait_seconds=5)
+                    state['receipt']=r
+                    if r.get('ssh_status')=='READY':
+                        saved=session.state_for(sid)
+                        channel=Channel(session,saved,log)
+                        try:
+                            channel.rpc({'action':'ping'})
+                            if stopping.is_set() or pool.get(sid)['state'] in ('closing','stopped'): return
+                            pool.ready(sid,os.getpid())
+                            state['channel']=channel
+                        finally:
+                            if state['channel'] is not channel: channel.close()
+                        state['error']=None
+                        return
+                    if r.get('submission_status')=='NOT_SUBMITTED':
+                        give_up('Kaggle notebook was not submitted ('+str(r.get('error_type') or 'no detail')+')');return
+                    failures=0
+                except Exception as e:
+                    failures+=1
+                    state['error']=type(e).__name__+': '+str(e)[:300]
+                    print('Provision: '+str(e),file=sys.stderr,flush=True)
+                    if failures>=5:
+                        give_up('Kaggle bootstrap failed 5 times in a row: '+state['error']);return
+                stopping.wait(2)
+        finally:
+            # Token forwarding is only needed for bootstrap submission, not
+            # throughout training or the notebook's idle grace period.
+            stop_proxies()
+    provision_thread=threading.Thread(target=provision,daemon=True)
+    provision_thread.start()
     last_poll=0
-    stop_requested=False
+    last_status=time.monotonic()
+    last_heartbeat=0
+    last_maintenance=0
+    stop_requested=load(folder/'stop-requested.json').get('requested') is True
+    next_stop=0
+    stop_delay=3
     try:
         while True:
+            if time.monotonic()-last_maintenance>=10:
+                # Each owner enforces its bounds even if the pool scheduler
+                # itself is temporarily unavailable.
+                pool.reconcile()
+                last_maintenance=time.monotonic()
+            if time.monotonic()-last_heartbeat>=5:
+                save(folder/'heartbeat.json',{**owner(os.getpid()),'at':time.time()})
+                last_heartbeat=time.monotonic()
             server.handle_request()
             current=pool.get(sid)
+            if current['state']=='stopped': break
             if current['state']=='closing' or time.time()>=current['deadline']:
+                if current['state']!='closing': pool.close(sid,'Notebook lifetime expired')
+                stopping.set()
+                if state['channel']: state['channel'].close()
+                if time.monotonic()<next_stop: continue
                 # Keep ownership until the provider confirms stop, including offline periods.
                 stopped,stop_requested=shutdown(session,sid,row['account'],Path(config['home'])/'sessions',stop_requested)
                 if stopped: pool.stopped(sid);break
-                time.sleep(3)
+                if stop_requested:
+                    save(folder/'stop-requested.json',{'requested':True})
+                next_stop=time.monotonic()+stop_delay
+                stop_delay=min(60,stop_delay*2)
             elif state['channel'] and current['active_run'] and time.monotonic()-last_poll>5:
                 last_poll=time.monotonic()
                 try:
                     r=state['channel'].rpc({'action':'inspect','runId':current['active_run']})
                     if r['stage'] in ('COMPLETE','ERROR'): pool.release(sid,current['active_run'])
+                    elif r['stage']=='NOT_STARTED' and time.time()-(current['leased_at'] or current['created'])>LAUNCH_SECONDS:
+                        pool.close(sid,'Run lease was never launched within 2 minutes')
                 except Exception: pass
+            elif current['state']=='idle' and state['channel']:
+                # Preserve the notebook's packages, not an unused terminal pipe.
+                state['channel'].close()
+            if current['state']!='closing' and time.monotonic()-last_status>=60:
+                last_status=time.monotonic()
+                try:
+                    if control(session,'status',sid,row['account'],Path(config['home'])/'sessions').get('stopped'):
+                        pool.stopped(sid);break
+                except Exception:
+                    pass  # A network failure does not prove a live Run is dead.
     finally:
+        stopping.set()
         server.server_close()
         if state['channel']: state['channel'].close()
-        if proxy is not None and proxy.poll() is None: proxy.terminate();proxy.wait(timeout=5)
+        # The lifetime Job reaps any bootstrap child still blocked in a network
+        # call when this worker exits. Never wait indefinitely on that thread.
+        provision_thread.join(timeout=1)
         log.close()
 
 if __name__=='__main__':
-    serve(json.loads(Path(sys.argv[1]).read_text('utf-8')))
+    config=json.loads(Path(sys.argv[1]).read_text('utf-8'))
+    pool=Pool(config['home'])
+    with lock(pool.worker_dir(config['sessionId'])/'worker.lock') as acquired:
+        if acquired:
+            guard_worker()
+            serve(config)

@@ -55,15 +55,18 @@ when a notebook is reused. A later Run is bounded by the remaining lifetime.
   `/kaggle/working` survive. Source snapshots remain separate per Run.
 - Parallel Runs use different accounts. The pool conservatively admits one
   live notebook per enabled account. External busy accounts are not used.
-  Additional Runs wait until a compatible Session/account is available.
+  Additional Runs wait in a durable FIFO queue for contended accounts. Runs
+  using disjoint account sets can proceed independently.
 - Mounts, accelerator, project and requested lifetime define compatibility.
-  Incompatible notebooks remain available until you close them or TTL ends.
+  An idle notebook is retained for up to five minutes. When an incompatible
+  waiting Run has no ready account, one idle notebook is closed to make room.
 - Submission and Run identities are durable. Reconnecting uses the same
   notebook; a lost acknowledgement never causes a replacement submission.
   Remote launch intents prevent replaying an uncertain experiment command.
 - A detached plugin worker owns the notebook independently of chat and app.
-  It keeps one SSH pipe for upload, launch, logs and monitoring. After a
-  transport failure it reconnects to that same notebook and inspects Run IDs.
+  It uses one SSH pipe for upload, launch, logs and monitoring, closes that
+  pipe while idle, and reconnects on reuse. After a transport failure it
+  reconnects to that same notebook and inspects Run IDs.
 - **Stop Run** cancels only that Run's process group. The notebook is retained.
   **Close session** or TTL shuts down the notebook. An account is released only
   after a provider stop receipt. Unknown stop outcomes remain reserved.
@@ -72,12 +75,59 @@ when a notebook is reused. A later Run is bounded by the remaining lifetime.
   the owner confirms completion or the notebook reaches its deadline.
 - Commands stop on failed steps and pipelines. Each Run receives `ORX_RUN_ID`
   alongside the synced environment so metric trackers can identify it.
-- The session list restarts a missing owner using the saved notebook identity.
-  Remote bootstrap TTL bounds compute even if the local machine goes offline.
+- A detached pool scheduler restarts missing owners using saved notebook
+  identities, even while the dashboard is closed. Remote bootstrap TTL bounds
+  compute if the local machine goes offline.
 
 Logs are persisted in OpenResearch. Notebook storage remains ephemeral;
 export required artifacts before closing the Session. No Workbench workflow,
 MCP server, n8n or external Python checkout is required.
+
+## Scheduling and zombie cleanup
+
+The pool scheduler sweeps every 10 seconds and exits when no live reservations
+remain. Each worker also enforces the same time bounds if the scheduler is
+temporarily unavailable. SQLite transactions serialize admission, reuse and
+reclamation; OS locks are held for the entire scheduler/worker lifetime.
+Repeated worker startup failures back off up to two minutes instead of
+spawning another interpreter on every poll.
+
+| Condition | Action |
+| --- | --- |
+| Idle for 5 minutes | Close the notebook and release its local processes. |
+| Incompatible queued Run cannot obtain a ready account | Close one idle notebook; wait for its provider stop receipt before admitting a replacement. |
+| Provisioning for 10 minutes, or notebook TTL reached | Begin closing without submitting another notebook. |
+| Remote confirms `NOT_STARTED` and no acquisition/upload activity for 2 minutes | Close the abandoned lease. Large ongoing uploads refresh this grace, never the notebook TTL. |
+| Worker heartbeat absent for 180 seconds | Verify PID **and creation time**, terminate that owner, and recover the same session. A running remote experiment is inspected, never replayed. |
+| Provider reports the notebook already stopped | Persist the receipt, free the account, and exit the worker. |
+| Stop outcome or remote state is unknown | Keep the account reserved; retry shutdown with backoff up to 60 seconds. A lost connection alone never releases a lease. |
+
+`processes.py` owns local tree cleanup. On Windows, SSH starts suspended and is
+assigned to a kill-on-close Job before being resumed, so its Tailcat
+ProxyCommand cannot escape reconnect cleanup. A worker lifetime Job also reaps
+its children if the worker crashes. Unix transports use dedicated process
+groups; automatic stale-owner termination uses Linux pidfds where available.
+Other Unix platforms retain an unverifiable owner until its deadline instead
+of risking a signal to a reused PID. This follows the [Windows Job ownership
+model](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects).
+
+Token proxies run only during bootstrap. Idle notebooks hold no persistent
+SSH/Tailcat pipe. One active notebook still needs a worker, SSH and Tailcat,
+plus one scheduler shared by the pool; the Run supervisor and short bridge
+calls are separate processes. These are background processes, and internal
+Windows commands run without opening terminal windows. After the last
+notebook's stop is confirmed, its worker and the pool scheduler exit.
+
+The upgrade migrates `pool.sqlite3` in place. Workers started by an older binary
+are authenticated through their existing private endpoint and allowed to
+retire through their original close/TTL path, without creating duplicate
+owners. New workers use lifetime locks, heartbeats and process Jobs.
+
+Lifecycle decisions appear in each session's `note` in the existing session
+list. Diagnostics live under `<data>/kaggle/scheduler.log` and
+`workers/<session-id>/worker.log` / `ssh.log`; owner and heartbeat files identify
+the exact local process instance. Do not manually free a database reservation
+or mass-kill every Python/terminal process to recover an uncertain stop.
 
 ## Ownership and maintenance
 
@@ -98,7 +148,12 @@ python -m unittest discover -s downstream/kaggle/tests -p 'test_*.py'
 
 Tests cover concurrent pool admission, overflow, retry identity, reuse,
 project/mount isolation, unconfirmed shutdown ownership, profile import and
-independence from the donor checkout. Browser acceptance results are recorded
+independence from the donor checkout. Lifecycle regression tests also exercise
+FIFO fairness, idle/pressure reclamation, schema migration, orphaned launch
+leases, real Windows process trees, worker crashes and transport recovery.
+The new cleanup policy is tested locally with a fake provider; live Kaggle
+acceptance for this policy has not been run. Browser acceptance results below
+describe the earlier lifecycle and are recorded
 after real CPU verification; GPU/TPU require separate hardware validation.
 
 Verified on Windows through the browser against real Kaggle CPU notebooks
@@ -108,7 +163,7 @@ without notebook teardown, and provider-confirmed Close session. A fresh CPU
 Run from the final embedded binary also reached Done; all QA sessions stopped.
 The printed `metric: 285` is a transport fixture, not a research benchmark.
 
-Local checks passed: 21 Python tests, 1,035 Rust unit tests, 9 integration tests,
+Local checks for that earlier acceptance passed: 21 Python tests, 1,035 Rust unit tests, 9 integration tests,
 299 UI tests, UI production build, Rust formatting and Clippy. GPU/TPU and a
 fresh interactive/password cookie renewal were not exercised; auto-login
 packaging, script paths and private profile import are covered by tests.

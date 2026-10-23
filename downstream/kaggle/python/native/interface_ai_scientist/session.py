@@ -24,6 +24,7 @@ import uuid
 import zipfile
 import account_store
 from proxy_control import ensure_proxy, PROXY_PORT
+from processes import run_tree
 
 BASE = Path(__file__).resolve().parents[1]
 DEFAULT_STATE = Path(os.environ["ORX_KAGGLE_HOME"]) / "sessions"
@@ -170,6 +171,7 @@ def prepare(args):
     generated = subprocess.run(
         [str(binary), "genkey", "--key", str(server_key), "--region=tok", "--embed-derp-map"],
         capture_output=True, text=True, timeout=45, check=True,
+        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
     )
     addresses = re.findall(r"\btc[A-Za-z0-9_-]{40,}", generated.stdout + generated.stderr)
     if len(addresses) != 1:
@@ -179,9 +181,10 @@ def prepare(args):
     private.write_bytes(ssh_key.private_bytes(
         serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH, serialization.NoEncryption()))
     if os.name == "nt":
-        owner = subprocess.run(["whoami"], capture_output=True, text=True, check=True, timeout=5).stdout.strip()
+        owner = subprocess.run(["whoami"], capture_output=True, text=True, check=True, timeout=5,
+                               creationflags=subprocess.CREATE_NO_WINDOW).stdout.strip()
         subprocess.run(["icacls", str(private), "/inheritance:r", "/grant:r", owner + ":(R,W)"],
-                       capture_output=True, check=True, timeout=5)
+                       capture_output=True, check=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW)
     else:
         private.chmod(0o600)
     public = ssh_key.public_key().public_bytes(
@@ -319,9 +322,9 @@ if Path('/opt/bin/nvidia-smi').is_file():
 
 def remote(state, command, *, wait=30, data=None, record=None):
     started = time.monotonic()
-    result = subprocess.run([shutil.which("ssh") or "ssh", *ssh_options(state), "-T",
-                             state["address"], notebook_environment_command(command)],
-                            input=data, capture_output=True, timeout=wait)
+    result = run_tree([shutil.which("ssh") or "ssh", *ssh_options(state), "-T",
+                       state["address"], notebook_environment_command(command)],
+                      input=data, timeout=wait)
     elapsed = time.monotonic() - started
     if record:
         save(Path(state["root"]) / record, {"returncode": result.returncode, "elapsed_sec": elapsed,

@@ -6,8 +6,16 @@ import subprocess
 import sys
 import time
 import urllib.request
+from processes import owner, spawn_tree, stop_tree
 
 PROXY_PORT = int(os.environ.get('AI_SCIENTIST_KAGGLE_PROXY_PORT', '8013'))
+_owned = []
+
+
+def stop_proxies():
+    # Includes a proxy restarted by session.client() during a failed bootstrap.
+    while _owned:
+        stop_tree(_owned.pop())
 
 
 def ensure_proxy():
@@ -25,10 +33,11 @@ def ensure_proxy():
     logs = Path(os.environ['ORX_KAGGLE_HOME']) / 'logs'
     logs.mkdir(exist_ok=True)
     with (logs / 'proxy.log').open('ab') as output:
-        process = subprocess.Popen([sys.executable, str(root / 'proxy.py'), str(PROXY_PORT)], cwd=root,
+        process = spawn_tree([sys.executable, str(root / 'proxy.py'), str(PROXY_PORT)], cwd=root,
             stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
-            env={**os.environ, 'ORX_KAGGLE_PROXY_OWNER': str(os.getpid())},
-            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            env={**os.environ, 'ORX_KAGGLE_PROXY_OWNER_ID': json.dumps(owner(os.getpid())),
+                 'PYTHONPATH': str(root.parent)+os.pathsep+os.environ.get('PYTHONPATH','')})
+    _owned.append(process)
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         if ready():
@@ -36,7 +45,6 @@ def ensure_proxy():
         if process.poll() is not None:
             break
         time.sleep(0.1)
-    if process.poll() is None:
-        process.terminate()
-        process.wait(timeout=5)
+    stop_tree(process)
+    _owned.remove(process)
     raise RuntimeError('Bundle proxy failed; check kaggle mcp/logs/proxy.log or the configured port')

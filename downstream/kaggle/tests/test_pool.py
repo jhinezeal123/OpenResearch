@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 
@@ -75,5 +76,102 @@ class PoolTests(unittest.TestCase):
         r=request();r['runId']='../../escape'
         with self.assertRaises(ValueError):self.pool.acquire(r,['a'])
         self.assertFalse(self.pool.list())
+    def test_idle_grace_expires_without_closing_a_running_experiment(self):
+        idle=self.pool.acquire(request(),['a'])
+        self.pool.ready(idle['id'],123);self.pool.release(idle['id'],idle['active_run'])
+        busy=self.pool.acquire(request('different-project'),['b'])
+        self.pool.ready(busy['id'],124)
+        with self.pool.db() as db:
+            db.execute('UPDATE sessions SET deadline=?,idle_since=?',(time.time()+3600,time.time()-301))
+        self.pool.reconcile()
+        self.assertEqual(self.pool.get(idle['id'])['state'],'closing')
+        self.assertEqual(self.pool.get(busy['id'])['state'],'busy')
+        self.assertEqual(self.pool.get(busy['id'])['active_run'],busy['active_run'])
+    def test_pressure_reclaims_one_idle_incompatible_notebook_and_keeps_account_reserved(self):
+        for account in ('a','b'):
+            r=request();r['runtime']['accounts']=[account]
+            row=self.pool.acquire(r,[account])
+            self.pool.ready(row['id'],123);self.pool.release(row['id'],row['active_run'])
+        waiting=request('another-project')
+        for _ in range(3): self.assertIsNone(self.pool.acquire(waiting,['a','b']))
+        closing=[r for r in self.pool.live() if r['state']=='closing']
+        self.assertEqual(len(closing),1)
+        self.pool.stopped(closing[0]['id'])
+        self.assertEqual(self.pool.acquire(waiting,[closing[0]['account']])['account'],closing[0]['account'])
+    def test_reuse_probe_does_not_evict_a_warm_notebook_before_account_admission(self):
+        row=self.pool.acquire(request(),['a'])
+        self.pool.ready(row['id'],123);self.pool.release(row['id'],row['active_run'])
+        waiting=request('other-project')
+        self.assertIsNone(self.pool.acquire(waiting,[],reclaim=False))
+        self.assertEqual(self.pool.get(row['id'])['state'],'idle')
+        self.assertEqual(self.pool.acquire(waiting,['b'])['account'],'b')
+        self.assertEqual(self.pool.get(row['id'])['state'],'idle')
+    def test_fifo_prevents_a_new_run_from_stealing_a_contended_account(self):
+        first=request();first['runtime']['accounts']=['a']
+        row=self.pool.acquire(first,['a'])
+        second={**request(),'runtime':first['runtime']}
+        third={**request(),'runtime':first['runtime']}
+        self.assertIsNone(self.pool.acquire(second,[]))
+        self.assertIsNone(self.pool.acquire(third,[]))
+        self.pool.stopped(row['id'])
+        self.assertIsNone(self.pool.acquire(third,['a']))
+        self.assertIsNotNone(self.pool.acquire(second,['a']))
+    def test_a_waiting_run_does_not_block_disjoint_accounts_and_cancel_removes_it(self):
+        a={**request(),'runtime':{'accounts':['a']}}
+        b={**request(),'runtime':{'accounts':['b']}}
+        self.assertIsNone(self.pool.acquire(a,[]))
+        self.assertIsNotNone(self.pool.acquire(b,['b']))
+        self.pool.cancel_wait(a['runId'])
+        self.assertIsNotNone(self.pool.acquire({**a,'runId':str(uuid.uuid4())},['a']))
+    def test_abandoned_waiters_expire(self):
+        a={**request(),'runtime':{'accounts':['a']}}
+        self.pool.acquire(a,[])
+        with self.pool.db() as db: db.execute('UPDATE pending_runs SET last_seen=0')
+        self.assertIsNotNone(self.pool.acquire({**a,'runId':str(uuid.uuid4())},['a']))
+    def test_provisioning_timeout_and_ttl_begin_closing_but_never_free_the_account(self):
+        a=self.pool.acquire(request(),['a'])
+        b=self.pool.acquire(request(),['b'])
+        with self.pool.db() as db:
+            db.execute('UPDATE sessions SET created=?,deadline=? WHERE id=?',(time.time()-601,time.time()+3600,a['id']))
+            db.execute('UPDATE sessions SET deadline=0 WHERE id=?',(b['id'],))
+        self.pool.reconcile()
+        self.assertEqual(self.pool.get(a['id'])['note'],'Notebook provisioning exceeded 10 minutes')
+        self.assertEqual(self.pool.get(b['id'])['note'],'Notebook lifetime expired')
+        self.assertIsNone(self.pool.acquire(request(),['a','b']))
+    def test_delayed_ready_or_release_cannot_resurrect_a_closed_session(self):
+        row=self.pool.acquire(request(),['a'])
+        self.pool.stopped(row['id'])
+        self.pool.ready(row['id'],123)
+        self.pool.release(row['id'],row['active_run'])
+        self.assertEqual(self.pool.get(row['id'])['state'],'stopped')
+    def test_upload_activity_extends_only_the_current_run_launch_grace(self):
+        row=self.pool.acquire(request(),['a'])
+        with self.pool.db() as db: db.execute('UPDATE sessions SET leased_at=0')
+        self.pool.touch(row['id'],str(uuid.uuid4()))
+        self.assertEqual(self.pool.get(row['id'])['leased_at'],0)
+        self.pool.touch(row['id'],row['active_run'])
+        self.assertGreater(self.pool.get(row['id'])['leased_at'],time.time()-10)
+        self.assertEqual(self.pool.get(row['id'])['deadline'],row['deadline'])
+    def test_maintenance_is_not_limited_to_the_last_hundred_history_rows(self):
+        row=self.pool.acquire(request(),['a'])
+        with self.pool.db() as db:
+            for _ in range(101):
+                db.execute('INSERT INTO sessions(id,account,spec,created,deadline,state) VALUES(?,?,?,?,?,?)',
+                           (uuid.uuid4().hex,'old','{}',time.time()+1,0,'stopped'))
+        self.assertNotIn(row['id'],[r['id'] for r in self.pool.list()])
+        self.assertEqual([r['id'] for r in self.pool.live()],[row['id']])
+    def test_old_schema_is_migrated_without_losing_reservations(self):
+        import sqlite3
+        from contextlib import closing
+        with tempfile.TemporaryDirectory() as home:
+            with closing(sqlite3.connect(Path(home)/'pool.sqlite3')) as db, db:
+                db.execute('''CREATE TABLE sessions(id TEXT PRIMARY KEY,account TEXT NOT NULL,spec TEXT NOT NULL,
+                    created REAL NOT NULL,deadline REAL NOT NULL,state TEXT NOT NULL,active_run TEXT,
+                    worker_pid INTEGER,note TEXT)''')
+                db.execute("INSERT INTO sessions VALUES('old','a','{}',1,9999999999,'idle',NULL,NULL,NULL)")
+            migrated=Pool(home)
+            self.assertEqual(migrated.live()[0]['account'],'a')
+            self.assertGreater(migrated.live()[0]['idle_since'],time.time()-10)
+            Pool(home)  # Reopening is idempotent and does not reset idle time.
 
 if __name__=='__main__':unittest.main()

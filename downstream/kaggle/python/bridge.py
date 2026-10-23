@@ -7,6 +7,7 @@ import contextlib
 import json
 from pathlib import Path
 import sys
+import time
 
 
 def accounts(account_store):
@@ -56,24 +57,6 @@ def configure(request):
     return session
 
 
-def alive(pid):
-    import os
-    if not pid: return False
-    if os.name=='nt':
-        import ctypes
-        from ctypes import wintypes
-        k=ctypes.WinDLL('kernel32',use_last_error=True)
-        k.OpenProcess.restype=wintypes.HANDLE
-        handle=k.OpenProcess(0x1000,False,int(pid))
-        if not handle: return False
-        try:
-            status=wintypes.DWORD()
-            return bool(k.GetExitCodeProcess(handle,ctypes.byref(status))) and status.value==259
-        finally: k.CloseHandle(handle)
-    try: os.kill(pid,0);return True
-    except ProcessLookupError: return False
-
-
 def contact(folder,request,timeout=55):
     import urllib.request
     owner=json.loads((folder/'worker.json').read_text('utf-8'))
@@ -86,18 +69,52 @@ def contact(folder,request,timeout=55):
 
 def ensure_worker(session,pool,row,request):
     import os,subprocess
+    from processes import alive, load, lock, owner, save, terminate
+    from scheduler import ensure_scheduler, healthy
+    if not request.get('_scheduler'):
+        ensure_scheduler(pool)
     folder=pool.worker_dir(row['id'])
-    with session.request_lock(row['id'],namespace='assets'):
-        owner=folder/'owner.json'
-        if owner.exists() and alive(json.loads(owner.read_text())['pid']): return
+    with lock(folder/'launch.lock') as acquired:
+        if not acquired: return
+        metadata=load(folder/'owner.json')
+        if metadata.get('legacy') and alive(metadata): return
+        if healthy(metadata,load(folder/'heartbeat.json')): return
+        if alive(metadata):
+            terminate(metadata)
+            if alive(metadata): return
+        # A worker also holds this lock throughout its lifetime, including
+        # cleanup. A missing/corrupt PID file cannot create a second owner.
+        with lock(folder/'worker.lock') as unowned:
+            if not unowned: return
+        if time.time()<metadata.get('restart_after',0): return
+        # Pre-upgrade workers have no lifetime lock. Their authenticated endpoint
+        # is also checked when owner.json is lost, before creating any new owner.
+        from processes import identity
+        previous=load(folder/'worker.json')
+        birth=identity(previous.get('pid'))
+        known_reused=(previous.get('pid')==metadata.get('pid') and metadata.get('birth') and metadata['birth']!=birth)
+        if birth and not known_reused:
+            try:
+                contact(folder,{'action':'health'},timeout=3)
+            except (OSError,ValueError,RuntimeError):
+                return  # Unverified legacy owner: neither kill nor duplicate it.
+            if identity(previous['pid'])!=birth: return
+            save(folder/'owner.json',{**owner(previous['pid']),'legacy':True})
+            return
+        if metadata.get('pid') and not metadata.get('birth') and identity(metadata['pid']):
+            return
+        row=pool.get(row['id'])
+        if row['state']=='stopped': return
         folder.mkdir(parents=True,exist_ok=True)
         config={**json.loads(row['spec']), 'home':str(pool.home),'sessionId':row['id'],'account':row['account']}
-        session.save(folder/'worker-config.json',config)
+        save(folder/'worker-config.json',config)
         with (folder/'worker.log').open('ab') as log:
             child=subprocess.Popen([sys.executable,str(Path(__file__).with_name('worker.py')),str(folder/'worker-config.json')],
                 stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,cwd=Path(__file__).parent,
                 creationflags=(getattr(subprocess,'DETACHED_PROCESS',0)|getattr(subprocess,'CREATE_NEW_PROCESS_GROUP',0)|getattr(subprocess,'CREATE_NO_WINDOW',0)),start_new_session=os.name!='nt')
-        session.save(owner,{'pid':child.pid})
+        failures=min(6,metadata.get('failures',0)+1)
+        save(folder/'owner.json',{**owner(child.pid),'failures':failures,
+             'restart_after':time.time()+min(120,5*2**(failures-1))})
 
 
 def dispatch(request):
@@ -116,9 +133,8 @@ def dispatch(request):
         from account_runtime import account_readiness
         return account_readiness(request['account'])
     if action=='sessions':
+        for row in pool.reconcile(): ensure_worker(session,pool,row,request)
         rows=pool.list()
-        for row in rows:
-            if row['state']!='stopped': ensure_worker(session,pool,row,request)
         return {'sessions':[{k:v for k,v in r.items() if k not in ('spec',)} for r in rows]}
     if action=='close-session':
         row=pool.get(request['sessionId']);pool.close(row['id']);ensure_worker(session,pool,row,request)
@@ -127,27 +143,36 @@ def dispatch(request):
     if action=='acquire' and row is None:
         from account_runtime import account_readiness
         # Prefer a compatible idle notebook before probing provider account admission.
-        row=pool.acquire(request,[])
+        row=pool.acquire(request,[],reclaim=False)
         if row is None:
+            for existing in pool.reconcile(): ensure_worker(session,pool,existing,request)
             free=[]
-            reserved={r['account'] for r in pool.list() if r['state']!='stopped'}
+            reserved={r['account'] for r in pool.live()}
             for account in request['runtime']['accounts']:
                 if account in reserved: continue
                 try:
                     if account_readiness(account).get('readiness')=='verified_idle': free.append(account)
                 except Exception: pass
             row=pool.acquire(request,free)
+            if row is None:
+                # Reclamation may have changed idle -> closing just now. Wake
+                # maintenance even if the scheduler had no owners before this call.
+                for existing in pool.live(): ensure_worker(session,pool,existing,request)
         if row is None: return {'queued':True,'detail':'Waiting for a compatible idle notebook or a ready account from the pool.'}
     if row is None and action=='cancel':
         # A queued Run owns no notebook and must not acquire one just to cancel.
+        pool.cancel_wait(request['runId'])
         return {'stage':'ERROR','exitCode':143,'log':'','offset':request.get('offset',0),'logSize':0}
-    if row is None and action=='release': return {'released':True}
+    if row is None and action=='release':
+        pool.cancel_wait(request['runId'])
+        return {'released':True}
     if row is None: raise ValueError('Run has no session assignment')
     if row['state']=='stopped': return {'stopped':True,'sessionId':row['id'],'error':row.get('note')}
     if row['state']=='closing' and action in ('acquire','launch'): return {'pending':True,'closing':True,'sessionId':row['id'],'error':row.get('note')}
     ensure_worker(session,pool,row,request)
     folder=pool.worker_dir(row['id'])
     if action=='acquire':
+        pool.touch(row['id'],request['runId'])
         try: health=contact(folder,{'action':'health'},timeout=3)
         except (OSError,ValueError): return {'pending':True,'sessionId':row['id'],'account':row['account']}
         return {**health,'sessionId':row['id'],'account':row['account'],'deadline':row['deadline']}
@@ -159,11 +184,13 @@ def dispatch(request):
         if terminal: pool.release(row['id'],request['runId'])
         return {'released':terminal}
     if action=='launch':
+        pool.touch(row['id'],request['runId'])
         source=Path(request['sourcePath'])
         import base64
         offset=0
         with source.open('rb') as f:
             while chunk:=f.read(256*1024):
+                pool.touch(row['id'],request['runId'])
                 r=contact(folder,{'action':'upload','digest':request['digest'],'offset':offset,'data':base64.b64encode(chunk).decode(),'final':offset+len(chunk)==source.stat().st_size})
                 offset+=len(chunk)
                 if r['present']: break

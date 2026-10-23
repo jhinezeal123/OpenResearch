@@ -30,6 +30,8 @@ def inspect(directory, offset=0):
         result.update(stage='COMPLETE' if code==0 else 'ERROR', exitCode=code)
     elif (directory/'launch-intent').exists() and not (directory/'pid').exists():
         result.update(stage='UNKNOWN', message='Launch acknowledgement missing; command will not be replayed.')
+    elif not (directory/'launch-intent').exists() and not (directory/'pid').exists():
+        result['stage']='NOT_STARTED'
     return result
 
 def dispatch(r):

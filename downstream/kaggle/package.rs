@@ -66,7 +66,9 @@ const FILES: &[(&str, &str)] = &[
         include_str!("python/native/web_session.py"),
     ),
     ("pool.py", include_str!("python/pool.py")),
+    ("processes.py", include_str!("python/processes.py")),
     ("remote.py", include_str!("python/remote.py")),
+    ("scheduler.py", include_str!("python/scheduler.py")),
     ("worker.py", include_str!("python/worker.py")),
 ];
 pub fn extract() -> Result<PathBuf> {
