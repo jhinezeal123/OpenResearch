@@ -784,12 +784,6 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
     let backend_id = args.backend.as_deref().unwrap_or("local");
     let backend = backend(backend_id)?;
     let store = Store::open()?;
-    let experiment = store
-        .get_local_experiment(&args.exp_id)?
-        .ok_or_else(|| anyhow!("Local experiment {} not found.", args.exp_id))?;
-    let project = store
-        .get_local_project(&experiment.project_id)?
-        .ok_or_else(|| anyhow!("Local project {} not found.", experiment.project_id))?;
     let preflight = backend.preflight(args).await?;
     if !preflight.ready {
         return Err(anyhow!(
@@ -800,6 +794,29 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
                 .unwrap_or_else(|| "Compute backend is not ready.".to_string())
         ));
     }
+    let artifacts_lock = store.run_artifacts_lock()?;
+    let deadline = std::time::Instant::now() + crate::store::RUN_ARTIFACTS_WAIT;
+    let _artifacts_guard = loop {
+        match artifacts_lock.try_read() {
+            Ok(guard) => break guard,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(crate::store::RUN_ARTIFACTS_POLL).await;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(anyhow!("Run artifacts are busy; retry the run submission."))
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let experiment = store
+        .get_local_experiment(&args.exp_id)?
+        .ok_or_else(|| anyhow!("Local experiment {} not found.", args.exp_id))?;
+    let project = store
+        .get_local_project(&experiment.project_id)?
+        .ok_or_else(|| anyhow!("Local project {} not found.", experiment.project_id))?;
     let source = backend.stage_source(&project, &experiment).await?;
     let run_id = uuid::Uuid::new_v4().to_string();
     let command = Some(experiment.run_command.clone())
@@ -834,6 +851,7 @@ pub async fn submit(args: &crate::ExpRunArgs) -> Result<StoredRun> {
         source_digest: None,
         source_path: None,
         source_size: None,
+        remote_root: None,
     };
     source.0.apply_to_descriptor(&mut descriptor);
     let now = crate::store::now_ms();
@@ -1174,9 +1192,10 @@ pub(crate) mod tests {
                     "lab".into(),
                     SshHostSettings {
                         container: Some("research".into()),
+                        remote_root: Some("/scratch/lab/orx".into()),
                     },
                 ),
-                ("direct".into(), SshHostSettings { container: None }),
+                ("direct".into(), SshHostSettings::default()),
             ]),
         };
         let mut args = tinker_args();
@@ -1203,6 +1222,11 @@ pub(crate) mod tests {
             let (host, options) = crate::jobs::ssh::resolve_options(&args, &settings).unwrap();
             assert_eq!(host, expected_host);
             assert_eq!(options.container.as_deref(), expected_container);
+            assert_eq!(
+                options.remote_root.is_some(),
+                host == "lab",
+                "the saved root follows the host, not the container"
+            );
         }
         args.host = None;
         assert!(crate::jobs::ssh::resolve_options(&args, &SshSettings::default()).is_err());
