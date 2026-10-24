@@ -12,6 +12,15 @@ IDLE_SECONDS = 5 * 60
 PROVISION_SECONDS = 10 * 60
 QUEUE_SECONDS = 2 * 60
 LAUNCH_SECONDS = 2 * 60
+# Kaggle runs at most two GPU sessions per account; CPU and TPU stay exclusive.
+GPU_ACCELERATORS = frozenset({'NvidiaTeslaT4'})
+GPU_SESSIONS_PER_ACCOUNT = 2
+
+def capacity(accelerator, live):
+    """Notebook slots for a new session beside an account's live accelerators."""
+    if accelerator in GPU_ACCELERATORS and all(a in GPU_ACCELERATORS for a in live):
+        return GPU_SESSIONS_PER_ACCOUNT
+    return 1
 
 class Pool:
     def __init__(self, home):
@@ -24,8 +33,8 @@ class Pool:
               created REAL NOT NULL, deadline REAL NOT NULL, state TEXT NOT NULL,
               active_run TEXT, worker_pid INTEGER, note TEXT);
             CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY, session_id TEXT NOT NULL);
-            CREATE UNIQUE INDEX IF NOT EXISTS one_live_notebook_per_account
-              ON sessions(account) WHERE state != 'stopped';
+            -- Admission counts slots per accelerator inside BEGIN IMMEDIATE.
+            DROP INDEX IF EXISTS one_live_notebook_per_account;
             CREATE TABLE IF NOT EXISTS pending_runs(
               id TEXT PRIMARY KEY, accounts TEXT NOT NULL, created REAL NOT NULL,
               last_seen REAL NOT NULL);
@@ -55,9 +64,21 @@ class Pool:
         with self.db() as db:
             row=db.execute('SELECT s.* FROM sessions s JOIN runs r ON s.id=r.session_id WHERE r.id=?',(run_id,)).fetchone()
             return dict(row) if row else None
+    @staticmethod
+    def _live_accelerators(db, account):
+        return [json.loads(r[0]).get('accelerator') for r in
+                db.execute("SELECT spec FROM sessions WHERE account=? AND state!='stopped'", (account,))]
+    def has_room(self, account, accelerator, external=0):
+        """Whether local reservations plus ``external`` provider sessions leave a slot."""
+        with self.db() as db:
+            live = self._live_accelerators(db, account)
+        return len(live) + external < capacity(accelerator, live)
     def acquire(self, request, available, *, reclaim=True):
+        """``available`` lists ready accounts, or maps each to its count of
+        Kaggle sessions this pool does not own (they occupy slots too)."""
         run_id=str(uuid.UUID(request['runId']))
         spec=self.spec(request)
+        external=available if isinstance(available, dict) else {}
         with self.db() as db:
             db.execute('BEGIN IMMEDIATE')
             prior=db.execute('SELECT s.* FROM sessions s JOIN runs r ON s.id=r.session_id WHERE r.id=?',(run_id,)).fetchone()
@@ -80,8 +101,10 @@ class Pool:
                 sid=chosen['id']
                 db.execute("UPDATE sessions SET state='busy',active_run=?,leased_at=?,idle_since=NULL WHERE id=?",(run_id,now,sid))
             else:
-                busy={r[0] for r in db.execute("SELECT account FROM sessions WHERE state!='stopped'")}
-                account=next((a for a in eligible if a in available and a not in busy),None)
+                def room(a):
+                    live=self._live_accelerators(db, a)
+                    return len(live)+external.get(a,0) < capacity(request.get('accelerator'), live)
+                account=next((a for a in eligible if a in available and room(a)),None)
                 if not account:
                     # Reclaim only one idle notebook under pressure. A closing
                     # notebook still reserves its account until a stop receipt.

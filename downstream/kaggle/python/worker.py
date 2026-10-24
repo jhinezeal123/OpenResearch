@@ -13,6 +13,9 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from pool import Pool, LAUNCH_SECONDS
+
+# Kaggle ends every session within 12 hours of starting, whatever its timeout.
+MAX_NOTEBOOK_SECONDS = 12 * 60 * 60
 from processes import guard_worker, load, lock, owner, save, spawn_tree, stop_tree
 
 class Channel:
@@ -62,8 +65,9 @@ class Channel:
         with self.lock:
             self._disconnect()
 
-def shutdown(session,sid,account,root,requested):
+def shutdown(session,sid,account,root,requested,row=None):
     from bridge import control
+    missing=False
     # Read provider state even when SSH has already disappeared after STOP.
     for action in (('status',) if requested else ('status','stop')):
         try:
@@ -72,6 +76,18 @@ def shutdown(session,sid,account,root,requested):
             if result.get('stopped'): return True,requested
         except Exception as error:
             print('Shutdown '+action+': '+type(error).__name__,file=sys.stderr,flush=True)
+            # Kaggle answers 403 (not 404) for a private slug that does not exist.
+            missing|=action=='status' and getattr(getattr(error,'response',None),'status_code',None) in (403,404)
+    if row is not None:
+        # Without a receipt the reservation would otherwise outlive any notebook
+        # forever. A push that never got a response, has no notebook at Kaggle,
+        # and is past deadline plus its own timeout cannot still be running.
+        now=time.time()
+        lifetime=row['deadline']-row['created']
+        never_created=missing and not (Path(root)/sid/'push-response.json').exists() and now>row['deadline']+lifetime+90
+        if never_created or now>row['deadline']+MAX_NOTEBOOK_SECONDS:
+            print('Shutdown abandoned: '+('notebook never created' if never_created else 'past Kaggle maximum runtime'),file=sys.stderr,flush=True)
+            return True,requested
     return False,requested
 
 def serve(config):
@@ -200,7 +216,7 @@ def serve(config):
                     pass
                 if time.monotonic()<next_stop: continue
                 # Keep ownership until the provider confirms stop, including offline periods.
-                stopped,stop_requested=shutdown(session,sid,row['account'],Path(config['home'])/'sessions',stop_requested)
+                stopped,stop_requested=shutdown(session,sid,row['account'],Path(config['home'])/'sessions',stop_requested,row=row)
                 if stopped: pool.stopped(sid);break
                 if stop_requested:
                     save(folder/'stop-requested.json',{'requested':True})

@@ -53,8 +53,9 @@ when a notebook is reused. A later Run is bounded by the remaining lifetime.
 - A Session serves one Run at a time. Compatible idle Sessions in the same
   project are reused, including after a failed Run. Packages, caches and
   `/kaggle/working` survive. Source snapshots remain separate per Run.
-- Parallel Runs use different accounts. The pool conservatively admits one
-  live notebook per enabled account. External busy accounts are not used.
+- An enabled account holds up to two GPU notebooks, or one CPU or TPU
+  notebook. Kaggle sessions this pool does not own, including notebooks it
+  cannot identify, occupy those slots.
   Additional Runs wait in a durable FIFO queue for contended accounts. Runs
   using disjoint account sets can proceed independently.
 - Mounts, accelerator, project and requested lifetime define compatibility.
@@ -101,6 +102,8 @@ spawning another interpreter on every poll.
 | Worker heartbeat absent for 180 seconds | Verify PID **and creation time**, terminate that owner, and recover the same session. A running remote experiment is inspected, never replayed. |
 | Provider reports the notebook already stopped | Persist the receipt, free the account, and exit the worker. |
 | Stop outcome or remote state is unknown | Keep the account reserved; the shared scheduler retries shutdown with backoff up to 5 minutes. A lost connection alone never releases a lease. |
+| Push response was lost, Kaggle has no such notebook, and deadline plus lifetime has passed | Free the account: the notebook was never created. |
+| Stop still unconfirmed 12 hours past the deadline | Free the account: Kaggle has ended any session by then. |
 
 `processes.py` owns local tree cleanup. On Windows, SSH starts suspended and is
 assigned to a kill-on-close Job before being resumed, so its Tailcat

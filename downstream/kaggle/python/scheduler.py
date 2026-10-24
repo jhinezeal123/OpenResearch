@@ -96,7 +96,7 @@ def cleanup(pool, row):
         requested = load(folder/'stop-requested.json').get('requested') is True
         try:
             session = configure({'home':str(pool.home), 'stateRoot':str(pool.home/'sessions')})
-            stopped, requested = shutdown(session, row['id'], row['account'], pool.home/'sessions', requested)
+            stopped, requested = shutdown(session, row['id'], row['account'], pool.home/'sessions', requested, row=row)
             if requested:
                 save(folder/'stop-requested.json', {'requested': True})
             if stopped:

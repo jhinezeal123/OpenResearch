@@ -38,6 +38,21 @@ class WorkerShutdownTests(unittest.TestCase):
     def test_unconfirmed_outcomes_do_not_free_the_account(self):
         with patch('bridge.control',side_effect=ConnectionError('offline')):
             self.assertEqual(worker.shutdown(None,'session','account',Path('.'),False),(False,False))
+    def test_unverifiable_stop_is_abandoned_only_when_no_notebook_can_still_run(self):
+        forbidden=Exception('403');forbidden.response=SimpleNamespace(status_code=403)
+        now=time.time()
+        expired={'created':now-7300,'deadline':now-3700}
+        with tempfile.TemporaryDirectory() as root,                 patch('bridge.control',side_effect=[forbidden,RuntimeError('SSH stop failed')]*4):
+            # Push response lost, Kaggle has no such notebook, past deadline plus timeout.
+            self.assertEqual(worker.shutdown(None,'sid','account',Path(root),False,row=expired),(True,False))
+            # Within that bound a delayed notebook could still be running.
+            recent={'created':now-3700,'deadline':now-100}
+            self.assertEqual(worker.shutdown(None,'sid','account',Path(root),False,row=recent),(False,False))
+            # A confirmed push keeps its reservation until Kaggle's maximum runtime.
+            (Path(root)/'sid').mkdir();(Path(root)/'sid'/'push-response.json').write_text('{}')
+            self.assertEqual(worker.shutdown(None,'sid','account',Path(root),False,row=expired),(False,False))
+            ancient={'created':now-worker.MAX_NOTEBOOK_SECONDS-7300,'deadline':now-worker.MAX_NOTEBOOK_SECONDS-1}
+            self.assertEqual(worker.shutdown(None,'sid','account',Path(root),False,row=ancient),(True,False))
     def test_never_submitted_request_can_be_closed(self):
         with patch('bridge.control',side_effect=[FileNotFoundError(),{'stopped':True}]):
             self.assertEqual(worker.shutdown(None,'session','account',Path('.'),False),(True,True))

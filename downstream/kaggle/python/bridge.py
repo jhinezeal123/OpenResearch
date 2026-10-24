@@ -23,6 +23,20 @@ def accounts(account_store):
     return result
 
 
+def foreign_sessions(observation, account, live):
+    """Kaggle sessions on an account that no live pool reservation owns.
+
+    Returns None when readiness is unverified. A session whose notebook could
+    not be identified counts as foreign: never infer a free slot.
+    """
+    count = observation.get('active_session_count')
+    if observation.get('readiness') not in ('verified_idle', 'busy') or type(count) is not int:
+        return None
+    sessions = observation.get('active_sessions') or []
+    owned = {'ai-scientist-ssh-'+r['id'][:12] for r in live if r['account'] == account}
+    return count - len(sessions) + sum((s.get('ref') or '').split('/', 1)[-1] not in owned for s in sessions)
+
+
 def control(session, action, sid, account, state_root):
     receipt = state_root / sid / "stop-confirmed.json"
     if receipt.is_file():
@@ -150,13 +164,12 @@ def dispatch(request):
         row=pool.acquire(request,[],reclaim=False)
         if row is None:
             for existing in pool.reconcile(): ensure_worker(session,pool,existing,request)
-            free=[]
-            reserved={r['account'] for r in pool.live()}
+            free={}
             for account in request['runtime']['accounts']:
-                if account in reserved: continue
-                try:
-                    if account_readiness(account).get('readiness')=='verified_idle': free.append(account)
-                except Exception: pass
+                if not pool.has_room(account,request['accelerator']): continue
+                try: external=foreign_sessions(account_readiness(account),account,pool.live())
+                except Exception: continue
+                if external is not None and pool.has_room(account,request['accelerator'],external): free[account]=external
             row=pool.acquire(request,free)
             if row is None:
                 # Reclamation may have changed idle -> closing just now. Wake
@@ -196,6 +209,8 @@ def dispatch(request):
             while chunk:=f.read(256*1024):
                 pool.touch(row['id'],request['runId'])
                 r=contact(folder,{'action':'upload','digest':request['digest'],'offset':offset,'data':base64.b64encode(chunk).decode(),'final':offset+len(chunk)==source.stat().st_size})
+                # A channel that is not ready, or a closing session, answers pending.
+                if r.get('pending'): return r
                 offset+=len(chunk)
                 if r['present']: break
         request['seconds']=max(1,min(request['ttlSeconds'],int(row['deadline']-__import__('time').time())))

@@ -42,7 +42,7 @@ export function KaggleSection(){
       {!data?.runtimeReady&&<p className="error" role="alert">Install the standalone runtime with downstream/kaggle/setup.ps1. Python, dependencies and account profiles stay in OpenResearch storage.</p>}
       <fieldset className="flex flex-col gap-3 rounded-lg border border-border p-4">
         <legend className="px-1 text-sm font-medium">Account pool</legend>
-        <p className="m-0 text-xs text-subtext">Enable accounts available to all projects. One live notebook per account. No project is pinned to an account.</p>
+        <p className="m-0 text-xs text-subtext">Enable accounts available to all projects. Up to two GPU notebooks, or one CPU or TPU notebook, per account. No project is pinned to an account.</p>
         {data?.accounts.map(a=><div className="flex flex-wrap items-center gap-2" key={a.id}>
           <label className="flex flex-1 items-center gap-2 text-sm"><input type="checkbox" checked={draft.accounts.includes(a.id)} disabled={busy||!a.configured} onChange={e=>set("accounts",e.target.checked?[...draft.accounts,a.id]:draft.accounts.filter(id=>id!==a.id))}/>{a.username??a.alias}</label>
           <span className="text-xs text-subtext">{!a.configured?"Missing token":readiness[a.id]??"Not checked"}</span>

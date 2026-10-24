@@ -40,6 +40,16 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(result['stopped'])
         self.assertEqual(result['session_id'],'session-id')
 
+    def test_foreign_sessions_exclude_owned_notebooks_and_count_unidentified_ones(self):
+        sid=uuid.uuid4().hex
+        live=[{'id':sid,'account':'a'},{'id':uuid.uuid4().hex,'account':'b'}]
+        observation={'readiness':'busy','active_session_count':3,'active_sessions':[
+            {'ref':'user/ai-scientist-ssh-'+sid[:12]},{'ref':'user/other'},{'ref':''}]}
+        self.assertEqual(bridge.foreign_sessions(observation,'a',live),2)
+        self.assertEqual(bridge.foreign_sessions({**observation,'active_session_count':4},'a',live),3)
+        self.assertEqual(bridge.foreign_sessions(observation,'b',live),3)
+        self.assertIsNone(bridge.foreign_sessions({'readiness':'needs_login'},'a',live))
+
     def test_catalog_returns_metadata_without_credentials(self):
         class Store:
             def load_registry(self):
@@ -118,6 +128,16 @@ class BridgeLeaseTests(unittest.TestCase):
                 self.assertFalse(bridge.dispatch({**self.request,'action':'release'})['released'])
                 self.assertEqual(self.pool.get(self.row['id'])['active_run'], self.request['runId'])
                 self.assertIsNone(self.pool.acquire({**self.request,'runId':str(uuid.uuid4())}, []))
+
+    def test_launch_upload_waits_when_the_notebook_channel_is_not_ready(self):
+        self.reserve()
+        with tempfile.TemporaryDirectory() as folder:
+            source=Path(folder)/'source.tar';source.write_bytes(b'x'*10)
+            self.contact.return_value={'pending':True}
+            result=bridge.dispatch({**self.request,'action':'launch','sourcePath':str(source),'digest':'0'*64})
+        self.assertTrue(result['pending'])
+        self.assertEqual(self.contact.call_count,1)
+        self.assertEqual(self.contact.call_args.args[1]['action'],'upload')
 
     def test_ssh_failure_keeps_the_lease_until_the_owner_confirms_completion(self):
         self.reserve()

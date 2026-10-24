@@ -33,6 +33,24 @@ class PoolTests(unittest.TestCase):
         self.assertEqual(len(rows),2)
         self.assertEqual({r['account'] for r in rows},{'a','b'})
         self.assertEqual(len({r['id'] for r in rows}),2)
+    def test_gpu_accounts_hold_two_notebooks_but_cpu_stays_exclusive(self):
+        gpu=lambda:{**request(),'accelerator':'NvidiaTeslaT4'}
+        jobs=[gpu() for _ in range(10)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            rows=[r for r in executor.map(lambda r:self.pool.acquire(r,['a','b']),jobs) if r]
+        self.assertEqual(sorted(r['account'] for r in rows),['a','a','b','b'])
+        self.assertFalse(self.pool.has_room('a','NvidiaTeslaT4'))
+        self.assertFalse(self.pool.has_room('a','cpu'))
+        self.pool.stopped(rows[0]['id'])
+        self.assertTrue(self.pool.has_room(rows[0]['account'],'NvidiaTeslaT4'))
+        self.assertFalse(self.pool.has_room(rows[0]['account'],'cpu'))
+    def test_a_cpu_notebook_blocks_a_gpu_partner_and_foreign_sessions_take_slots(self):
+        gpu={**request(),'accelerator':'NvidiaTeslaT4','runtime':{'accounts':['a']}}
+        self.pool.acquire({**request(),'runtime':{'accounts':['a']}},['a'])
+        self.assertIsNone(self.pool.acquire(gpu,['a'],reclaim=False))
+        self.assertIsNone(self.pool.acquire({**gpu,'runtime':{'accounts':['b']}},{'b':2}))
+        self.assertEqual(self.pool.acquire({**gpu,'runtime':{'accounts':['b']}},{'b':1})['account'],'b')
+        self.assertFalse(self.pool.has_room('b','NvidiaTeslaT4',1))
     def test_failed_bootstrap_closes_with_a_reason_that_survives_later_closes(self):
         r=request();row=self.pool.acquire(r,['a'])
         self.pool.close(row['id'],'Kaggle bootstrap failed 5 times in a row: OSError')
@@ -169,9 +187,12 @@ class PoolTests(unittest.TestCase):
                     created REAL NOT NULL,deadline REAL NOT NULL,state TEXT NOT NULL,active_run TEXT,
                     worker_pid INTEGER,note TEXT)''')
                 db.execute("INSERT INTO sessions VALUES('old','a','{}',1,9999999999,'idle',NULL,NULL,NULL)")
+                db.execute("CREATE UNIQUE INDEX one_live_notebook_per_account ON sessions(account) WHERE state != 'stopped'")
             migrated=Pool(home)
             self.assertEqual(migrated.live()[0]['account'],'a')
             self.assertGreater(migrated.live()[0]['idle_since'],time.time()-10)
             Pool(home)  # Reopening is idempotent and does not reset idle time.
+            gpu={**request(),'accelerator':'NvidiaTeslaT4','runtime':{'accounts':['c']}}
+            for _ in range(2): self.assertIsNotNone(migrated.acquire({**gpu,'runId':str(uuid.uuid4())},['c']))
 
 if __name__=='__main__':unittest.main()

@@ -17,7 +17,16 @@ def save(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix('.' + uuid.uuid4().hex + '.tmp')
     temporary.write_text(json.dumps(value), encoding='utf-8')
-    temporary.replace(path)
+    # Windows refuses to replace a file another process is reading (WinError 5).
+    for attempt in range(20):
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError:
+            if os.name != 'nt' or attempt == 19:
+                temporary.unlink(missing_ok=True)
+                raise
+            time.sleep(.05)
 
 
 def load(path):

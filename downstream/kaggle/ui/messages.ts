@@ -10,7 +10,7 @@ export const messages = {
   "kaggle_missing_token": "token unavailable",
   "kaggle_accelerator": "Accelerator",
   "kaggle_lifetime": "Notebook lifetime (minutes)",
-  "kaggle_lifetime_note": "The notebook stops after the run or at its lifetime limit. New runs use this accelerator and lifetime unless overridden. One OpenResearch notebook per account at a time.",
+  "kaggle_lifetime_note": "The notebook stops after the run or at its lifetime limit. New runs use this accelerator and lifetime unless overridden. Each account runs up to two GPU notebooks, or one CPU or TPU notebook, at a time.",
   "kaggle_competitions": "Competition sources (optional)",
   "kaggle_datasets": "Dataset sources (optional)",
   "kaggle_sources_note": "One reference per line: competition-slug or owner/dataset. Accept competition rules on Kaggle first. These sources are mounted under /kaggle/input.",
