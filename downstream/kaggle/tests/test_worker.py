@@ -42,7 +42,7 @@ class WorkerShutdownTests(unittest.TestCase):
         forbidden=Exception('403');forbidden.response=SimpleNamespace(status_code=403)
         now=time.time()
         expired={'created':now-7300,'deadline':now-3700}
-        with tempfile.TemporaryDirectory() as root,                 patch('bridge.control',side_effect=[forbidden,RuntimeError('SSH stop failed')]*4):
+        with tempfile.TemporaryDirectory() as root,                 patch('bridge.control',side_effect=[forbidden,RuntimeError('SSH stop failed')]*4),                 patch.object(worker,'observe_sessions',side_effect=ConnectionError('offline')):
             # Push response lost, Kaggle has no such notebook, past deadline plus timeout.
             self.assertEqual(worker.shutdown(None,'sid','account',Path(root),False,row=expired),(True,False))
             # Within that bound a delayed notebook could still be running.
@@ -53,6 +53,52 @@ class WorkerShutdownTests(unittest.TestCase):
             self.assertEqual(worker.shutdown(None,'sid','account',Path(root),False,row=expired),(False,False))
             ancient={'created':now-worker.MAX_NOTEBOOK_SECONDS-7300,'deadline':now-worker.MAX_NOTEBOOK_SECONDS-1}
             self.assertEqual(worker.shutdown(None,'sid','account',Path(root),False,row=ancient),(True,False))
+    def test_missing_notebook_is_freed_once_verified_sessions_omit_it_twice(self):
+        forbidden=Exception('403');forbidden.response=SimpleNamespace(status_code=403)
+        now=time.time()
+        row={'created':now-1000,'deadline':now+6200}
+        other={'ref':'owner/ai-scientist-ssh-'+'f'*12}
+        listing={'readiness':'busy','active_session_count':1,'active_sessions':[other]}
+        with tempfile.TemporaryDirectory() as root, \
+                patch('bridge.control',side_effect=forbidden) as control, \
+                patch.object(worker,'observe_sessions',return_value=listing):
+            (Path(root)/'sid').mkdir()
+            # First absence keeps the reservation and skips a pointless SSH STOP.
+            self.assertEqual(worker.shutdown(None,'sid','account',Path(root),False,row=row),(False,False))
+            self.assertEqual([c.args[1] for c in control.call_args_list],['status'])
+            # Confirmed after a second verified absence minutes later.
+            with patch.object(worker.time,'time',return_value=now+worker.ABSENCE_CONFIRM_SECONDS+1):
+                self.assertEqual(worker.shutdown(None,'sid','account',Path(root),False,row=row),(True,False))
+    def test_missing_notebook_is_kept_when_sessions_cannot_rule_it_out(self):
+        forbidden=Exception('403');forbidden.response=SimpleNamespace(status_code=403)
+        now=time.time()
+        row={'created':now-1000,'deadline':now+6200}
+        ours={'ref':'owner/ai-scientist-ssh-sid'}
+        for listing in ({'readiness':'busy','active_session_count':1,'active_sessions':[ours]},
+                        {'readiness':'busy','active_session_count':1,'active_sessions':[{'ref':''}]},
+                        {'readiness':'busy','active_session_count':2,'active_sessions':[]},
+                        {'readiness':'needs_login','active_session_count':None}):
+            with tempfile.TemporaryDirectory() as root, \
+                    patch('bridge.control',side_effect=[forbidden,RuntimeError('SSH stop failed')]*2), \
+                    patch.object(worker,'observe_sessions',return_value=listing):
+                (Path(root)/'sid').mkdir();(Path(root)/'sid'/'absent.json').write_text(json.dumps({'at':now-3600}))
+                self.assertEqual(worker.shutdown(None,'sid','account',Path(root),False,row=row),(False,False))
+        # A push response proves Kaggle accepted the notebook; 403 proves nothing.
+        with tempfile.TemporaryDirectory() as root, \
+                patch('bridge.control',side_effect=[forbidden,RuntimeError('SSH stop failed')]), \
+                patch.object(worker,'observe_sessions') as observe:
+            (Path(root)/'sid').mkdir();(Path(root)/'sid'/'push-response.json').write_text('{}')
+            self.assertEqual(worker.shutdown(None,'sid','account',Path(root),False,row=row),(False,False))
+            observe.assert_not_called()
+    def test_absence_is_not_observed_while_a_lost_push_may_still_land(self):
+        forbidden=Exception('403');forbidden.response=SimpleNamespace(status_code=403)
+        row={'created':time.time()-1000,'deadline':time.time()+6200}
+        with tempfile.TemporaryDirectory() as root, \
+                patch('bridge.control',side_effect=[forbidden,RuntimeError('SSH stop failed')]), \
+                patch.object(worker,'observe_sessions') as observe:
+            (Path(root)/'sid').mkdir();(Path(root)/'sid'/'submit-intent.json').write_text('{}')
+            self.assertEqual(worker.shutdown(None,'sid','account',Path(root),False,row=row),(False,False))
+            observe.assert_not_called()
     def test_never_submitted_request_can_be_closed(self):
         with patch('bridge.control',side_effect=[FileNotFoundError(),{'stopped':True}]):
             self.assertEqual(worker.shutdown(None,'session','account',Path('.'),False),(True,True))

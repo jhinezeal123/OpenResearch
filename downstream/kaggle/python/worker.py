@@ -16,6 +16,9 @@ from pool import Pool, LAUNCH_SECONDS
 
 # Kaggle ends every session within 12 hours of starting, whatever its timeout.
 MAX_NOTEBOOK_SECONDS = 12 * 60 * 60
+# Push requests time out after 100 seconds; two absences must be this far apart.
+PUSH_SETTLE_SECONDS = 2 * 60
+ABSENCE_CONFIRM_SECONDS = 2 * 60
 from processes import guard_worker, load, lock, owner, save, spawn_tree, stop_tree
 
 class Channel:
@@ -65,11 +68,43 @@ class Channel:
         with self.lock:
             self._disconnect()
 
+def observe_sessions(account):
+    from account_runtime import account_readiness
+    return account_readiness(account)
+
+def not_running(sid,account,root,row):
+    """Whether verified account session lists, minutes apart, omit this notebook.
+
+    True once confirmed, False after the first absence, None when unverified.
+    """
+    folder=Path(root)/sid
+    intent=folder/'submit-intent.json'
+    # A push whose response was lost may still land until its request times out.
+    if time.time()<(intent.stat().st_mtime if intent.exists() else row['created'])+PUSH_SETTLE_SECONDS: return None
+    try: observation=observe_sessions(account)
+    except Exception as error:
+        print('Shutdown sessions: '+type(error).__name__,file=sys.stderr,flush=True)
+        return None
+    sessions=observation.get('active_sessions') or []
+    slugs=[(s.get('ref') or '').split('/',1)[-1] for s in sessions]
+    if 'ai-scientist-ssh-'+sid[:12] in slugs:
+        (folder/'absent.json').unlink(missing_ok=True)
+        return None
+    # An unidentified session could be this notebook; never infer absence.
+    if observation.get('readiness') not in ('verified_idle','busy') or observation.get('active_session_count')!=len(sessions) or not all(slugs):
+        return None
+    first=load(folder/'absent.json').get('at')
+    if first is None:
+        save(folder/'absent.json',{'at':time.time()})
+        return False
+    return time.time()-first>=ABSENCE_CONFIRM_SECONDS
+
 def shutdown(session,sid,account,root,requested,row=None):
     from bridge import control
-    missing=False
+    missing,absent=False,None
     # Read provider state even when SSH has already disappeared after STOP.
     for action in (('status',) if requested else ('status','stop')):
+        if action=='stop' and absent is False: break
         try:
             result=control(session,action,sid,account,root)
             if action=='stop': requested=True
@@ -78,6 +113,13 @@ def shutdown(session,sid,account,root,requested,row=None):
             print('Shutdown '+action+': '+type(error).__name__,file=sys.stderr,flush=True)
             # Kaggle answers 403 (not 404) for a private slug that does not exist.
             missing|=action=='status' and getattr(getattr(error,'response',None),'status_code',None) in (403,404)
+        if action=='status' and missing and row is not None and not (Path(root)/sid/'push-response.json').exists():
+            # Prove the notebook is not running instead of waiting out its
+            # lifetime. Nothing running needs an SSH STOP either.
+            absent=not_running(sid,account,root,row)
+            if absent:
+                print('Shutdown confirmed: notebook absent from verified Kaggle sessions',file=sys.stderr,flush=True)
+                return True,requested
     if row is not None:
         # Without a receipt the reservation would otherwise outlive any notebook
         # forever. A push that never got a response, has no notebook at Kaggle,

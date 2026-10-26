@@ -102,7 +102,8 @@ spawning another interpreter on every poll.
 | Worker heartbeat absent for 180 seconds | Verify PID **and creation time**, terminate that owner, and recover the same session. A running remote experiment is inspected, never replayed. |
 | Provider reports the notebook already stopped | Persist the receipt, free the account, and exit the worker. |
 | Stop outcome or remote state is unknown | Keep the account reserved; the shared scheduler retries shutdown with backoff up to 5 minutes. A lost connection alone never releases a lease. |
-| Push response was lost, Kaggle has no such notebook, and deadline plus lifetime has passed | Free the account: the notebook was never created. |
+| Push response was lost, Kaggle has no such notebook, and two verified account session lists at least 2 minutes apart omit it | Free the account without an SSH STOP. Absence counts only after the lost push could have landed; an unidentified session never proves absence. |
+| Push response was lost, Kaggle has no such notebook, and deadline plus lifetime has passed | Free the account: the notebook was never created. Fallback when session lists stay unverifiable. |
 | Stop still unconfirmed 12 hours past the deadline | Free the account: Kaggle has ended any session by then. |
 
 `processes.py` owns local tree cleanup. On Windows, SSH starts suspended and is
