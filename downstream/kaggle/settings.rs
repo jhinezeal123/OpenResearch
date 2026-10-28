@@ -73,6 +73,14 @@ pub(crate) async fn sessions() -> ApiResult {
             .map_err(bad_request)?,
     ))
 }
+pub(crate) async fn quota() -> ApiResult {
+    let settings = kaggle::load_settings()?.unwrap_or_else(defaults);
+    Ok(Json(
+        kaggle::call(&settings, json!({"action":"quota"}), 45)
+            .await
+            .map_err(bad_request)?,
+    ))
+}
 pub(crate) async fn close_session(Json(value): Json<Value>) -> ApiResult {
     let settings = kaggle::load_settings()?.unwrap_or_else(defaults);
     Ok(Json(

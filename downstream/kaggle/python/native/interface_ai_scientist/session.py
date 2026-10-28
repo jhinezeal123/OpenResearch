@@ -276,9 +276,34 @@ def push(state):
         state["submission_status"] = "SUBMITTED"
         save(root / "state.json", state)
         return result
-    except Exception:
+    except Exception as error:
         # A lost response does not prove Kaggle rejected the request.
+        save(root / "push-error.json", push_failure(error))
         raise
+
+
+def push_failure(error):
+    """What a failed push reported, for logs. Only the bundled proxy's header proves
+    that no connection to Kaggle was made, so the push cannot have landed."""
+    response = getattr(error, 'response', None)
+    detail = {'error_type': type(error).__name__, 'message': str(error)[:500],
+              'at': datetime.now(timezone.utc).isoformat()}
+    if response is not None:
+        detail['http_status'] = response.status_code
+        detail['body'] = response.text[:1000]
+        detail['unsent'] = response.headers.get('X-Orx-Upstream-Unsent') == '1'
+    for key in ('message', 'body'):
+        if key in detail:
+            detail[key] = re.sub(r'KGAT_[A-Za-z0-9_-]+', 'KGAT_<redacted>', detail[key])
+    # One log line, e.g. "HTTPError HTTP 502 (request never reached Kaggle): ...".
+    summary = detail['error_type']
+    if 'http_status' in detail:
+        summary += ' HTTP %s' % detail['http_status']
+    if detail.get('unsent'):
+        summary += ' (request never reached Kaggle)'
+    reason = (detail.get('body') or detail['message']).strip().replace('\n', ' ')
+    detail['summary'] = summary + (': ' + reason[:300] if reason else '')
+    return detail
 
 
 def ssh_options(state):
@@ -390,6 +415,38 @@ def notebook_status(account, kernel_ref, session_id=None):
     return {'session_id': session_id, 'notebook_ref': kernel_ref,
             'status': current, 'stopped': current in {'complete', 'completed', 'error', 'cancelled', 'canceled'},
             'observed_at': datetime.now(timezone.utc).isoformat()}
+
+
+def accelerator_quota(account):
+    """Weekly GPU/TPU hours used and allowed, in seconds, and the next reset.
+
+    Read the raw JSON: the pinned SDK drops whole days from durations
+    (30 h reads as 6 h), and its proxy rewrite is not needed here.
+    """
+    import requests
+    key, _ = account_store.resolve(account)
+    from provider_metrics import record as record_metrics
+    started, response = time.perf_counter(), None
+    try:
+        response = requests.post('https://api.kaggle.com/v1/kernels.KernelsApiService/GetAcceleratorQuotaStatistics',
+            json={}, headers={'Authorization': 'Bearer ' + account_store.read_token(key),
+                              'User-Agent': 'OpenResearch-Kaggle'}, timeout=(10, 20))
+    finally:
+        record_metrics(key, 2, len(response.content) if response is not None else 0, started,
+                       response is None or response.status_code >= 400)
+    response.raise_for_status()
+    payload = response.json()
+    def seconds(value):
+        return float(value[:-1]) if isinstance(value, str) and value.endswith('s') else 0.0
+    def quota(name):
+        value = payload.get(name)
+        if not isinstance(value, dict):
+            return None
+        used, total = seconds(value.get('timeUsed')), seconds(value.get('totalTimeAllowed'))
+        return {'used': used, 'reserved': seconds(value.get('timeReserved')), 'total': total,
+                'remaining': max(0.0, total - used)}
+    return {'account': key, 'gpu': quota('gpuQuota'), 'tpu': quota('tpuQuota'),
+            'refresh_at': payload.get('quotaRefreshTime')}
 
 
 def write_ssh_config(state):

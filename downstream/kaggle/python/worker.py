@@ -77,6 +77,16 @@ def rejected(root,sid):
     error=response.get('error')
     return str(error) if error and not response.get('url') else None
 
+def unsent(root,sid):
+    """The bundled proxy's proof that the push never reached Kaggle.
+
+    It could not open a connection, so no notebook exists and nothing needs stopping.
+    """
+    folder=Path(root)/sid
+    failure=load(folder/'push-error.json')
+    if not failure.get('unsent') or (folder/'push-response.json').exists(): return None
+    return failure.get('summary') or 'no connection to Kaggle'
+
 def lost_push(session,sid,row,root):
     """Whether Kaggle proves that a push whose response was lost never landed.
 
@@ -106,6 +116,8 @@ def settle_unsubmitted(session,pool,sid,root,row):
         note='Kaggle rejected the notebook: '+error
         if 'quota' in error.lower(): pool.never_created(sid,note,quota=True)
         else: pool.close(sid,note)
+    elif failure:=unsent(root,sid):
+        pool.never_created(sid,'Kaggle push never left this machine: '+failure)
     elif lost_push(session,sid,row,root):
         pool.never_created(sid,'Kaggle never created the notebook; its push response was lost')
     else:
@@ -148,7 +160,7 @@ def not_running(sid,account,root,row):
 
 def shutdown(session,sid,account,root,requested,row=None):
     from bridge import control
-    if rejected(root,sid) or load(Path(root)/sid/'absent.json').get('confirmed'):
+    if rejected(root,sid) or unsent(root,sid) or load(Path(root)/sid/'absent.json').get('confirmed'):
         print('Shutdown confirmed: Kaggle never created the notebook',file=sys.stderr,flush=True)
         return True,requested
     missing,absent=False,None
@@ -223,7 +235,10 @@ def serve(config):
             except Exception as e:
                 body=json.dumps({'ok':False,'errorType':type(e).__name__}).encode()
                 print(type(e).__name__+': '+str(e),file=sys.stderr,flush=True)
-            self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+            try:
+                self.send_response(200);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+            except ConnectionError:
+                pass  # The caller timed out first, e.g. a 3-second health probe.
     server=HTTPServer(('127.0.0.1',0),Handler);server.timeout=1
     session.save(folder/'worker.json',{'pid':os.getpid(),'port':server.server_port,'token':token})
     from auto_login.web_session import protect_acl
@@ -262,12 +277,13 @@ def serve(config):
                         return
                     outcome=(r.get('submission_status'),r.get('ssh_status'),r.get('error_type'))
                     if outcome!=reported and r.get('error_type'):
-                        print('Provision: submission %s, SSH %s, %s'%outcome,file=sys.stderr,flush=True)
+                        detail=(' - '+r['error_detail']) if r.get('error_detail') else ''
+                        print('Provision: submission %s, SSH %s, %s'%outcome+detail,file=sys.stderr,flush=True)
                     reported=outcome
                     # Bootstrap reports a rejected or lost push as an UNKNOWN
                     # submission and would wait for SSH from a notebook that
                     # never existed. Provider probes are rate limited.
-                    if rejected(sessions,sid) or time.monotonic()-last_probe>=30:
+                    if rejected(sessions,sid) or unsent(sessions,sid) or time.monotonic()-last_probe>=30:
                         last_probe=time.monotonic()
                         if settle_unsubmitted(session,pool,sid,sessions,row):
                             state['error']=pool.get(sid)['note'];state['fatal']=True;return

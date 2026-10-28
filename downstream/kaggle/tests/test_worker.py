@@ -112,6 +112,19 @@ class WorkerShutdownTests(unittest.TestCase):
             self.assertIsNone(worker.rejected(root,'sid'))
             (Path(root)/'sid'/'push-response.json').write_text('{}')
             self.assertIsNone(worker.rejected(root,'sid'))
+    def test_unsent_push_is_stopped_without_provider_calls_or_ssh(self):
+        row={'created':time.time()-10,'deadline':time.time()+7200}
+        with tempfile.TemporaryDirectory() as root, patch('bridge.control') as control:
+            folder=Path(root)/'sid';folder.mkdir();(folder/'submit-intent.json').write_text('{}')
+            (folder/'push-error.json').write_text(json.dumps({'unsent':False,'summary':'ReadTimeout'}))
+            self.assertIsNone(worker.unsent(root,'sid'))  # A lost response may still land.
+            (folder/'push-error.json').write_text(json.dumps({'unsent':True,'summary':'HTTPError HTTP 502 (request never reached Kaggle)'}))
+            self.assertIn('never reached Kaggle',worker.unsent(root,'sid'))
+            self.assertEqual(worker.shutdown(None,'sid','account',Path(root),False,row=row),(True,False))
+            control.assert_not_called()
+            # A saved push answer outranks the proxy's verdict.
+            (folder/'push-response.json').write_text(json.dumps({'url':'https://www.kaggle.com/code/o/n'}))
+            self.assertIsNone(worker.unsent(root,'sid'))
     def test_lost_push_counts_as_never_created_only_when_kaggle_proves_it(self):
         forbidden=Exception('403');forbidden.response=SimpleNamespace(status_code=403)
         row={'account':'account','created':time.time()-1000}
@@ -257,6 +270,22 @@ class WorkerLifecycleTests(unittest.TestCase):
         current=self.pool.get(self.row['id'])
         self.assertEqual((current['state'],current['active_run']),('stopped',None))
         self.assertIn('push response was lost',current['note'])
+        self.assertIsNone(self.pool.assigned(self.request['runId']))
+
+    def test_unsent_push_requeues_the_run_without_waiting_for_absence(self):
+        folder=Path(self.config['home'])/'sessions'/self.row['id']
+        folder.mkdir(parents=True);(folder/'submit-intent.json').write_text('{}')
+        processes.save(folder/'push-error.json',{'unsent':True,'summary':'HTTPError HTTP 502 (request never reached Kaggle): WinError 10060'})
+        self.start.return_value={'submission_status':'UNKNOWN','ssh_status':'NOT_CHECKED','error_type':'HTTPError',
+                                 'error_detail':'HTTPError HTTP 502 (request never reached Kaggle): WinError 10060'}
+        with patch.object(bridge,'control',side_effect=AssertionError('no provider call needed')), \
+                patch.object(worker,'not_running',side_effect=AssertionError('no absence check needed')):
+            self.begin();self.future.result(timeout=5)
+        self.start.assert_called_once()
+        current=self.pool.get(self.row['id'])
+        self.assertEqual((current['state'],current['active_run']),('stopped',None))
+        self.assertIn('never left this machine',current['note'])
+        self.assertIn('WinError 10060',current['note'])
         self.assertIsNone(self.pool.assigned(self.request['runId']))
 
     def test_external_stop_receipt_ends_the_owner_and_closes_its_channel(self):

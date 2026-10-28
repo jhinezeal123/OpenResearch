@@ -37,7 +37,9 @@
       "SDK proxy, cookie API and native status reads record per-account aggregate payload bytes/attempt latency into ignored .runtime SQLite",
       "Benchmark publication reuses selected profile tokens with KaggleHub GCS upload and pinned SDK public create, validates name availability before sessions/upload, and returns immutable public dataset receipts",
       "Persistent Bash resets inherited errexit before each command so a nonzero exit can be reported without losing cwd/exports or replaying commands",
-      "Unused donor CLI entrypoints removed: session.main/bridge/shell/copy/network, terminal_remote.py and account_admin CRUD; hashes record the original donor files"
+      "Unused donor CLI entrypoints removed: session.main/bridge/shell/copy/network, terminal_remote.py and account_admin CRUD; hashes record the original donor files",
+      "Proxy retries failed upstream connects (nothing sent yet) and marks a request that never reached Kaggle with X-Orx-Upstream-Unsent; explicit-token requests receive Kaggle's own 429/403 instead of a proxy-wide token block",
+      "Push failures persist push-error.json with HTTP status and redacted body; weekly accelerator quota is read from GetAcceleratorQuotaStatistics raw JSON"
     ]
   },
   "files": {

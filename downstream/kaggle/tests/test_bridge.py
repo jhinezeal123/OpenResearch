@@ -16,6 +16,63 @@ spec = importlib.util.spec_from_file_location('kaggle_bridge', Path(__file__).re
 bridge = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bridge)
 
+def load_session(**modules):
+    """The native session module with its runtime dependencies replaced."""
+    path=Path(__file__).resolve().parents[1]/'python/native/interface_ai_scientist/session.py'
+    stubs={'account_store':SimpleNamespace(resolve=lambda a:('qa.txt',{'username':'qa-user'}),read_token=lambda a:'KGAT_FIXTURE'),
+           'proxy_control':SimpleNamespace(ensure_proxy=lambda:None,PROXY_PORT=0),
+           'provider_metrics':SimpleNamespace(record=Mock()),**modules}
+    with patch.dict(os.environ,{'ORX_KAGGLE_HOME':'unused-fixture'}), patch.dict(sys.modules,stubs):
+        spec=importlib.util.spec_from_file_location('test_native_session',path)
+        session=importlib.util.module_from_spec(spec);spec.loader.exec_module(session)
+    return session
+
+class PushFailureTests(unittest.TestCase):
+    def test_proxy_proof_of_an_unsent_push_is_recorded_with_kaggle_detail(self):
+        session=load_session()
+        error=Exception('502 Server Error for url: http://127.0.0.1:1/api/v1/x')
+        error.response=SimpleNamespace(status_code=502,headers={'X-Orx-Upstream-Unsent':'1'},
+            text='request not sent (token qa.txt): cannot connect to www.kaggle.com: [WinError 10060] KGAT_secret123')
+        detail=session.push_failure(error)
+        self.assertEqual((detail['http_status'],detail['unsent']),(502,True))
+        self.assertNotIn('KGAT_secret123',json.dumps(detail))
+        self.assertIn('HTTP 502 (request never reached Kaggle)',detail['summary'])
+        self.assertIn('WinError 10060',detail['summary'])
+    def test_a_lost_response_is_not_proof_that_the_push_was_unsent(self):
+        session=load_session()
+        detail=session.push_failure(TimeoutError('read timed out'))
+        self.assertNotIn('unsent',detail)
+        self.assertEqual(detail['summary'],'TimeoutError: read timed out')
+        error=Exception('502');error.response=SimpleNamespace(status_code=502,headers={},text='upstream fail')
+        self.assertFalse(session.push_failure(error)['unsent'])
+
+class QuotaTests(unittest.TestCase):
+    def test_weekly_hours_keep_whole_days(self):
+        payload={'quotaRefreshTime':'2026-10-31T00:00:00Z',
+                 'gpuQuota':{'timeUsed':'108228.384s','timeReserved':'0s','totalTimeAllowed':'108000s'},
+                 'tpuQuota':{'timeUsed':'0s','totalTimeAllowed':'72000s'}}
+        response=SimpleNamespace(content=b'{}',status_code=200,raise_for_status=lambda:None,json=lambda:payload)
+        def post(url,*,json,headers,timeout):
+            self.assertTrue(url.endswith('/GetAcceleratorQuotaStatistics'))
+            self.assertEqual(headers['Authorization'],'Bearer KGAT_FIXTURE')
+            return response
+        session=load_session(requests=SimpleNamespace(post=post))
+        with patch.dict(sys.modules,{'requests':SimpleNamespace(post=post),'provider_metrics':SimpleNamespace(record=Mock())}):
+            quota=session.accelerator_quota('qa')
+        self.assertEqual(quota['gpu']['total'],108000.0)  # 30 h, not the SDK's 6 h.
+        self.assertEqual(quota['gpu']['remaining'],0.0)
+        self.assertEqual(quota['tpu']['remaining'],72000.0)
+        self.assertEqual(quota['refresh_at'],'2026-10-31T00:00:00Z')
+    def test_one_unreachable_account_does_not_hide_the_others(self):
+        store=SimpleNamespace(load_registry=lambda:{'accounts':{'a.txt':{},'b.txt':{}}},read_token=lambda k:'KGAT_X')
+        def read(key):
+            if key=='b.txt': raise ConnectionError('timed out')
+            return {'account':key,'gpu':None,'tpu':None}
+        pool=SimpleNamespace(quota_blocks=lambda:[{'account':'a.txt','quota':'gpu','until':1,'reason':'quota'}])
+        rows={r['account']:r for r in bridge.quotas(SimpleNamespace(accelerator_quota=read),pool,store)['accounts']}
+        self.assertEqual(rows['a.txt']['blocks'][0]['quota'],'gpu')
+        self.assertIn('ConnectionError',rows['b.txt']['error'])
+
 class BridgeTests(unittest.TestCase):
     def test_provider_status_identifies_client_and_recognizes_completed_notebook(self):
         session_path=Path(__file__).resolve().parents[1]/'python/native/interface_ai_scientist/session.py'

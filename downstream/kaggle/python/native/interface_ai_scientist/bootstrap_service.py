@@ -69,9 +69,11 @@ def start(account: str, ttl_seconds: int = 480, accelerator: str = 'cpu',
                     session.push(state)
                 except Exception as exc:
                     attempted = (Path(state['root']) / 'submit-intent.json').is_file()
+                    failure = Path(state['root']) / 'push-error.json'
                     return {**session.descriptor(state),
                             'submission_status': 'UNKNOWN' if attempted else 'NOT_SUBMITTED',
                             'ssh_status': 'NOT_CHECKED', 'error_type': type(exc).__name__,
+                            'error_detail': session.load(failure)['summary'] if failure.is_file() else str(exc)[:300],
                             'required_action': 'Reconnect with this session_id; do not submit it again.'}
     result = {**session.descriptor(state),
               'submission_status': state.get('submission_status', 'UNKNOWN')}

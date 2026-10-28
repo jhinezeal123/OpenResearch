@@ -32,6 +32,7 @@ pub(crate) fn routes() -> axum::Router<crate::commands::up::AppState> {
             "/api/settings/kaggle/sessions",
             get(kaggle::settings::sessions),
         )
+        .route("/api/settings/kaggle/quota", get(kaggle::settings::quota))
         .route(
             "/api/settings/kaggle/close-session",
             post(kaggle::settings::close_session),

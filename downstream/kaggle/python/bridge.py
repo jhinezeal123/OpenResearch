@@ -23,6 +23,24 @@ def accounts(account_store):
     return result
 
 
+def quotas(session, pool, account_store):
+    """Weekly accelerator hours per configured account, read concurrently.
+
+    One unreachable account reports its error without hiding the others.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    keys=[a['id'] for a in accounts(account_store) if a['configured']]
+    def read(key):
+        try: return session.accelerator_quota(key)
+        except Exception as error: return {'account':key,'error':type(error).__name__+': '+str(error)[:200]}
+    with ThreadPoolExecutor(max_workers=max(1,min(8,len(keys)))) as executor:
+        rows=list(executor.map(read,keys))
+    blocks=pool.quota_blocks()
+    for row in rows:
+        row['blocks']=[b for b in blocks if b['account']==row['account']]
+    return {'accounts':rows}
+
+
 def foreign_sessions(observation, account, live):
     """Kaggle sessions on an account that no live pool reservation owns.
 
@@ -144,6 +162,8 @@ def dispatch(request):
     action=request['action']
     if action=='accounts':
         return {'accounts':accounts(account_store),'accelerators':list(session.ACCELERATORS)}
+    if action=='quota':
+        return quotas(session,pool,account_store)
     if action=='recover-cookie':
         from auto_login.recovery import recover_cookie_core
         return recover_cookie_core(request['account'])

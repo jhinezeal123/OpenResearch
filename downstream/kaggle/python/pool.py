@@ -149,6 +149,10 @@ class Pool:
     def blocked(self, accelerator):
         """Accounts whose quota for this accelerator was recently exhausted."""
         with self.db() as db: return self._blocked(db, accelerator, time.time())
+    def quota_blocks(self):
+        """Every active quota block, for display."""
+        with self.db() as db:
+            return [dict(r) for r in db.execute('SELECT account,quota,until,reason FROM quota_blocks WHERE until>?',(time.time(),))]
     def never_created(self, sid, reason, quota=False):
         """Kaggle proved this session has no notebook, so nothing ran. Its Run
         may be admitted again, a bounded number of times. A quota refusal also

@@ -1,12 +1,38 @@
 import {useEffect,useState} from "react";
 import {useQuery,queryOptions} from "@tanstack/react-query";
-import {getKaggleSettings,saveKaggleSettings,kagglePreflight,getSessions,closeSession,recoverCookie,type KaggleConfig} from "./api";
+import {getKaggleSettings,saveKaggleSettings,kagglePreflight,getSessions,getQuota,closeSession,recoverCookie,type KaggleConfig,type KaggleAccountQuota,type KaggleQuotaHours} from "./api";
 import {queryClient,workspaceKey,workspaceScope,isCurrentScope,setScopedQueryData,Button} from "../../bridge/ui";
+
+const hours=(seconds:number)=>`${(seconds/3600).toFixed(1)}h`;
+
+function QuotaMeter({label,quota}:{label:string;quota:KaggleQuotaHours}){
+  const share=quota.total>0?quota.remaining/quota.total:0;
+  const fill=share<=0?"bg-accent-red":share<0.2?"bg-accent-amber":"bg-accent-green";
+  return <div className="flex min-w-40 flex-1 flex-col gap-1">
+    <div className="flex justify-between gap-2 text-xs"><span>{label}</span><span className={share<=0?"text-accent-red":"text-subtext"}>{hours(quota.remaining)} left of {hours(quota.total)}</span></div>
+    <div className="h-1.5 overflow-hidden rounded-full bg-border" role="meter" aria-label={`${label} hours left`} aria-valuemin={0} aria-valuemax={quota.total} aria-valuenow={quota.remaining}>
+      <div className={`h-full ${fill}`} style={{width:`${Math.round(Math.min(1,Math.max(0,share))*100)}%`}}/>
+    </div>
+  </div>;
+}
+
+function AccountQuota({quota,loading}:{quota?:KaggleAccountQuota;loading:boolean}){
+  if(!quota)return <span className="w-full text-xs text-subtext">{loading?"Loading quota…":"Quota unavailable"}</span>;
+  if(quota.error)return <span className="w-full text-xs text-accent-red">Quota unavailable: {quota.error}</span>;
+  return <div className="flex w-full flex-col gap-1">
+    <div className="flex flex-wrap gap-4">
+      {quota.gpu&&<QuotaMeter label="GPU" quota={quota.gpu}/>}
+      {quota.tpu&&<QuotaMeter label="TPU" quota={quota.tpu}/>}
+    </div>
+    {quota.blocks.map(b=><span key={b.quota} className="text-xs text-accent-amber">Skipped for new {b.quota.toUpperCase()} notebooks until {new Date(b.until*1000).toLocaleTimeString()}{b.reason?` · ${b.reason}`:""}</span>)}
+  </div>;
+}
 
 export function KaggleSection(){
   const options=queryOptions({queryKey:workspaceKey("getKaggleSettings"),queryFn:({signal})=>getKaggleSettings(signal)});
   const query=useQuery(options);
   const sessions=useQuery({queryKey:workspaceKey("kaggleSessions"),queryFn:({signal})=>getSessions(signal),enabled:query.data?.runtimeReady===true,refetchInterval:5000});
+  const quota=useQuery({queryKey:workspaceKey("kaggleQuota"),queryFn:({signal})=>getQuota(signal),enabled:query.data?.runtimeReady===true,refetchInterval:5*60_000,staleTime:60_000});
   const [draft,setDraft]=useState<KaggleConfig|null>(null);
   const [busy,setBusy]=useState(false);
   const [error,setError]=useState<string|null>(null);
@@ -36,6 +62,9 @@ export function KaggleSection(){
     if(isCurrentScope(scope))setReadiness(Object.fromEntries(result.accounts.map(a=>[a.account,a.readiness])));
   }
   const live=sessions.data?.sessions.filter(s=>s.state!=="stopped")??[];
+  const quotaByAccount=new Map(quota.data?.accounts.map(q=>[q.account,q])??[]);
+  const reset=quota.data?.accounts.find(q=>q.refresh_at)?.refresh_at;
+  const refreshAt=reset?new Date(reset):null;
   return <div className="flex flex-col gap-6">
     <form className="settings-form flex flex-col gap-4" onSubmit={e=>{e.preventDefault();void act(save)}}>
       <p className="m-0 text-sm text-subtext leading-relaxed">Each experiment Run leases a Kaggle notebook. Runs can reuse its environment until the session expires or you close it. Parallel Runs use different accounts; excess Runs wait for a free session.</p>
@@ -43,10 +72,16 @@ export function KaggleSection(){
       <fieldset className="flex flex-col gap-3 rounded-lg border border-border p-4">
         <legend className="px-1 text-sm font-medium">Account pool</legend>
         <p className="m-0 text-xs text-subtext">Enable accounts available to all projects. Up to two GPU notebooks, or one CPU or TPU notebook, per account. No project is pinned to an account.</p>
-        {data?.accounts.map(a=><div className="flex flex-wrap items-center gap-2" key={a.id}>
+        <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-subtext">
+          <span>{refreshAt?`Weekly accelerator quota resets ${refreshAt.toLocaleString(undefined,{weekday:"short",hour:"2-digit",minute:"2-digit"})}`:"Weekly accelerator quota"}{quota.dataUpdatedAt?` · checked ${new Date(quota.dataUpdatedAt).toLocaleTimeString()}`:""}</span>
+          <Button type="button" disabled={quota.isFetching} onClick={()=>void quota.refetch()}>{quota.isFetching?"Checking quota…":"Refresh quota"}</Button>
+        </div>
+        {quota.error&&<p className="error m-0" role="alert">{quota.error.message}</p>}
+        {data?.accounts.map(a=><div className="flex flex-wrap items-center gap-2 border-t border-border pt-3" key={a.id}>
           <label className="flex flex-1 items-center gap-2 text-sm"><input type="checkbox" checked={draft.accounts.includes(a.id)} disabled={busy||!a.configured} onChange={e=>set("accounts",e.target.checked?[...draft.accounts,a.id]:draft.accounts.filter(id=>id!==a.id))}/>{a.username??a.alias}</label>
           <span className="text-xs text-subtext">{!a.configured?"Missing token":readiness[a.id]??"Not checked"}</span>
           <Button type="button" disabled={busy} onClick={()=>void act(async()=>{const scope=workspaceScope();const r=await recoverCookie(a.id);if(isCurrentScope(scope))setStatus(r.note??"Cookie recovery finished. Check accounts again.")})}>Recover cookie</Button>
+          {a.configured&&<AccountQuota quota={quotaByAccount.get(a.id)} loading={quota.isPending}/>}
         </div>)}
       </fieldset>
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">

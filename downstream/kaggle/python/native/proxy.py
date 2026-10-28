@@ -31,6 +31,17 @@ def _fix_json(body):
     return _DUR.sub(rb'"\1.000s"', body)
 
 
+# Một kết nối chưa lập được thì request chưa rời máy: thử lại an toàn, kể cả SaveKernel.
+# Tổng thời gian chờ phải nằm trong read timeout 90s của SDK.
+CONNECT_TIMEOUT = 10
+CONNECT_ATTEMPTS = 3
+UNSENT_HEADER = 'X-Orx-Upstream-Unsent'
+
+
+class Unsent(Exception):
+    """No connection to Kaggle was established, so the request never left this machine."""
+
+
 # ---------------------------------------------------------------- upstream pool
 class _UpstreamPool:
     """Pool kết nối HTTPS(UPSTREAM) persistent. Acquire 1 conn, request + đọc đủ body,
@@ -49,11 +60,30 @@ class _UpstreamPool:
         self._created = 0
 
     def _new(self):
-        self._created += 1
-        if self.is_https:
-            ctx = ssl.create_default_context()
-            return http.client.HTTPSConnection(self.host, self.port, context=ctx, timeout=self.timeout)
-        return http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+        """Mở và connect 1 kết nối mới; raise Unsent khi mọi lần connect đều lỗi.
+
+        Lỗi TCP/DNS/TLS lúc connect (vd WinError 10060) xảy ra trước khi gửi byte nào,
+        nên thử lại không thể nhân đôi request."""
+        last = None
+        for attempt in range(CONNECT_ATTEMPTS):
+            self._created += 1
+            if self.is_https:
+                ctx = ssl.create_default_context()
+                conn = http.client.HTTPSConnection(self.host, self.port, context=ctx, timeout=CONNECT_TIMEOUT)
+            else:
+                conn = http.client.HTTPConnection(self.host, self.port, timeout=CONNECT_TIMEOUT)
+            try:
+                conn.connect()
+            except OSError as exc:
+                conn.close()
+                last = exc
+                self._log_upstream('connect %d/%d thất bại: %s' % (attempt + 1, CONNECT_ATTEMPTS, exc))
+                if attempt < CONNECT_ATTEMPTS - 1:
+                    time.sleep(attempt + 1)
+                continue
+            conn.sock.settimeout(self.timeout)
+            return conn
+        raise Unsent('cannot connect to %s: %s' % (self.host, last))
 
     def acquire(self):
         """Lấy 1 conn sẵn sàng; trả (conn, reused_bool)."""
@@ -248,7 +278,9 @@ class H(http.server.BaseHTTPRequestHandler):
                 status, rheaders, rbody, reused = POOL.request(self.command, self.path, body or None, headers)
                 tk[2] += 1
                 # http.client không raise HTTPError — kiểm tra status trực tiếp.
-                quota = status == 429 or (status == 403 and b'quota' in (rbody or b'').lower())
+                # Token do client chỉ định không có token thay thế: trả nguyên lỗi
+                # Kaggle thay vì chặn token và trả 502 "no token available".
+                quota = explicit is None and (status == 429 or (status == 403 and b'quota' in (rbody or b'').lower()))
                 if quota:
                     retry = dict(rheaders).get('Retry-After')
                     try:
@@ -266,6 +298,10 @@ class H(http.server.BaseHTTPRequestHandler):
                 self._log('%s %s -> %d (token %s, %d reqs%s)' %
                           (self.command, self.path, status, tk[0], tk[2], ', reuse' if reused else ''))
                 return
+            except Unsent as ex:
+                self._log('UPSTREAM UNREACHABLE %s: %s' % (tk[0], ex))
+                last_err = (502, ('request not sent (token %s): %s' % (tk[0], ex)).encode('utf-8', 'replace'), True)
+                continue
             except Exception as ex:
                 self._log('UPSTREAM FAIL %s: %s' % (tk[0], ex))
                 last_err = (502, ('upstream fail (token %s): %s' % (tk[0], ex)).encode('utf-8', 'replace'))
@@ -273,9 +309,9 @@ class H(http.server.BaseHTTPRequestHandler):
                     # The save may have reached Kaggle; another account must not repeat it.
                     break
                 continue
-        code, body = last_err if last_err else (502, b'no token available')
-        self._respond_err(code, body)
-        self._log('%s -> %d (ALL TOKENS EXHAUSTED)' % (self.path, code))
+        code, body, *unsent = last_err if last_err else (502, b'no token available')
+        self._respond_err(code, body, unsent=bool(unsent))
+        self._log('%s %s -> %d (%s)' % (self.command, self.path, code, body.decode('utf-8', 'replace')[:300]))
 
     def _forward_once(self, body, auth):
         """Forward 1 request với Authorization client cho sẵn (token ngoài pool)."""
@@ -289,7 +325,8 @@ class H(http.server.BaseHTTPRequestHandler):
             self._log('%s %s -> %d (external token%s)' %
                       (self.command, self.path, status, ', reuse' if reused else ''))
         except Exception as ex:
-            self._respond_err(502, str(ex).encode())
+            self._respond_err(502, str(ex).encode('utf-8', 'replace'), unsent=isinstance(ex, Unsent))
+            self._log('%s %s -> 502 (external token: %s)' % (self.command, self.path, ex))
 
     def _respond_bytes(self, status, headers, body):
         self.send_response(status)
@@ -300,8 +337,11 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _respond_err(self, code, body):
+    def _respond_err(self, code, body, unsent=False):
         self.send_response(code)
+        if unsent:
+            # Proof for the caller that Kaggle never received this request.
+            self.send_header(UNSENT_HEADER, '1')
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
         if body:
