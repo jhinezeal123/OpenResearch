@@ -14,7 +14,7 @@ const compiled = ts.transpileModule(source, {
 let trackioUrl = null;
 const mocks = {
   "../paraglide/messages.js": { m: new Proxy({}, { get: (_, name) => () => String(name) }) },
-  "../api": { runDisplayStatus: () => "complete", timeAgo: () => "now", trackioRunUrl: () => trackioUrl },
+  "../api": { runDisplayStatus: () => "complete", runMonitoringError: (run) => run.backend?.monitoringError ?? null, timeAgo: () => "now", trackioRunUrl: () => trackioUrl },
   "../queries/settings": { useTrackioRuns: () => ({ data: undefined }) },
   "../tabPreview": { tabOpenGestureHandlers: () => ({}) },
   "../theme": { useResolvedTheme: () => "light" },
@@ -85,5 +85,18 @@ test("the trackio view embeds the run's charts in place of its logs", () => {
     assert.doesNotMatch(html, /LOG:/);
   } finally {
     trackioUrl = null;
+  }
+});
+
+
+test("monitoring diagnostic follows the selected run and clears after recovery", () => {
+  props.runs[1].backend = { monitoringError: "Monitoring unavailable: no exit status or scheduler record." };
+  try {
+    assert.match(render(null), /role="status"[^>]*>Monitoring unavailable:/);
+    assert.doesNotMatch(render("run-old"), /Monitoring unavailable:/);
+    props.runs[1].backend = {};
+    assert.doesNotMatch(render(null), /Monitoring unavailable:/);
+  } finally {
+    delete props.runs[1].backend;
   }
 });

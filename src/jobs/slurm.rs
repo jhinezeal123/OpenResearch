@@ -61,6 +61,9 @@ pub struct SlurmSettings {
     /// Absolute shared-filesystem root for runs and the source cache; `None` is `~/.orx`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_root: Option<String>,
+    /// Keep every finished run's remote dir, not just each project's newest few.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_remote_runs: bool,
 }
 
 fn settings_path() -> std::path::PathBuf {
@@ -288,7 +291,7 @@ pub async fn run_job(spec: &SlurmJobSpec) -> Result<String> {
         script = spec.setup_script,
     );
     ssh_run(
-        &SshTarget::alias(&spec.host),
+        &SshTarget::alias(&spec.host).for_run(&spec.run_id),
         &format!("mkdir -p {dir} && chmod 700 {dir} && bash -s"),
         Some(&setup),
     )
@@ -297,13 +300,13 @@ pub async fn run_job(spec: &SlurmJobSpec) -> Result<String> {
 
     // Write the batch script (owner-only: it embeds tokens) and submit.
     ssh_run(
-        &SshTarget::alias(&spec.host),
+        &SshTarget::alias(&spec.host).for_run(&spec.run_id),
         &format!("umask 077 && cat > {dir}/job.sbatch"),
         Some(&render_sbatch(spec)),
     )
     .await?;
     let out = ssh_run(
-        &SshTarget::alias(&spec.host),
+        &SshTarget::alias(&spec.host).for_run(&spec.run_id),
         &format!("cd {dir} && sbatch --parsable job.sbatch"),
         None,
     )
@@ -340,21 +343,16 @@ fn queue_probe(job_id: &str) -> String {
 ///
 /// `GONE` means monitoring is unavailable, not that the job terminated.
 /// Accounting can be disabled or unavailable while a job still runs.
-pub async fn inspect_job(host: &str, dir: &str, job_id: &str) -> Result<JobState> {
-    let dir = shell_path(dir);
-    let queue = queue_probe(job_id);
-    let cmd = format!(
-        "d={dir}; \
-         if [ -f \"$d/exit_code\" ]; then echo \"EXIT $(cat \"$d/exit_code\")\"; \
-         else queue=$({queue}); \
-         case \"$queue\" in \
-         SQ*) echo \"$queue\";; \
-         *) if st=$(sacct -nPX -j {job_id} -o State 2>/dev/null) && [ -n \"$st\" ]; then echo \"SA $st\"; \
-         elif [ \"$queue\" = GONE ]; then echo GONE; else echo UNAVAILABLE; fi;; esac; fi",
-        job_id = sh_quote(job_id),
-    );
-    let out = ssh_run(&SshTarget::alias(host), &cmd, None).await?;
-    Ok(map_inspect_token(out.trim()))
+pub async fn inspect_job(host: &str, run_id: &str, dir: &str, job_id: &str) -> Result<JobState> {
+    let value = super::ssh::service::request(
+        &SshTarget::alias(host).for_run(run_id),
+        serde_json::json!({"op":"slurm", "run":run_id, "job":job_id, "dir":dir}),
+    )
+    .await?;
+    let token = value["token"]
+        .as_str()
+        .ok_or_else(|| anyhow!("Missing Slurm status response"))?;
+    Ok(map_inspect_token(token.trim()))
 }
 
 /// Pure token → stage mapping (unit-tested; Slurm state names are stable).
@@ -397,12 +395,9 @@ fn map_inspect_token(out: &str) -> JobState {
         "RUNNING" | "COMPLETING" | "SUSPENDED" | "STAGE_OUT" | "SIGNALING" => {
             state("RUNNING", None)
         }
-        // Terminal per the scheduler but no exit_code file yet (NFS lag):
-        // job.sbatch exits with the payload's code, so sacct's verdict mirrors
-        // the payload — trust it. From squeue it's transient; keep polling.
-        "COMPLETED" if source == "sacct" => state("COMPLETED", None),
-        "COMPLETED" => state("RUNNING", None),
-        // Also transient from squeue: default JobRequeue=1 (and
+        // The batch script exits with the payload code, so either scheduler verdict is authoritative.
+        "COMPLETED" => state("COMPLETED", None),
+        // Transient from squeue: default JobRequeue=1 (and
         // PreemptMode=REQUEUE) re-queues these under the same job id — a poll
         // landing in the window must not finalize a run that's about to
         // re-run. If the job is NOT requeued it leaves the queue and the
@@ -422,10 +417,10 @@ fn map_inspect_token(out: &str) -> JobState {
 }
 
 /// Cancellation succeeds when accepted or the controller confirms the job is absent.
-pub async fn cancel_job(host: &str, job_id: &str) -> Result<()> {
+pub async fn cancel_job(host: &str, run_id: &str, job_id: &str) -> Result<()> {
     let queue = queue_probe(job_id);
-    ssh_run(
-        &SshTarget::alias(host),
+    super::ssh::ssh_control(
+        &SshTarget::alias(host).for_run(run_id),
         &format!(
             "if error=$(scancel {} 2>&1); then exit 0; \
              elif [ \"$({queue})\" = GONE ]; then exit 0; \
@@ -670,7 +665,7 @@ mod tests {
             let host = host.clone();
             async move {
                 for _ in 0..150 {
-                    let s = inspect_job(&host, &run_dir(None, &run_id), &job_id)
+                    let s = inspect_job(&host, &run_id, &run_dir(None, &run_id), &job_id)
                         .await
                         .unwrap();
                     if until.contains(&s.stage.as_str()) {
@@ -715,7 +710,7 @@ mod tests {
         // Cancel path: scancel'd job leaves the queue without an exit code.
         let job_b = run_job(&mk(&run_b, "sleep 300")).await.unwrap();
         poll(run_b.clone(), job_b.clone(), &["RUNNING", "SCHEDULING"]).await;
-        cancel_job(&host, &job_b).await.unwrap();
+        cancel_job(&host, &run_b, &job_b).await.unwrap();
         let after = poll(run_b, job_b, &["CANCELED", "GONE", "ERROR"]).await;
         // Best-effort teardown before asserting — don't litter the cluster.
         let _ = ssh_run(&SshTarget::alias(&host), &cleanup, None).await;
@@ -744,9 +739,8 @@ mod tests {
         assert_eq!(map_inspect_token("SQ PENDING").stage, "SCHEDULING");
         assert_eq!(map_inspect_token("SQ RUNNING").stage, "RUNNING");
         assert_eq!(map_inspect_token("SQ COMPLETING").stage, "RUNNING");
-        // squeue COMPLETED without exit_code: transient, keep polling.
-        assert_eq!(map_inspect_token("SQ COMPLETED").stage, "RUNNING");
-        // sacct COMPLETED means the script (= payload) exited 0.
+        // Both scheduler sources confirm the script (= payload) exited successfully.
+        assert_eq!(map_inspect_token("SQ COMPLETED").stage, "COMPLETED");
         assert_eq!(map_inspect_token("SA COMPLETED").stage, "COMPLETED");
         assert_eq!(map_inspect_token("SA CANCELLED by 1234").stage, "CANCELED");
         // Fixed-width sacct truncates with a trailing '+'; -P avoids it, but

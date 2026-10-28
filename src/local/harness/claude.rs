@@ -751,25 +751,49 @@ impl Harness for ClaudeCode {
         true
     }
 
-    /// Claude compacts in place through its own `/compact`, keeping the session
-    /// id. Without a live child there is nothing to compact against, so the
-    /// shared fallback runs instead.
+    fn supports_compaction(&self) -> bool {
+        true
+    }
+
     async fn compact(&self, ctx: &CompactCtx) -> Result<CompactOutcome> {
-        if ctx
-            .host
+        let Some(native_id) = ctx.native_session_id.clone() else {
+            return Ok(CompactOutcome::Fallback);
+        };
+        let lookup_id = native_id.clone();
+        let native_session =
+            tokio::task::spawn_blocking(move || native_store::claude_session(&lookup_id))
+                .await
+                .map_err(|error| anyhow!("Claude session lookup failed: {error}"))??
+                .ok_or_else(|| {
+                    anyhow!("Claude Code's saved conversation is unavailable for compaction")
+                })?;
+        let project = ctx.project.clone();
+        let session_id = ctx.session_id.clone();
+        let skills_dir = self.session_skills_dir();
+        let (repo, playbook) =
+            tokio::task::spawn_blocking(move || ensure_playbook(&project, &session_id, skills_dir))
+                .await
+                .map_err(|error| anyhow!("playbook task failed: {error}"))??;
+        let spec = SpawnSpec {
+            chat: ctx.host.clone(),
+            session_id: ctx.session_id.clone(),
+            repo,
+            playbook,
+            resume: Some(native_id),
+            config: SpawnConfig {
+                permission_mode: ctx.permission_mode,
+                effort: claude_effort(ctx.reasoning_level.as_deref()).map(str::to_string),
+                model: ctx.model.clone(),
+                native_store: native_session.store,
+                bridge_active: uses_permission_bridge(ctx.permission_mode)
+                    && ctx.host.up_port().is_some(),
+            },
+        };
+        ctx.host
             .claude
-            .compact_session(&ctx.session_id, CLAUDE_COMPACT_TIMEOUT)
-            .await?
-        {
-            return Ok(CompactOutcome::Native);
-        }
-        if ctx.native_session_id.is_some() {
-            // The session is still resumable; summarizing would throw it away.
-            return Err(anyhow!(
-                "Claude Code is not running for this chat — send a message first, then compact"
-            ));
-        }
-        Ok(CompactOutcome::Fallback)
+            .compact_session(spec, CLAUDE_COMPACT_TIMEOUT)
+            .await?;
+        Ok(CompactOutcome::Native)
     }
 
     /// The resident child holds stdin open, so a second stream-json user
@@ -960,13 +984,10 @@ impl Harness for ClaudeCode {
         Some(native_store::claude_home(NativeStore::Legacy))
     }
 
-    fn skill_target(&self) -> Option<PathBuf> {
-        Some(
-            self.config_home()?
-                .join("skills")
-                .join("orx")
-                .join("SKILL.md"),
-        )
+    fn native_skill_roots(&self) -> Vec<PathBuf> {
+        self.config_home()
+            .map(|home| vec![home.join("skills")])
+            .unwrap_or_default()
     }
 
     fn skill_shim(&self) -> Option<&'static str> {
@@ -1349,7 +1370,7 @@ fn replays_user_message(event: &Value, text: &str) -> bool {
 /// including a stale `result` that would end the turn instantly. The echo
 /// itself is consumed (returns `false`); everything after it belongs to the
 /// turn.
-fn belongs_to_current_turn(event: &Value, text: &str, saw_user_echo: &mut bool) -> bool {
+pub(crate) fn belongs_to_current_turn(event: &Value, text: &str, saw_user_echo: &mut bool) -> bool {
     if *saw_user_echo {
         return true;
     }
@@ -2238,7 +2259,7 @@ async fn run_attempt(ctx: &mut TurnCtx, spec: SpawnSpec) -> Result<(TurnState, u
                 // A failed write means the child is gone and this turn is about
                 // to error out — park the text so it survives into the next one.
                 match client.send_user_message(&steer.text).await {
-                    Ok(()) => ctx.record_steer(&steer.display),
+                    Ok(()) => ctx.record_steer(&steer, true),
                     Err(_) => {
                         if let Err(error) = ctx.host.park_steer(&ctx.session_id, steer) {
                             ctx.push_error(format!("Could not preserve steering message: {error}"));
@@ -2604,7 +2625,7 @@ mod tests {
             "models": [
                 {
                     "value": "default",
-                    "resolvedModel": "claude-opus-4-8[1m]",
+                    "resolvedModel": "claude-fable-5",
                     "displayName": "Default (recommended)",
                     "supportsEffort": true,
                     "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],

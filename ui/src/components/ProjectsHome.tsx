@@ -20,7 +20,7 @@ export function ProjectsEmptyState({
   return (
     <div className="home flex flex-1 min-h-0 flex-col items-center justify-center gap-3 bg-background p-6 text-center">
       <FolderOpen size={36} strokeWidth={1.5} className="shrink-0 text-muted" />
-      <p className="m-0 w-full max-w-105 text-lg leading-[1.55] text-subtext">
+      <p className="m-0 w-full max-w-105 text-lg leading-normal text-subtext">
         {m.projects_home_no_projects_yet_create_one_to_get_started()}
       </p>
       <Button variant="primary" className="mt-1" onClick={() => setDialogOpen(true)}>
@@ -46,11 +46,13 @@ export function NewProjectDialog({
   onCreated,
   remote = false,
   preferredAgent,
+  initialPaperId,
 }: {
   onClose: () => void;
   onCreated: (project: Project, githubPublicationError: string | null) => void;
   remote?: boolean;
   preferredAgent: AgentSelection | null;
+  initialPaperId?: string;
 }) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
@@ -74,10 +76,9 @@ export function NewProjectDialog({
         return;
       }
       if (
-        event.key === "Enter" &&
         (event.metaKey || event.ctrlKey) &&
         !event.altKey &&
-        event.shiftKey
+        ((event.key.toLowerCase() === "n" && !event.shiftKey) || (event.key === "Enter" && event.shiftKey))
       ) {
         event.preventDefault();
         event.stopPropagation();
@@ -124,7 +125,13 @@ export function NewProjectDialog({
         tabIndex={-1}
       >
         <h2 id="new-project-dialog-title">{m.projects_home_new_project()}</h2>
-        <NewProjectForm onCancel={onClose} onCreated={onCreated} remote={remote} preferredAgent={preferredAgent} />
+        <NewProjectForm
+          onCancel={onClose}
+          onCreated={onCreated}
+          remote={remote}
+          preferredAgent={preferredAgent}
+          initialPaperId={initialPaperId}
+        />
       </div>
     </div>
   );
