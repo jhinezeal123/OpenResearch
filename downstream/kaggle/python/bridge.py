@@ -162,11 +162,16 @@ def dispatch(request):
         from account_runtime import account_readiness
         # Prefer a compatible idle notebook before probing provider account admission.
         row=pool.acquire(request,[],reclaim=False)
+        blocked=pool.blocked(request['accelerator']) if row is None else {}
+        if row is None and blocked and all(a in blocked for a in request['runtime']['accounts']):
+            # Waiting cannot help before the weekly reset; fail with Kaggle's reason.
+            pool.cancel_wait(request['runId'])
+            return {'stopped':True,'error':'Every enabled Kaggle account is out of quota for '+request['accelerator']+'. '+next(iter(blocked.values()))}
         if row is None:
             for existing in pool.reconcile(): ensure_worker(session,pool,existing,request)
             free={}
             for account in request['runtime']['accounts']:
-                if not pool.has_room(account,request['accelerator']): continue
+                if account in blocked or not pool.has_room(account,request['accelerator']): continue
                 try: external=foreign_sessions(account_readiness(account),account,pool.live())
                 except Exception: continue
                 if external is not None and pool.has_room(account,request['accelerator'],external): free[account]=external
@@ -185,7 +190,15 @@ def dispatch(request):
         return {'released':True}
     if row is None: raise ValueError('Run has no session assignment')
     if row['state']=='stopped': return {'stopped':True,'sessionId':row['id'],'error':row.get('note')}
+    if row['state']=='closing':
+        # Only the shared scheduler finishes a closing session. Keep it running
+        # while any Run still waits on one, even after a scheduler crash.
+        ensure_worker(session,pool,row,request)
     if row['state']=='closing' and action in ('acquire','launch'): return {'pending':True,'closing':True,'sessionId':row['id'],'error':row.get('note')}
+    if row['state']=='closing' and action=='cancel':
+        # Shutting down the notebook ends the Run; its worker no longer relays
+        # requests. The account stays reserved until the provider stop receipt.
+        return {'stopped':True,'closing':True,'sessionId':row['id'],'error':row.get('note')}
     ensure_worker(session,pool,row,request)
     folder=pool.worker_dir(row['id'])
     if action=='acquire':

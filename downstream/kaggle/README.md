@@ -101,6 +101,10 @@ spawning another interpreter on every poll.
 | Remote confirms `NOT_STARTED` and no acquisition/upload activity for 2 minutes | Close the abandoned lease. Large ongoing uploads refresh this grace, never the notebook TTL. |
 | Worker heartbeat absent for 180 seconds | Verify PID **and creation time**, terminate that owner, and recover the same session. A running remote experiment is inspected, never replayed. |
 | Provider reports the notebook already stopped | Persist the receipt, free the account, and exit the worker. |
+| Kaggle answers the push with an error | Free the account without an SSH STOP: no notebook was created. Fail the Run with that error. |
+| Push response was lost, Kaggle has no such notebook, and two verified account session lists at least 2 minutes apart omit it, while provisioning or closing | Close the session and requeue its Run: nothing ran, so nothing is replayed. A Run is requeued at most 3 times, then fails. Bootstrap errors are logged to `worker.log`. |
+| Kaggle's push error is a GPU/TPU quota refusal | Exclude the account from new pushes of that quota for 6 hours (its warm notebooks stay reusable) and requeue the Run for another account. If every enabled account is excluded, fail the Run with the quota error. |
+| Stop Run while its session is closing | Mark the Run stopped without contacting the departed worker; the account stays reserved until the stop receipt. |
 | Stop outcome or remote state is unknown | Keep the account reserved; the shared scheduler retries shutdown with backoff up to 5 minutes. A lost connection alone never releases a lease. |
 | Push response was lost, Kaggle has no such notebook, and two verified account session lists at least 2 minutes apart omit it | Free the account without an SSH STOP. Absence counts only after the lost push could have landed; an unidentified session never proves absence. |
 | Push response was lost, Kaggle has no such notebook, and deadline plus lifetime has passed | Free the account: the notebook was never created. Fallback when session lists stay unverifiable. |

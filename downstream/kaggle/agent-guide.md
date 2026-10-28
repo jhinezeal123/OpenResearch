@@ -10,8 +10,11 @@ orx logs <run-id>
 
 Accelerators: `cpu`, `NvidiaTeslaT4`, `TpuV5E8`, `TpuV6E8`.
 The configured account pool selects an available account automatically.
-Parallel Runs lease distinct notebooks/accounts; overflow waits. Do not pin a
-project to an account or submit notebooks yourself.
+Each Run leases its own notebook. An account holds up to two T4 notebooks, or
+one CPU or TPU notebook, so the pool can run more Runs than it has accounts.
+Launch every Run you intend to run now: Runs beyond free capacity wait in a
+durable queue and start as notebooks free up. Do not hold Runs back to match
+the account count, pin a project to an account, or submit notebooks yourself.
 
 Experiments and notebook Sessions have different lifetimes. A failed Run does
 not close its notebook: fix code in the experiment worktree, commit it, and

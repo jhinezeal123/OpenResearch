@@ -95,6 +95,23 @@ class SchedulerTests(unittest.TestCase):
             self.assertTrue(shutdown.call_args.args[-1])
         self.assertEqual(self.pool.get(row['id'])['state'],'stopped')
 
+    def test_cleanup_frees_a_quota_rejected_closing_session_and_its_run(self):
+        import json, uuid
+        run=str(uuid.uuid4())
+        row=self.pool.acquire({'runId':run,'projectId':'p','accelerator':'NvidiaTeslaT4',
+                               'ttlSeconds':3600,'runtime':{'accounts':['a']}},['a'])
+        self.pool.close(row['id'],'Notebook provisioning exceeded 10 minutes')
+        response=self.pool.home/'sessions'/row['id']/'push-response.json'
+        response.parent.mkdir(parents=True)
+        response.write_text(json.dumps({'error':'Maximum weekly GPU quota of 30.00 hours reached.'}))
+        with patch('bridge.configure'), patch('bridge.control',side_effect=AssertionError('no provider call')):
+            scheduler.cleanup(self.pool,self.pool.get(row['id']))
+        current=self.pool.get(row['id'])
+        self.assertEqual(current['state'],'stopped')
+        self.assertIn('Maximum weekly GPU quota',current['note'])
+        self.assertIsNone(self.pool.assigned(run))
+        self.assertIn('a',self.pool.blocked('NvidiaTeslaT4'))
+
     def test_cleanup_waits_for_existing_worker_to_release_lifetime_lock(self):
         import uuid
         row=self.pool.acquire({'runId':str(uuid.uuid4()),'projectId':'p','accelerator':'cpu',

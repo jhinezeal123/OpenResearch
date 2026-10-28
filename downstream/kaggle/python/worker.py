@@ -68,6 +68,50 @@ class Channel:
         with self.lock:
             self._disconnect()
 
+def rejected(root,sid):
+    """Kaggle's error answer to the push, e.g. an exhausted GPU quota.
+
+    The push was answered, so no notebook exists and nothing needs stopping.
+    """
+    response=load(Path(root)/sid/'push-response.json')
+    error=response.get('error')
+    return str(error) if error and not response.get('url') else None
+
+def lost_push(session,sid,row,root):
+    """Whether Kaggle proves that a push whose response was lost never landed.
+
+    As for shutdown, the status endpoint must not know the notebook (403/404)
+    and verified session lists minutes apart must omit it.
+    """
+    folder=Path(root)/sid
+    if not (folder/'submit-intent.json').exists() or (folder/'push-response.json').exists(): return False
+    if load(folder/'absent.json').get('confirmed'): return True
+    from bridge import control
+    try:
+        control(session,'status',sid,row['account'],Path(root))
+        return False
+    except Exception as error:
+        if getattr(getattr(error,'response',None),'status_code',None) not in (403,404): return False
+    return not_running(sid,row['account'],root,row) is True
+
+def settle_unsubmitted(session,pool,sid,root,row):
+    """Close a session Kaggle proves has no notebook; True when proven.
+
+    Nothing ran, so its Run may be admitted again without replaying anything:
+    on another account after a quota refusal, or anywhere after a lost push.
+    Other refusals would repeat anywhere and fail the Run.
+    """
+    error=rejected(root,sid)
+    if error:
+        note='Kaggle rejected the notebook: '+error
+        if 'quota' in error.lower(): pool.never_created(sid,note,quota=True)
+        else: pool.close(sid,note)
+    elif lost_push(session,sid,row,root):
+        pool.never_created(sid,'Kaggle never created the notebook; its push response was lost')
+    else:
+        return False
+    return True
+
 def observe_sessions(account):
     from account_runtime import account_readiness
     return account_readiness(account)
@@ -97,10 +141,16 @@ def not_running(sid,account,root,row):
     if first is None:
         save(folder/'absent.json',{'at':time.time()})
         return False
-    return time.time()-first>=ABSENCE_CONFIRM_SECONDS
+    if time.time()-first<ABSENCE_CONFIRM_SECONDS: return False
+    # Remembered so shutdown after a requeue needs no further provider calls.
+    save(folder/'absent.json',{'at':first,'confirmed':True})
+    return True
 
 def shutdown(session,sid,account,root,requested,row=None):
     from bridge import control
+    if rejected(root,sid) or load(Path(root)/sid/'absent.json').get('confirmed'):
+        print('Shutdown confirmed: Kaggle never created the notebook',file=sys.stderr,flush=True)
+        return True,requested
     missing,absent=False,None
     # Read provider state even when SSH has already disappeared after STOP.
     for action in (('status',) if requested else ('status','stop')):
@@ -188,6 +238,9 @@ def serve(config):
         from proxy_control import ensure_proxy, stop_proxies
         proxy=None
         failures=0
+        last_probe=0
+        reported=None
+        sessions=Path(config['home'])/'sessions'
         try:
             while not stopping.is_set() and pool.get(sid)['state'] not in ('closing','stopped') and time.time()<row['deadline']:
                 try:
@@ -207,6 +260,17 @@ def serve(config):
                             if state['channel'] is not channel: channel.close()
                         state['error']=None
                         return
+                    outcome=(r.get('submission_status'),r.get('ssh_status'),r.get('error_type'))
+                    if outcome!=reported and r.get('error_type'):
+                        print('Provision: submission %s, SSH %s, %s'%outcome,file=sys.stderr,flush=True)
+                    reported=outcome
+                    # Bootstrap reports a rejected or lost push as an UNKNOWN
+                    # submission and would wait for SSH from a notebook that
+                    # never existed. Provider probes are rate limited.
+                    if rejected(sessions,sid) or time.monotonic()-last_probe>=30:
+                        last_probe=time.monotonic()
+                        if settle_unsubmitted(session,pool,sid,sessions,row):
+                            state['error']=pool.get(sid)['note'];state['fatal']=True;return
                     if r.get('submission_status')=='NOT_SUBMITTED':
                         give_up('Kaggle notebook was not submitted ('+str(r.get('error_type') or 'no detail')+')');return
                     failures=0
@@ -257,6 +321,7 @@ def serve(config):
                 except OSError:
                     pass
                 if time.monotonic()<next_stop: continue
+                settle_unsubmitted(session,pool,sid,Path(config['home'])/'sessions',row)
                 # Keep ownership until the provider confirms stop, including offline periods.
                 stopped,stop_requested=shutdown(session,sid,row['account'],Path(config['home'])/'sessions',stop_requested,row=row)
                 if stopped: pool.stopped(sid);break

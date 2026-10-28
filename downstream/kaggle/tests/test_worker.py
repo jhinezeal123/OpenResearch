@@ -99,6 +99,53 @@ class WorkerShutdownTests(unittest.TestCase):
             (Path(root)/'sid').mkdir();(Path(root)/'sid'/'submit-intent.json').write_text('{}')
             self.assertEqual(worker.shutdown(None,'sid','account',Path(root),False,row=row),(False,False))
             observe.assert_not_called()
+    def test_rejected_push_is_stopped_without_provider_calls_or_ssh(self):
+        now=time.time()
+        row={'created':now-1000,'deadline':now+6200}
+        with tempfile.TemporaryDirectory() as root, patch('bridge.control') as control:
+            (Path(root)/'sid').mkdir()
+            (Path(root)/'sid'/'push-response.json').write_text(json.dumps({'error':'Maximum weekly GPU quota of 30.00 hours reached.'}))
+            self.assertEqual(worker.shutdown(None,'sid','account',Path(root),False,row=row),(True,False))
+            control.assert_not_called()
+            # A push answered with a notebook URL is a real notebook, even with an error field.
+            (Path(root)/'sid'/'push-response.json').write_text(json.dumps({'error':'warning','url':'https://www.kaggle.com/code/o/n'}))
+            self.assertIsNone(worker.rejected(root,'sid'))
+            (Path(root)/'sid'/'push-response.json').write_text('{}')
+            self.assertIsNone(worker.rejected(root,'sid'))
+    def test_lost_push_counts_as_never_created_only_when_kaggle_proves_it(self):
+        forbidden=Exception('403');forbidden.response=SimpleNamespace(status_code=403)
+        row={'account':'account','created':time.time()-1000}
+        with tempfile.TemporaryDirectory() as root:
+            folder=Path(root)/'sid'
+            # No push attempted yet.
+            with patch('bridge.control') as control:
+                self.assertFalse(worker.lost_push(None,'sid',row,root))
+                control.assert_not_called()
+            folder.mkdir();(folder/'submit-intent.json').write_text('{}')
+            with patch('bridge.control',return_value={'stopped':False}), patch.object(worker,'not_running',return_value=True):
+                self.assertFalse(worker.lost_push(None,'sid',row,root))  # Kaggle knows the notebook.
+            with patch('bridge.control',side_effect=ConnectionError('offline')), patch.object(worker,'not_running',return_value=True):
+                self.assertFalse(worker.lost_push(None,'sid',row,root))
+            with patch('bridge.control',side_effect=forbidden), patch.object(worker,'not_running',return_value=False):
+                self.assertFalse(worker.lost_push(None,'sid',row,root))  # One absence is not proof.
+            with patch('bridge.control',side_effect=forbidden), patch.object(worker,'not_running',return_value=True):
+                self.assertTrue(worker.lost_push(None,'sid',row,root))
+            (folder/'push-response.json').write_text(json.dumps({'url':'https://www.kaggle.com/code/o/n'}))
+            with patch('bridge.control') as control:
+                self.assertFalse(worker.lost_push(None,'sid',row,root))
+                control.assert_not_called()
+    def test_confirmed_absence_is_remembered_for_shutdown(self):
+        now=time.time()
+        row={'created':now-1000,'deadline':now+6200}
+        with tempfile.TemporaryDirectory() as root, \
+                patch.object(worker,'observe_sessions',return_value={'readiness':'verified_idle','active_session_count':0,'active_sessions':[]}):
+            (Path(root)/'sid').mkdir();(Path(root)/'sid'/'submit-intent.json').write_text('{}')
+            os.utime(Path(root)/'sid'/'submit-intent.json',(now-1000,now-1000))
+            processes.save(Path(root)/'sid'/'absent.json',{'at':now-worker.ABSENCE_CONFIRM_SECONDS-1})
+            self.assertTrue(worker.not_running('sid','account',root,row))
+            with patch('bridge.control') as control:
+                self.assertEqual(worker.shutdown(None,'sid','account',Path(root),False,row=row),(True,False))
+                control.assert_not_called()
     def test_never_submitted_request_can_be_closed(self):
         with patch('bridge.control',side_effect=[FileNotFoundError(),{'stopped':True}]):
             self.assertEqual(worker.shutdown(None,'session','account',Path('.'),False),(True,True))
@@ -184,6 +231,33 @@ class WorkerLifecycleTests(unittest.TestCase):
             self.begin();self.future.result(timeout=5)
         self.start.assert_not_called();self.proxy.assert_not_called()
         self.assertEqual(self.pool.get(self.row['id'])['state'],'closing')
+
+    def test_rejected_push_fails_fast_instead_of_waiting_for_ssh(self):
+        rejection=Path(self.config['home'])/'sessions'/self.row['id']/'push-response.json'
+        rejection.parent.mkdir(parents=True)
+        rejection.write_text(json.dumps({'error':'Maximum weekly GPU quota of 30.00 hours reached.'}))
+        self.start.return_value={'submission_status':'UNKNOWN','ssh_status':'NOT_CHECKED','error_type':'RuntimeError'}
+        with patch.object(bridge,'control',side_effect=AssertionError('no provider stop needed')):
+            self.begin();self.future.result(timeout=5)
+        self.start.assert_called_once()
+        current=self.pool.get(self.row['id'])
+        self.assertEqual(current['state'],'stopped')
+        self.assertIn('Maximum weekly GPU quota',current['note'])
+
+    def test_lost_push_requeues_the_run_instead_of_waiting_for_ssh(self):
+        folder=Path(self.config['home'])/'sessions'/self.row['id']
+        folder.mkdir(parents=True);(folder/'submit-intent.json').write_text('{}')
+        self.start.return_value={'submission_status':'UNKNOWN','ssh_status':'NOT_CHECKED','error_type':'ReadTimeout'}
+        def proven(*args):
+            processes.save(folder/'absent.json',{'at':0,'confirmed':True});return True
+        forbidden=Exception('403');forbidden.response=SimpleNamespace(status_code=403)
+        with patch.object(bridge,'control',side_effect=forbidden), patch.object(worker,'not_running',side_effect=proven):
+            self.begin();self.future.result(timeout=5)
+        self.start.assert_called_once()
+        current=self.pool.get(self.row['id'])
+        self.assertEqual((current['state'],current['active_run']),('stopped',None))
+        self.assertIn('push response was lost',current['note'])
+        self.assertIsNone(self.pool.assigned(self.request['runId']))
 
     def test_external_stop_receipt_ends_the_owner_and_closes_its_channel(self):
         self.begin()

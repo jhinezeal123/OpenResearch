@@ -70,7 +70,7 @@ def sweep(pool):
 
 def cleanup(pool, row):
     from bridge import configure, contact
-    from worker import shutdown
+    from worker import settle_unsubmitted, shutdown
     folder = pool.worker_dir(row['id'])
     def wait_for_owner():
         save(folder/'cleanup.json', {**load(folder/'cleanup.json'), 'retry_at':time.time()+SWEEP_SECONDS})
@@ -96,6 +96,8 @@ def cleanup(pool, row):
         requested = load(folder/'stop-requested.json').get('requested') is True
         try:
             session = configure({'home':str(pool.home), 'stateRoot':str(pool.home/'sessions')})
+            # Sessions closed before Kaggle proved them absent still free their Run.
+            settle_unsubmitted(session, pool, row['id'], pool.home/'sessions', row)
             stopped, requested = shutdown(session, row['id'], row['account'], pool.home/'sessions', requested, row=row)
             if requested:
                 save(folder/'stop-requested.json', {'requested': True})

@@ -16,6 +16,19 @@ LAUNCH_SECONDS = 2 * 60
 GPU_ACCELERATORS = frozenset({'NvidiaTeslaT4'})
 GPU_SESSIONS_PER_ACCOUNT = 2
 
+# Kaggle quotas are weekly; recheck an exhausted account after this long.
+# A rejected push creates no notebook, so a retry costs one request.
+QUOTA_BLOCK_SECONDS = 6 * 60 * 60
+# A Run whose notebook Kaggle never created is admitted again at most this
+# often, so a lasting network fault fails it instead of looping.
+MAX_REQUEUES = 3
+
+def quota_class(accelerator):
+    """Accelerators sharing one Kaggle quota; CPU has none."""
+    if accelerator in GPU_ACCELERATORS: return 'gpu'
+    if str(accelerator).startswith('Tpu'): return 'tpu'
+    return None
+
 def capacity(accelerator, live):
     """Notebook slots for a new session beside an account's live accelerators."""
     if accelerator in GPU_ACCELERATORS and all(a in GPU_ACCELERATORS for a in live):
@@ -38,6 +51,10 @@ class Pool:
             CREATE TABLE IF NOT EXISTS pending_runs(
               id TEXT PRIMARY KEY, accounts TEXT NOT NULL, created REAL NOT NULL,
               last_seen REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS quota_blocks(
+              account TEXT NOT NULL, quota TEXT NOT NULL, until REAL NOT NULL,
+              reason TEXT, PRIMARY KEY(account, quota));
+            CREATE TABLE IF NOT EXISTS run_requeues(id TEXT PRIMARY KEY, count INTEGER NOT NULL);
             """)
             db.execute('BEGIN IMMEDIATE')
             columns = {r['name'] for r in db.execute('PRAGMA table_info(sessions)')}
@@ -104,14 +121,16 @@ class Pool:
                 def room(a):
                     live=self._live_accelerators(db, a)
                     return len(live)+external.get(a,0) < capacity(request.get('accelerator'), live)
-                account=next((a for a in eligible if a in available and room(a)),None)
+                # Existing notebooks stay reusable; only new pushes need quota.
+                blocked=self._blocked(db, request.get('accelerator'), now)
+                account=next((a for a in eligible if a in available and a not in blocked and room(a)),None)
                 if not account:
                     # Reclaim only one idle notebook under pressure. A closing
                     # notebook still reserves its account until a stop receipt.
                     closing={r[0] for r in db.execute("SELECT account FROM sessions WHERE state='closing'")}
                     if reclaim and not closing.intersection(eligible):
                         idle=db.execute("SELECT * FROM sessions WHERE state='idle' ORDER BY idle_since,created").fetchall()
-                        victim=next((r for r in idle if r['account'] in eligible),None)
+                        victim=next((r for r in idle if r['account'] in eligible and r['account'] not in blocked),None)
                         if victim:
                             db.execute("UPDATE sessions SET state='closing',note=? WHERE id=?",('Idle notebook reclaimed for a waiting Run',victim['id']))
                     return None
@@ -121,6 +140,40 @@ class Pool:
             db.execute('INSERT INTO runs VALUES(?,?)',(run_id,sid))
             db.execute('DELETE FROM pending_runs WHERE id=?',(run_id,))
             return dict(db.execute('SELECT * FROM sessions WHERE id=?',(sid,)).fetchone())
+    @staticmethod
+    def _blocked(db, accelerator, now):
+        quota=quota_class(accelerator)
+        if quota is None: return {}
+        return {r['account']:r['reason'] for r in
+                db.execute('SELECT account,reason FROM quota_blocks WHERE quota=? AND until>?',(quota,now))}
+    def blocked(self, accelerator):
+        """Accounts whose quota for this accelerator was recently exhausted."""
+        with self.db() as db: return self._blocked(db, accelerator, time.time())
+    def never_created(self, sid, reason, quota=False):
+        """Kaggle proved this session has no notebook, so nothing ran. Its Run
+        may be admitted again, a bounded number of times. A quota refusal also
+        keeps the account out of new pushes for that quota."""
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row=db.execute('SELECT * FROM sessions WHERE id=?',(sid,)).fetchone()
+            if not row or row['state']=='stopped': return
+            requeue=row['active_run'] is not None
+            if quota:
+                kind=quota_class(json.loads(row['spec']).get('accelerator'))
+                if kind:
+                    db.execute('''INSERT INTO quota_blocks VALUES(?,?,?,?) ON CONFLICT(account,quota)
+                                  DO UPDATE SET until=excluded.until,reason=excluded.reason''',
+                               (row['account'],kind,time.time()+QUOTA_BLOCK_SECONDS,reason))
+                # Without a block the same account would refuse it again.
+                requeue=requeue and kind is not None
+            if requeue:
+                run=row['active_run']
+                db.execute('INSERT INTO run_requeues VALUES(?,1) ON CONFLICT(id) DO UPDATE SET count=count+1',(run,))
+                requeue=db.execute('SELECT count FROM run_requeues WHERE id=?',(run,)).fetchone()[0]<=MAX_REQUEUES
+            if requeue:
+                db.execute('DELETE FROM runs WHERE id=? AND session_id=?',(row['active_run'],sid))
+            db.execute("UPDATE sessions SET state='closing',active_run=CASE WHEN ? THEN NULL ELSE active_run END,note=? WHERE id=?",
+                       (requeue,reason,sid))
     def list(self):
         with self.db() as db: return [dict(r) for r in db.execute('SELECT * FROM sessions ORDER BY created DESC LIMIT 100')]
     def live(self):

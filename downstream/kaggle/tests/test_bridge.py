@@ -157,6 +157,33 @@ class BridgeLeaseTests(unittest.TestCase):
         self.assertTrue(bridge.dispatch({**self.request,'action':'cancel'})['pending'])
         self.assertEqual(self.pool.get(self.row['id'])['state'], 'busy')
 
+    def test_stop_on_a_closing_session_ends_the_run_without_contacting_its_worker(self):
+        self.reserve()
+        self.pool.close(self.row['id'], 'Kaggle rejected the notebook: quota')
+        result = bridge.dispatch({**self.request,'action':'cancel'})
+        self.assertTrue(result['stopped'])
+        self.assertIn('quota', result['error'])
+        self.contact.assert_not_called()
+        # Waiting Runs keep the cleanup scheduler alive.
+        self.assertTrue(bridge.ensure_worker.called)
+        bridge.ensure_worker.reset_mock()
+        self.assertTrue(bridge.dispatch({**self.request,'action':'acquire'})['pending'])
+        self.assertTrue(bridge.ensure_worker.called)
+        # The account remains reserved until the provider stop receipt.
+        self.assertEqual(self.pool.get(self.row['id'])['state'], 'closing')
+
+    def test_run_fails_once_every_enabled_account_is_out_of_quota(self):
+        gpu = {**self.request, 'accelerator':'NvidiaTeslaT4'}
+        self.pool.acquire(gpu, ['account-a'])
+        self.pool.never_created(self.pool.assigned(gpu['runId'])['id'], 'Kaggle rejected the notebook: Maximum weekly GPU quota reached.', quota=True)
+        with patch.dict(sys.modules, {'account_runtime':SimpleNamespace(account_readiness=Mock(side_effect=AssertionError('blocked account probed')))}):
+            result = bridge.dispatch({**gpu, 'action':'acquire'})
+        self.assertTrue(result['stopped'])
+        self.assertIn('Maximum weekly GPU quota', result['error'])
+        self.assertIsNone(self.pool.assigned(gpu['runId']))
+        with self.pool.db() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM pending_runs').fetchone()[0], 0)
+
     def test_queued_stop_does_not_allocate_a_notebook_or_contact_a_worker(self):
         result = bridge.dispatch({**self.request,'action':'cancel'})
         self.assertEqual((result['stage'], result['exitCode']), ('ERROR', 143))

@@ -58,6 +58,50 @@ class PoolTests(unittest.TestCase):
         closed=self.pool.get(row['id'])
         self.assertEqual(closed['state'],'closing')
         self.assertEqual(closed['note'],'Kaggle bootstrap failed 5 times in a row: OSError')
+    def test_quota_rejection_moves_the_run_to_another_account(self):
+        gpu={**request(),'accelerator':'NvidiaTeslaT4'}
+        first=self.pool.acquire(gpu,['a'])
+        self.assertEqual(first['account'],'a')
+        self.pool.close(first['id'],'Notebook provisioning exceeded 10 minutes')
+        # Seen only after the session began closing: the Run is still freed.
+        self.pool.never_created(first['id'],'Kaggle rejected the notebook: quota',quota=True)
+        closed=self.pool.get(first['id'])
+        self.assertEqual((closed['state'],closed['active_run']),('closing',None))
+        self.assertIn('quota',closed['note'])
+        self.assertIsNone(self.pool.assigned(gpu['runId']))
+        self.assertEqual(set(self.pool.blocked('NvidiaTeslaT4')),{'a'})
+        self.assertEqual(self.pool.blocked('cpu'),{})
+        # Even once a's slot frees, a new GPU push goes elsewhere.
+        self.pool.stopped(first['id'])
+        self.assertIsNone(self.pool.acquire(gpu,['a']))
+        self.assertEqual(self.pool.acquire(gpu,['a','b'])['account'],'b')
+        # CPU has its own quota.
+        self.assertEqual(self.pool.acquire(request(),['a'])['account'],'a')
+    def test_quota_block_keeps_warm_notebooks_and_expires(self):
+        gpu=lambda:{**request(),'accelerator':'NvidiaTeslaT4'}
+        first=gpu();warm=self.pool.acquire(first,['a'])
+        rejected=gpu();self.assertNotEqual(self.pool.acquire(rejected,['a'])['id'],warm['id'])
+        self.pool.never_created(self.pool.assigned(rejected['runId'])['id'],'quota',quota=True)
+        self.pool.ready(warm['id'],1);self.pool.release(warm['id'],first['runId'])
+        # A notebook that already exists needs no new quota and is never reclaimed for one.
+        self.assertEqual(self.pool.acquire(gpu(),['a'])['id'],warm['id'])
+        self.assertIsNone(self.pool.acquire({**request(),'accelerator':'NvidiaTeslaT4','projectId':'other'},['a']))
+        with self.pool.db() as db: db.execute('UPDATE quota_blocks SET until=?',(time.time()-1,))
+        self.assertEqual(self.pool.blocked('NvidiaTeslaT4'),{})
+    def test_lost_push_requeues_a_run_a_bounded_number_of_times(self):
+        import pool as pool_module
+        r=request()
+        for attempt in range(pool_module.MAX_REQUEUES):
+            row=self.pool.acquire(r,['a','b'])
+            self.pool.never_created(row['id'],'lost push')
+            self.assertIsNone(self.pool.assigned(r['runId']))
+            self.assertEqual(self.pool.get(row['id'])['state'],'closing')
+            self.pool.stopped(row['id'])
+        # A lasting fault fails the Run through its closed session instead.
+        row=self.pool.acquire(r,['a','b'])
+        self.pool.never_created(row['id'],'lost push')
+        self.assertEqual(self.pool.assigned(r['runId'])['id'],row['id'])
+        self.assertEqual(self.pool.blocked('cpu'),{})
     def test_reconnect_keeps_account_even_when_the_pool_order_changes(self):
         r=request();first=self.pool.acquire(r,['a','b'])
         r['runtime']['accounts']=['b']
