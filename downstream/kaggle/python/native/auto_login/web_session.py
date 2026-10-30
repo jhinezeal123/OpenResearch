@@ -748,7 +748,7 @@ def resolve_session_id(cookie_file, kernel_ref, version_number=0, wait_seconds=1
     """
     jar = cookie_jar(cookie_file)  # build 1 lần
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {'User-Agent': 'OpenResearch-Kaggle'}
     # Cookie file extract bởi web_session đã có XSRF-TOKEN/CSRF-TOKEN -> KHÔNG cần GET
     # nguyên trang kaggle.com (tiết kiệm 1 round-trip full-page mỗi lần resolve).
     xsrf = next((c.value for c in jar if c.name == 'XSRF-TOKEN' and c.value), None)

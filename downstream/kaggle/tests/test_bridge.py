@@ -97,6 +97,25 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(result['stopped'])
         self.assertEqual(result['session_id'],'session-id')
 
+    def test_cookie_client_identifies_itself_to_the_internal_api(self):
+        path=Path(__file__).resolve().parents[1]/'python/native/cookie_client.py'
+        sent={}
+        class Connection:
+            def __init__(self,*a,**k): pass
+            def request(self,method,url,body,headers): sent.update(headers)
+            def getresponse(self): return SimpleNamespace(read=lambda:b'{}',status=200,will_close=False)
+        with patch.dict(sys.modules,{
+            'provider_metrics':SimpleNamespace(record=Mock()),
+            'web_session':SimpleNamespace(cookie_jar=lambda f:[],cookie_rejected=lambda s,t:False),
+            'account_runtime':SimpleNamespace(_account=None),
+        }):
+            spec=importlib.util.spec_from_file_location('test_cookie_client',path)
+            client=importlib.util.module_from_spec(spec);spec.loader.exec_module(client)
+            with patch.object(client.http.client,'HTTPSConnection',Connection):
+                self.assertEqual(client._IClient('cookies.json').call('kernels.KernelsService/ListKernelSessions',{}),(200,{}))
+        # Kaggle answers a bare browser User-Agent with an empty 404.
+        self.assertEqual(sent['User-Agent'],'OpenResearch-Kaggle')
+
     def test_foreign_sessions_exclude_owned_notebooks_and_count_unidentified_ones(self):
         sid=uuid.uuid4().hex
         live=[{'id':sid,'account':'a'},{'id':uuid.uuid4().hex,'account':'b'}]
@@ -240,6 +259,17 @@ class BridgeLeaseTests(unittest.TestCase):
         self.assertIsNone(self.pool.assigned(gpu['runId']))
         with self.pool.db() as db:
             self.assertEqual(db.execute('SELECT COUNT(*) FROM pending_runs').fetchone()[0], 0)
+
+    def test_queued_run_reports_why_no_account_is_ready(self):
+        request = {**self.request, 'runtime':{'accounts':['account-a','account-b']}}
+        def readiness(account):
+            if account == 'account-a': raise RuntimeError('Cannot verify active Kaggle sessions')
+            return {'readiness':'needs_login','active_session_count':None}
+        with patch.dict(sys.modules, {'account_runtime':SimpleNamespace(account_readiness=readiness)}):
+            result = bridge.dispatch({**request, 'action':'acquire'})
+        self.assertTrue(result['queued'])
+        self.assertIn('account-a: RuntimeError: Cannot verify active Kaggle sessions', result['error'])
+        self.assertIn('account-b: needs_login', result['error'])
 
     def test_queued_stop_does_not_allocate_a_notebook_or_contact_a_worker(self):
         result = bridge.dispatch({**self.request,'action':'cancel'})

@@ -34,7 +34,8 @@ class _IClient:
     def call(self, method, body, timeout=60):
         """POST /api/i/<method>. Trả (status, parsed_json_or_str). Reconnect 1 lần khi stale."""
         data = json.dumps(body).encode()
-        headers = {'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0'}
+        # Kaggle answers /api/i/ with an empty 404 for a bare 'Mozilla/5.0' UA.
+        headers = {'Content-Type': 'application/json', 'User-Agent': 'OpenResearch-Kaggle'}
         if self._cookie_header:
             headers['Cookie'] = self._cookie_header
         if self._xsrf:

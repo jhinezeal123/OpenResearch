@@ -187,20 +187,31 @@ def dispatch(request):
             # Waiting cannot help before the weekly reset; fail with Kaggle's reason.
             pool.cancel_wait(request['runId'])
             return {'stopped':True,'error':'Every enabled Kaggle account is out of quota for '+request['accelerator']+'. '+next(iter(blocked.values()))}
+        unready={}
         if row is None:
             for existing in pool.reconcile(): ensure_worker(session,pool,existing,request)
             free={}
             for account in request['runtime']['accounts']:
                 if account in blocked or not pool.has_room(account,request['accelerator']): continue
-                try: external=foreign_sessions(account_readiness(account),account,pool.live())
-                except Exception: continue
-                if external is not None and pool.has_room(account,request['accelerator'],external): free[account]=external
+                try:
+                    observation=account_readiness(account)
+                    external=foreign_sessions(observation,account,pool.live())
+                except Exception as error:
+                    unready[account]=f'{type(error).__name__}: {error}'
+                    continue
+                if external is None: unready[account]=observation.get('readiness') or 'unverified'
+                elif pool.has_room(account,request['accelerator'],external): free[account]=external
             row=pool.acquire(request,free)
             if row is None:
                 # Reclamation may have changed idle -> closing just now. Wake
                 # maintenance even if the scheduler had no owners before this call.
                 for existing in pool.live(): ensure_worker(session,pool,existing,request)
-        if row is None: return {'queued':True,'detail':'Waiting for a compatible idle notebook or a ready account from the pool.'}
+            if free: unready={}
+        if row is None:
+            queued={'queued':True,'detail':'Waiting for a compatible idle notebook or a ready account from the pool.'}
+            # A Run waiting only on unusable accounts must say why, not wait silently.
+            if unready: queued['error']='No Kaggle account is ready. '+'; '.join(f'{a}: {e}' for a,e in unready.items())
+            return queued
     if row is None and action=='cancel':
         # A queued Run owns no notebook and must not acquire one just to cancel.
         pool.cancel_wait(request['runId'])

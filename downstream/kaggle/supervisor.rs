@@ -120,6 +120,9 @@ pub(crate) async fn run(
                 // Surface bootstrap trouble while the notebook owner keeps retrying.
                 descriptor.monitoring_error = Some(format!("Kaggle notebook not ready: {error}"));
                 store.set_backend_json(&run_id, &descriptor.to_json())?;
+            } else if descriptor.monitoring_error.take().is_some() {
+                // A recovered poll must not keep showing an earlier failure.
+                store.set_backend_json(&run_id, &descriptor.to_json())?;
             }
             tokio::time::sleep(POLL_INTERVAL).await;
             continue;
