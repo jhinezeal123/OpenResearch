@@ -24,8 +24,10 @@ pub(crate) const KIND: &str = "kaggle_job";
 /// ten-second observation budget.
 const STEP_WAIT: Duration = Duration::from_secs(7);
 const LOG_POLL: Duration = Duration::from_secs(5);
-/// An `inspect` offset past any log, for a status check that transfers no log bytes.
-const NO_LOG: u64 = 1 << 53;
+/// An `inspect` offset past any log, for a status check that transfers no log bytes. Kept
+/// well under Linux's maximum file size: notebooks predating the remote's bounds check seek
+/// to it, and a larger offset fails there with EINVAL.
+const NO_LOG: u64 = 1 << 40;
 
 #[derive(Default)]
 pub(crate) struct KaggleAccount {

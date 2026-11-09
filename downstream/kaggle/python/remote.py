@@ -20,7 +20,8 @@ def run_dir(run_id):
 def inspect(directory, offset=0):
     log = directory/'log'
     data = b''
-    if log.exists():
+    # Seeking past a filesystem's maximum file size fails, so only read inside the log.
+    if log.exists() and offset<log.stat().st_size:
         with log.open('rb') as f:
             f.seek(offset)
             data=f.read(256*1024)
