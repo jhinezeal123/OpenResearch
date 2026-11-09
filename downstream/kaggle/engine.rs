@@ -155,6 +155,10 @@ fn close_copy(run_id: &str) -> Result<()> {
         return Ok(());
     }
     let len = copied(run_id)?;
+    // A run the notebook never started wrote nothing; there is nothing to call lost.
+    if len == 0 && !run_file(run_id, ".launched")?.is_file() {
+        return mark_complete(run_id);
+    }
     append(
         run_id,
         format!(
@@ -317,6 +321,10 @@ async fn drive(run_id: &str, cancelled: bool, step: &mut Step) -> Result<Observa
         let (launch, mut request) = local(run_id, true)?;
         let reply = exchange(run_id, &launch, &mut request, "launch").await?;
         step.launched = reply["pending"] != true && reply["stopped"] != true;
+        if step.launched {
+            std::fs::write(run_file(run_id, ".launched").map_err(Failure::Local)?, b"")
+                .map_err(|error| Failure::Local(error.into()))?;
+        }
         return Ok(observe(&reply, step));
     }
     let (launch, mut request) = local(run_id, false)?;
@@ -449,7 +457,7 @@ impl Api for KaggleAccount {
         let reply = operation(&launch, &request, "release").await?;
         if reply["released"] == true || reply["stopped"] == true {
             // The engine keeps the log before it finishes a run; the copy has served.
-            for suffix in [".log", ".log.complete"] {
+            for suffix in [".log", ".log.complete", ".launched"] {
                 match std::fs::remove_file(run_file(&run.id, suffix)?) {
                     Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
                         return Err(error.into())
@@ -612,6 +620,14 @@ mod tests {
         // A complete copy is never annotated again.
         close_copy(&run).unwrap();
         assert_eq!(text.len() as u64, copied(&run).unwrap());
+    }
+
+    #[test]
+    fn a_run_that_never_started_ends_its_log_without_a_loss_note() {
+        let run = uuid::Uuid::new_v4().to_string();
+        close_copy(&run).unwrap();
+        assert!(complete(&run).unwrap());
+        assert_eq!(copied(&run).unwrap(), 0);
     }
 
     #[test]
