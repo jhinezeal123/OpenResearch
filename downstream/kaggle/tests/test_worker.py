@@ -17,6 +17,26 @@ from pool import Pool
 import processes
 
 class WorkerShutdownTests(unittest.TestCase):
+    def test_a_cancelled_notebook_stops_once_verified_sessions_omit_it(self):
+        row={'created':time.time()-3600,'deadline':time.time()+3600}
+        status={'stopped':False,'status':'cancelrequested'}
+        with tempfile.TemporaryDirectory() as root, patch('bridge.control',lambda *a:status):
+            with patch('worker.not_running',return_value=True) as absent:
+                self.assertEqual(worker.shutdown(None,'sid','account',Path(root),True,row=row),(True,True))
+                absent.assert_called_once()
+            # While Kaggle still lists it, the reservation stays.
+            with patch('worker.not_running',return_value=None):
+                self.assertEqual(worker.shutdown(None,'sid','account',Path(root),True,row=row),(False,True))
+
+    def test_a_running_notebook_is_never_released_on_absence_alone(self):
+        row={'created':time.time()-3600,'deadline':time.time()+3600}
+        with tempfile.TemporaryDirectory() as root, \
+             patch('bridge.control',lambda *a:{'stopped':False,'status':'running'}), \
+             patch('worker.not_running',side_effect=AssertionError('absence probed for a running notebook')):
+            Path(root,'sid').mkdir()
+            Path(root,'sid','push-response.json').write_text('{}')
+            self.assertEqual(worker.shutdown(None,'sid','account',Path(root),True,row=row),(False,True))
+
     def test_after_stop_the_next_poll_checks_provider_without_reopening_ssh(self):
         actions=[]
         def control(session,action,*args):

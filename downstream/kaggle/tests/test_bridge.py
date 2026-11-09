@@ -281,3 +281,52 @@ class BridgeLeaseTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class StopFallbackTests(unittest.TestCase):
+    """A notebook whose SSH never came up is still cancelled through Kaggle."""
+
+    def stop(self, sessions, cancel_status=200):
+        session = load_session()
+        calls = []
+
+        class Client:
+            def call(self, method, body, timeout=60):
+                calls.append((method, body))
+                if method.endswith('ListKernelSessions'):
+                    return 200, {'totalCount': len(sessions), 'sessions': sessions}
+                return cancel_status, {}
+
+        with tempfile.TemporaryDirectory() as root:
+            session.save(Path(root) / 'push-response.json', {'kernelId': 42})
+            state = {'root': root, 'account': 'qa.txt', 'kernel_ref': 'qa-user/ai-scientist-ssh-abc',
+                     'remote_root': '/kaggle/working/x'}
+            refused = SimpleNamespace(returncode=255)
+            with patch.object(session, 'remote', return_value=(refused, 1.0)), \
+                 patch.dict(sys.modules, {'cookie_client': SimpleNamespace(_client_for=lambda a: Client())}):
+                try:
+                    session.stop(state)
+                    error = None
+                except RuntimeError as raised:
+                    error = raised
+            receipt = (Path(root) / 'stop-web.json').is_file()
+        return calls, error, receipt
+
+    def test_the_live_session_of_this_notebook_is_cancelled(self):
+        other = {'kernelId': 7, 'kernelRunId': 70, 'title': 'someone-else'}
+        mine = {'kernelId': 42, 'kernelRunId': 420, 'title': 'ai-scientist-ssh-abc'}
+        calls, error, receipt = self.stop([other, mine])
+        self.assertIsNone(error)
+        self.assertTrue(receipt)
+        self.assertEqual(calls[-1], ('kernels.KernelsService/CancelKernelSession', {'kernelSessionId': 420}))
+
+    def test_no_session_is_cancelled_when_kaggle_lists_none_for_this_notebook(self):
+        calls, error, receipt = self.stop([{'kernelId': 7, 'kernelRunId': 70, 'title': 'someone-else'}])
+        self.assertIsNotNone(error)
+        self.assertFalse(receipt)
+        self.assertFalse(any(method.endswith('CancelKernelSession') for method, _ in calls))
+
+    def test_a_refused_cancel_is_reported_not_assumed(self):
+        calls, error, receipt = self.stop([{'kernelId': 42, 'kernelRunId': 420, 'title': 'x'}], cancel_status=403)
+        self.assertIn('403', str(error))
+        self.assertFalse(receipt)

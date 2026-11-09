@@ -380,8 +380,44 @@ def connect(state, wait_seconds=240):
 def stop(state):
     result, elapsed = remote(state, "touch " + shlex.quote(state["remote_root"] + "/STOP"), record="stop.json")
     if result.returncode:
-        raise RuntimeError("SSH stop failed; notebook still has bounded TTL")
+        # A notebook whose SSH never came up cannot read STOP; Kaggle can still end it.
+        if cancel_session(state):
+            print(json.dumps({"stop_requested_via_kaggle": True}))
+            return
+        raise RuntimeError("SSH stop failed and Kaggle lists no session for this notebook to cancel; it stops at its own deadline")
     print(json.dumps({"stop_requested_over_ssh": True, "elapsed_sec": elapsed}))
+
+
+def live_session(sessions, kernel_id, slug):
+    """The live Kaggle session of this notebook, by kernel ID, else by its unique title."""
+    for session in sessions:
+        if kernel_id and session.get('kernelId') == kernel_id:
+            return session
+    for session in sessions:
+        if session.get('title') == slug:
+            return session
+    return None
+
+
+def cancel_session(state):
+    """Cancel the notebook's live session through Kaggle's web API. False when none is live."""
+    from cookie_client import _client_for
+    root = Path(state['root'])
+    pushed = load(root / 'push-response.json') if (root / 'push-response.json').is_file() else {}
+    client = _client_for(state['account'])
+    code, data = client.call('kernels.KernelsService/ListKernelSessions', {})
+    if code != 200 or not isinstance(data, dict):
+        raise RuntimeError('Cannot list Kaggle sessions to cancel (HTTP %s)' % code)
+    session = live_session(data.get('sessions') or [], pushed.get('kernelId'),
+                           state['kernel_ref'].split('/', 1)[1])
+    if session is None:
+        return False
+    code, _ = client.call('kernels.KernelsService/CancelKernelSession',
+                          {'kernelSessionId': session['kernelRunId']}, timeout=30)
+    if code != 200:
+        raise RuntimeError('Kaggle refused to cancel session %s (HTTP %s)' % (session['kernelRunId'], code))
+    save(root / 'stop-web.json', {'kernelRunId': session['kernelRunId'], 'kernelId': session.get('kernelId')})
+    return True
 
 
 def status(state):

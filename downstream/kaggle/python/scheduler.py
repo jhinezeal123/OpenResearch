@@ -22,6 +22,21 @@ def healthy(metadata, heartbeat):
         return False
 
 
+def stale(home):
+    """Whether a newer package was installed since this scheduler started."""
+    try:
+        current = (Path(home)/'package'/'current').read_text(encoding='utf-8').strip()
+    except OSError:
+        return False
+    return bool(current) and current != Path(__file__).resolve().parent.name
+
+
+def spawn(home, script):
+    with (Path(home)/'scheduler.log').open('ab') as log:
+        child = spawn_python(script, home, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+    save(Path(home)/'scheduler-owner.json', owner(child.pid))
+
+
 def ensure_scheduler(pool):
     with lock(pool.home/'scheduler-start.lock', wait_seconds=2) as acquired:
         if not acquired:
@@ -36,10 +51,7 @@ def ensure_scheduler(pool):
         with lock(pool.home/'scheduler.lock') as unowned:
             if not unowned:
                 return
-        with (pool.home/'scheduler.log').open('ab') as log:
-            child = spawn_python(Path(__file__).resolve(), pool.home,
-                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
-        save(pool.home/'scheduler-owner.json', owner(child.pid))
+        spawn(pool.home, Path(__file__).resolve())
 
 
 def sweep(pool):
@@ -118,6 +130,8 @@ def run(home):
             return
         metadata = owner(os.getpid())
         while True:
+            if stale(pool.home):
+                break
             save(pool.home/'scheduler-heartbeat.json', {**metadata, 'at': time.time()})
             if not sweep(pool):
                 # Exit under the launch lock. A new acquire sees no owner and
@@ -127,6 +141,11 @@ def run(home):
                         save(pool.home/'scheduler-owner.json', {})
                         return
             time.sleep(SWEEP_SECONDS)
+    # Hand the pool to the installed package's scheduler; it waits for this lock.
+    with lock(pool.home/'scheduler-start.lock', wait_seconds=10) as acquired:
+        if acquired:
+            current = (pool.home/'package'/'current').read_text(encoding='utf-8').strip()
+            spawn(pool.home, pool.home/'package'/current/'scheduler.py')
 
 
 if __name__ == '__main__':

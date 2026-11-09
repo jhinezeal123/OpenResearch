@@ -163,7 +163,7 @@ def shutdown(session,sid,account,root,requested,row=None):
     if rejected(root,sid) or unsent(root,sid) or load(Path(root)/sid/'absent.json').get('confirmed'):
         print('Shutdown confirmed: Kaggle never created the notebook',file=sys.stderr,flush=True)
         return True,requested
-    missing,absent=False,None
+    missing,absent,cancelling=False,None,(Path(root)/sid/'stop-web.json').exists()
     # Read provider state even when SSH has already disappeared after STOP.
     for action in (('status',) if requested else ('status','stop')):
         if action=='stop' and absent is False: break
@@ -171,11 +171,14 @@ def shutdown(session,sid,account,root,requested,row=None):
             result=control(session,action,sid,account,root)
             if action=='stop': requested=True
             if result.get('stopped'): return True,requested
+            # Kaggle can leave a cancelled notebook in a cancel state after its session ends.
+            cancelling|=result.get('status') in ('cancelrequested','cancelacknowledged')
         except Exception as error:
             print('Shutdown '+action+': '+type(error).__name__,file=sys.stderr,flush=True)
             # Kaggle answers 403 (not 404) for a private slug that does not exist.
             missing|=action=='status' and getattr(getattr(error,'response',None),'status_code',None) in (403,404)
-        if action=='status' and missing and row is not None and not (Path(root)/sid/'push-response.json').exists():
+        never_pushed=missing and not (Path(root)/sid/'push-response.json').exists()
+        if action=='status' and row is not None and (never_pushed or cancelling):
             # Prove the notebook is not running instead of waiting out its
             # lifetime. Nothing running needs an SSH STOP either.
             absent=not_running(sid,account,root,row)

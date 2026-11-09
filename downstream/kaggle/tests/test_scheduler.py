@@ -21,6 +21,23 @@ class SchedulerTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.pool=Pool(temporary.name)
 
+    def test_a_scheduler_from_a_replaced_package_knows_it_is_stale(self):
+        home=Path(self.pool.home)
+        self.assertFalse(scheduler.stale(home))
+        (home/'package').mkdir(exist_ok=True)
+        (home/'package'/'current').write_text(Path(scheduler.__file__).resolve().parent.name)
+        self.assertFalse(scheduler.stale(home))
+        (home/'package'/'current').write_text('a-newer-package')
+        self.assertTrue(scheduler.stale(home))
+
+    def test_a_stale_scheduler_hands_the_pool_to_the_installed_package(self):
+        home=Path(self.pool.home)
+        (home/'package').mkdir(exist_ok=True)
+        (home/'package'/'current').write_text('a-newer-package')
+        with patch.object(scheduler,'spawn') as spawn, patch.object(scheduler,'sweep',side_effect=AssertionError('stale scheduler swept')):
+            scheduler.run(home)
+        spawn.assert_called_once_with(home, home/'package'/'a-newer-package'/'scheduler.py')
+
     def test_parallel_requests_start_only_one_scheduler(self):
         with patch.object(scheduler.subprocess,'Popen',return_value=SimpleNamespace(pid=os.getpid())) as spawn:
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:

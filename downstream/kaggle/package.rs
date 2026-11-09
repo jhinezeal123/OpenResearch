@@ -78,7 +78,7 @@ pub fn extract() -> Result<PathBuf> {
         hash.update(body.as_bytes());
     }
     let version = format!("{:x}", hash.finalize());
-    let root = super::runtime::root().join("package").join(version);
+    let root = super::runtime::root().join("package").join(&version);
     for (name, body) in FILES {
         let path = root.join(name);
         if !path.is_file() {
@@ -92,6 +92,13 @@ pub fn extract() -> Result<PathBuf> {
                 let _ = std::fs::remove_file(tmp);
             }
         }
+    }
+    // Long-lived pool processes compare their own package with this to hand over to it.
+    let current = root.with_file_name("current");
+    if std::fs::read_to_string(&current).ok().as_deref() != Some(version.as_str()) {
+        let tmp = current.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::write(&tmp, &version)?;
+        std::fs::rename(&tmp, &current)?;
     }
     Ok(root)
 }
