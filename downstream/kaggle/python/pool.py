@@ -183,6 +183,9 @@ class Pool:
     def live(self):
         # Maintenance must not lose old live rows behind the UI's history cap.
         with self.db() as db: return [dict(r) for r in db.execute("SELECT * FROM sessions WHERE state!='stopped' ORDER BY created")]
+    def waiting(self, run_id):
+        with self.db() as db:
+            return db.execute('SELECT 1 FROM pending_runs WHERE id=?',(str(uuid.UUID(run_id)),)).fetchone() is not None
     def cancel_wait(self, run_id):
         with self.db() as db: db.execute('DELETE FROM pending_runs WHERE id=?',(run_id,))
     def reconcile(self, now=None):

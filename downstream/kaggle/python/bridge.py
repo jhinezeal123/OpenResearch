@@ -219,6 +219,10 @@ def dispatch(request):
     if row is None and action=='release':
         pool.cancel_wait(request['runId'])
         return {'released':True}
+    if row is None and action=='inspect':
+        # The engine reads logs of runs still queued, or ended before any notebook was
+        # assigned; only a waiting Run can still produce one.
+        return {'unassigned':True,'waiting':pool.waiting(request['runId']),'log':'','offset':request.get('offset',0),'logSize':0}
     if row is None: raise ValueError('Run has no session assignment')
     if row['state']=='stopped': return {'stopped':True,'sessionId':row['id'],'error':row.get('note')}
     if row['state']=='closing':

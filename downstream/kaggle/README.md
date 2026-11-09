@@ -80,6 +80,22 @@ when a notebook is reused. A later Run is bounded by the remaining lifetime.
   identities, even while the dashboard is closed. Remote bootstrap TTL bounds
   compute if the local machine goes offline.
 
+### Who watches a Run
+
+OpenResearch's run engine setting decides (Settings, `ORX_RUN_ENGINE`, always on
+for canary builds):
+
+- **Off:** a detached `orx supervise` process follows each Run
+  (`supervisor.rs`), as in 0.2.x.
+- **On:** the engine in `orx up` launches and watches Kaggle Runs through
+  `engine.rs`. It drives the same acquire, launch and inspect steps, one at a
+  time in the background, and never ends a Run on a timer: an unreachable
+  bridge or account shows as lost contact until Kaggle answers. The engine also
+  adopts Runs whose 0.2.x supervisor died, once they have been quiet for five
+  minutes. A cancel leaves a `.cancel` marker beside the saved launch so a
+  queued Run never acquires a notebook afterwards. The notebook is released for
+  reuse only after the log is kept and Kaggle reports the Run finished.
+
 Logs are persisted in OpenResearch. Notebook storage remains ephemeral;
 export required artifacts before closing the Session. No Workbench workflow,
 MCP server, n8n or external Python checkout is required.
@@ -150,7 +166,7 @@ or mass-kill every Python/terminal process to recover an uncertain stop.
 
 ## Ownership and maintenance
 
-`compute.rs`, `runtime.rs`, `supervisor.rs`, `settings.rs`, `ui/`, `python/`,
+`compute.rs`, `engine.rs`, `runtime.rs`, `supervisor.rs`, `settings.rs`, `ui/`, `python/`,
 setup and tests belong here. `downstream/bridge.rs` exposes the upstream
 contracts. `VENDORED.json` records the native package origin and original
 hashes; local changes redirect data, profile and cookie recovery paths.

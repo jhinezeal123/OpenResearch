@@ -98,10 +98,8 @@ impl Api {
         let admission = (self.admit)(&project)?;
         args.forwarded = true;
         crate::local::apply_compute_default(&mut args.backend, &mut args.flavor);
-        let backend = args.backend.get_or_insert_with(|| "local".into());
-        // Downstream backends have no engine adapter; they keep the supervised path.
-        let downstream = crate::downstream::compute_backend(backend).is_some();
-        if !downstream && crate::config::run_engine_settings()?.0 {
+        args.backend.get_or_insert_with(|| "local".into());
+        if crate::config::run_engine_settings()?.0 {
             self.commands.run(args, admission).await
         } else {
             let run = crate::compute::submit_supervised(&args).await?;

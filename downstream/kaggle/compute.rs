@@ -37,16 +37,31 @@ impl ComputeBackend for KaggleCompute {
         ready()
     }
 
+    /// The engine's launch intent: the resolved Kaggle launch, which names accounts and
+    /// sources but holds no credentials. The run's environment is added when it starts.
     async fn prepare(
         &self,
-        _args: &crate::downstream::bridge::ExpRunArgs,
+        args: &crate::downstream::bridge::ExpRunArgs,
         _source: &SourceSnapshot,
-        _run_id: &str,
-        _command: &str,
+        run_id: &str,
+        command: &str,
     ) -> Result<crate::downstream::bridge::store::LaunchSpec> {
-        Err(anyhow!(
-            "Kaggle runs use the supervised launcher; the run engine has no Kaggle adapter."
-        ))
+        if command.trim().is_empty() {
+            return Err(anyhow!(
+                "Set the experiment run command before starting Kaggle."
+            ));
+        }
+        let launch = crate::downstream::kaggle::runtime::Launch::resolve(args, run_id, command)?;
+        Ok(crate::downstream::bridge::store::LaunchSpec {
+            kind: crate::downstream::kaggle::engine::KIND.into(),
+            target: None,
+            // `flavor` and `timeout_seconds` are what the dashboard shows for engine runs.
+            options: serde_json::json!({
+                "flavor": launch.accelerator,
+                "timeout_seconds": launch.ttl_seconds,
+                "launch": launch,
+            }),
+        })
     }
 }
 

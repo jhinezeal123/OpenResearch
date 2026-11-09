@@ -2,6 +2,7 @@
 pub(crate) mod bridge;
 pub(crate) mod kaggle {
     pub(crate) mod compute;
+    pub(crate) mod engine;
     pub(crate) mod package;
     pub(crate) mod runtime;
     pub(crate) mod settings;
@@ -60,3 +61,18 @@ pub(crate) fn routes() -> axum::Router<crate::commands::up::AppState> {
 }
 
 pub(crate) const COMPUTE_ID: &str = "kaggle";
+
+/// Run engine adapters for downstream backends, found by `api::provider` after upstream's own.
+pub(crate) const ENGINE_PROVIDERS: &[crate::engine::adapters::api::Provider] =
+    &[crate::engine::adapters::api::Provider {
+        kind: kaggle::engine::KIND,
+        build: |_account, clock, spools| {
+            Ok(std::sync::Arc::new(
+                crate::engine::adapters::api::Adapter::new(
+                    kaggle::engine::KaggleAccount::default(),
+                    clock,
+                    spools,
+                ),
+            ))
+        },
+    }];

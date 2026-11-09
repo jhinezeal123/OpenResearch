@@ -156,6 +156,10 @@ impl Launch {
     pub fn save(&self) -> Result<()> {
         save_json(&Self::path(&self.run_id)?, self)
     }
+    /// Whether a launch was recorded for the run.
+    pub fn saved(run_id: &str) -> Result<bool> {
+        Ok(Self::path(run_id)?.is_file())
+    }
     pub fn load(run_id: &str) -> Result<Self> {
         let value: Self = serde_json::from_slice(&std::fs::read(Self::path(run_id)?)?)?;
         if value.run_id != run_id {

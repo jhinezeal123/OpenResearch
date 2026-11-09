@@ -21,6 +21,7 @@ pub struct Provider {
 pub fn provider(kind: &str) -> Result<&'static Provider> {
     super::PROVIDERS
         .iter()
+        .chain(crate::downstream::ENGINE_PROVIDERS)
         .find(|provider| provider.kind == kind)
         .ok_or_else(|| anyhow!("Unknown API provider {kind}"))
 }
