@@ -34,7 +34,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use super::detect::{
@@ -854,11 +854,11 @@ impl Codex {
             let parsed = info.version.as_deref().and_then(parse_version);
             let too_old = parsed.is_some_and(|v| v < MIN_APP_SERVER_VERSION);
             let supported = !snapshot
-                && app_server_supported(Some(
-                    !too_old
-                        && (catalog_answered
-                            || parsed.is_some_and(|v| v >= MIN_APP_SERVER_VERSION)),
-                ))
+                && app_server_supported(
+                    parsed
+                        .map(|v| v >= MIN_APP_SERVER_VERSION)
+                        .or_else(|| catalog_answered.then_some(true)),
+                )
                 .await;
             info.supports_steering = !codex_exec_forced() && supported;
             if too_old {
@@ -1395,28 +1395,37 @@ async fn runs_app_server() -> bool {
     !codex_exec_forced() && app_server_supported(None).await
 }
 
-/// Whether the installed codex speaks the validated app-server protocol.
-/// Probed once per process (a codex upgrade mid-run takes an `orx up` restart
-/// to notice — acceptable). A caller that already holds the evidence —
-/// detection's probed version, or a completed `model/list` handshake — passes
-/// it as `known` and the cell seeds without paying another `--version` child.
+/// Cache definitive capability evidence, allowing a successful re-detection to
+/// replace an earlier result. Failed probes must not become permanent fallback.
+async fn cached_app_server_support(
+    cache: &tokio::sync::Mutex<Option<bool>>,
+    known: Option<bool>,
+    probe: impl std::future::Future<Output = Option<bool>>,
+) -> bool {
+    let mut cached = cache.lock().await;
+    if let Some(known) = known {
+        *cached = Some(known);
+        return known;
+    }
+    if let Some(supported) = *cached {
+        return supported;
+    }
+    let supported = probe.await;
+    *cached = supported;
+    supported.unwrap_or(false)
+}
+
 async fn app_server_supported(known: Option<bool>) -> bool {
-    static SUPPORTED: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
-    *SUPPORTED
-        .get_or_init(|| async move {
-            match known {
-                Some(known) => known,
-                None => match find_codex() {
-                    Some(bin) => bin_version(&bin)
-                        .await
-                        .as_deref()
-                        .and_then(parse_version)
-                        .is_some_and(|v| v >= MIN_APP_SERVER_VERSION),
-                    None => false,
-                },
-            }
-        })
-        .await
+    static SUPPORTED: tokio::sync::Mutex<Option<bool>> = tokio::sync::Mutex::const_new(None);
+    cached_app_server_support(&SUPPORTED, known, async {
+        let bin = find_codex()?;
+        bin_version(&bin)
+            .await
+            .as_deref()
+            .and_then(parse_version)
+            .map(|v| v >= MIN_APP_SERVER_VERSION)
+    })
+    .await
 }
 
 /// Session mode → thread sandbox, approval policy, and approval reviewer.
@@ -4012,6 +4021,12 @@ fn codex_exec_command(bin: &Path, roots: &[PathBuf], native_id: Option<&str>) ->
     cmd
 }
 
+fn codex_exec_stdin(cmd: &mut Command) {
+    // Rust rejects newlines in batch-file arguments. Prompts also routinely
+    // exceed Windows command-line limits; Codex accepts them verbatim on stdin.
+    cmd.arg("-").stdin(Stdio::piped());
+}
+
 async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
     let bin = find_codex_required()?;
     let project = ctx.project.clone();
@@ -4164,7 +4179,7 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
     } else {
         turn_text
     };
-    cmd.arg(prompt);
+    codex_exec_stdin(&mut cmd);
     prepare_env(&mut cmd);
     cmd.env("CODEX_HOME", codex_home);
     // Plain text only: a synced FORCE_COLOR would put escape codes in the
@@ -4194,6 +4209,11 @@ async fn run_turn_exec(ctx: &mut TurnCtx) -> Result<()> {
             return Err(anyhow!("Could not spawn {}: {}", bin.display(), error));
         }
     };
+    {
+        let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
+        stdin.write_all(prompt.as_bytes()).await?;
+        // Drop closes the pipe: Codex reads the complete prompt through EOF.
+    }
     let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
     let mut lines = BufReader::new(stdout).lines();
     let mut counter = 0usize;
@@ -6141,6 +6161,51 @@ requires_openai_auth = false
             cmd.as_std().get_args().collect::<Vec<_>>(),
             [std::ffi::OsStr::new("exec")]
         );
+    }
+
+    #[tokio::test]
+    async fn capability_cache_recovers_from_unknown_and_accepts_fresh_evidence() {
+        let cache = tokio::sync::Mutex::new(None);
+        assert!(!cached_app_server_support(&cache, None, async { None }).await);
+        assert_eq!(*cache.lock().await, None);
+        assert!(cached_app_server_support(&cache, None, async { Some(true) }).await);
+        assert!(cached_app_server_support(&cache, None, async { panic!("cached") }).await);
+
+        // Refresh must replace a stale negative, including a prior old install.
+        assert!(!cached_app_server_support(&cache, Some(false), async { panic!("known") }).await);
+        assert!(cached_app_server_support(&cache, Some(true), async { panic!("known") }).await);
+        assert!(cached_app_server_support(&cache, None, async { panic!("cached") }).await);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn exec_batch_launcher_receives_multiline_prompt_on_stdin() {
+        let dir = std::env::temp_dir().join(format!("orx-codex-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("codex.cmd");
+        // Buffer all input before writing output, like Codex reading a prompt.
+        std::fs::write(
+            &bin,
+            "@powershell.exe -NoProfile -Command \"$m = New-Object IO.MemoryStream; [Console]::OpenStandardInput().CopyTo($m); $m.WriteTo([Console]::OpenStandardOutput())\"\r\n",
+        )
+        .unwrap();
+        let prompt = "Tiếng Việt\r\n\"quotes\" & | < > %PATH% ! ^\n".repeat(3000);
+        for native_id in [None, Some("thread-id")] {
+            let mut cmd = codex_exec_command(&bin, &[], native_id);
+            codex_exec_stdin(&mut cmd);
+            cmd.stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            let mut child = cmd.spawn().unwrap();
+            {
+                let mut stdin = child.stdin.take().unwrap();
+                stdin.write_all(prompt.as_bytes()).await.unwrap();
+            }
+            let output = child.wait_with_output().await.unwrap();
+            assert!(output.status.success(), "{:?}", output.stderr);
+            assert_eq!(output.stdout, prompt.as_bytes());
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
