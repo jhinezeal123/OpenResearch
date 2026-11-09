@@ -7,7 +7,12 @@
 //!
 //! A bridge operation can outlast the engine's observation budget (account probes, a source
 //! upload), so each step runs in the background and `inspect` reports the latest result.
+//!
+//! Notebook storage ends with its session, and a free notebook can be reclaimed for another
+//! run moments after this one ends. So every step also copies new log bytes to this machine,
+//! and the step that sees the run end copies the rest before reporting it.
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -24,10 +29,8 @@ pub(crate) const KIND: &str = "kaggle_job";
 /// ten-second observation budget.
 const STEP_WAIT: Duration = Duration::from_secs(7);
 const LOG_POLL: Duration = Duration::from_secs(5);
-/// An `inspect` offset past any log, for a status check that transfers no log bytes. Kept
-/// well under Linux's maximum file size: notebooks predating the remote's bounds check seek
-/// to it, and a larger offset fails there with EINVAL.
-const NO_LOG: u64 = 1 << 40;
+/// How much of the local copy one `logs` pass hands over at a time.
+const LOG_CHUNK: usize = 1 << 20;
 
 #[derive(Default)]
 pub(crate) struct KaggleAccount {
@@ -76,6 +79,93 @@ fn cancel_marker(run_id: &str) -> Result<PathBuf> {
     Ok(runtime::root().join("runs").join(format!("{id}.cancel")))
 }
 
+fn run_file(run_id: &str, suffix: &str) -> Result<PathBuf> {
+    let id = uuid::Uuid::parse_str(run_id)?;
+    Ok(runtime::root().join("runs").join(format!("{id}{suffix}")))
+}
+
+/// Serializes appends to the local log copies; steps and log reads both write them.
+static COPY: Mutex<()> = Mutex::new(());
+
+fn decoded(reply: &Value) -> Result<Vec<u8>> {
+    Ok(match reply["log"].as_str() {
+        Some(encoded) => base64::engine::general_purpose::STANDARD.decode(encoded)?,
+        None => Vec::new(),
+    })
+}
+
+fn terminal(reply: &Value) -> bool {
+    matches!(reply["stage"].as_str(), Some("COMPLETE" | "ERROR"))
+}
+
+/// Bytes of the run's log already on this machine.
+fn copied(run_id: &str) -> Result<u64> {
+    match std::fs::metadata(run_file(run_id, ".log")?) {
+        Ok(meta) => Ok(meta.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn append(run_id: &str, bytes: &[u8]) -> Result<()> {
+    let path = run_file(run_id, ".log")?;
+    if let Some(runs) = path.parent() {
+        std::fs::create_dir_all(runs)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("Could not open the Kaggle log copy {}", path.display()))?;
+    file.write_all(bytes)?;
+    Ok(())
+}
+
+fn mark_complete(run_id: &str) -> Result<()> {
+    std::fs::write(run_file(run_id, ".log.complete")?, b"")?;
+    Ok(())
+}
+
+fn complete(run_id: &str) -> Result<bool> {
+    Ok(run_file(run_id, ".log.complete")?.is_file())
+}
+
+/// Adds a reply's log bytes to the local copy when they continue it, and marks the copy
+/// complete once a finished run's log is all here. Returns whether bytes were added.
+fn record(run_id: &str, reply: &Value) -> Result<bool> {
+    let _guard = lock(&COPY);
+    let mut len = copied(run_id)?;
+    let bytes = decoded(reply)?;
+    let continues = reply["offset"].as_u64() == Some(len + bytes.len() as u64);
+    let added = !bytes.is_empty() && continues;
+    if added {
+        append(run_id, &bytes)?;
+        len += bytes.len() as u64;
+    }
+    if terminal(reply) && len >= reply["logSize"].as_u64().unwrap_or(u64::MAX) {
+        mark_complete(run_id)?;
+    }
+    Ok(added)
+}
+
+/// The notebook is gone: nothing past the copy can arrive, so the log says where it ends.
+fn close_copy(run_id: &str) -> Result<()> {
+    let _guard = lock(&COPY);
+    if complete(run_id)? {
+        return Ok(());
+    }
+    let len = copied(run_id)?;
+    append(
+        run_id,
+        format!(
+            "\n[orx] The Kaggle notebook closed before the rest of this log was copied; \
+             output after byte {len} is lost.\n"
+        )
+        .as_bytes(),
+    )?;
+    mark_complete(run_id)
+}
+
 /// The bridge request for a run: its saved launch plus where its source snapshot lives. The
 /// environment, which may carry synced secrets, is added only for the launch itself.
 fn request(run_id: &str, with_env: bool) -> Result<(Launch, Value)> {
@@ -96,7 +186,6 @@ fn request(run_id: &str, with_env: bool) -> Result<(Launch, Value)> {
     request["experimentId"] = json!(run.experiment_id);
     request["sourcePath"] = json!(source.path);
     request["digest"] = json!(source.digest);
-    request["offset"] = json!(NO_LOG);
     if with_env {
         request["env"] = json!(crate::downstream::bridge::config::run_env(run_id));
     }
@@ -182,11 +271,32 @@ async fn remote(launch: &Launch, request: &Value, action: &str) -> Result<Value,
         .map_err(Failure::Remote)
 }
 
+/// Sends `action` from where the local log copy ends and copies what comes back. Once the run
+/// has ended, keeps reading until its log is all here, while each read still makes progress.
+async fn exchange(
+    run_id: &str,
+    launch: &Launch,
+    request: &mut Value,
+    action: &str,
+) -> Result<Value, Failure> {
+    let mut action = action;
+    loop {
+        request["offset"] = json!(copied(run_id).map_err(Failure::Local)?);
+        let reply = remote(launch, request, action).await?;
+        let added = record(run_id, &reply).map_err(Failure::Local)?;
+        if !(terminal(&reply) && added && !complete(run_id).map_err(Failure::Local)?) {
+            return Ok(reply);
+        }
+        action = "inspect";
+    }
+}
+
 async fn drive(run_id: &str, cancelled: bool, step: &mut Step) -> Result<Observation, Failure> {
     if cancelled {
         // Idempotent: it re-reads the remote run, or ends a run still waiting for a notebook.
-        let (launch, request) = local(run_id, false)?;
-        return Ok(observe(&remote(&launch, &request, "cancel").await?, step));
+        let (launch, mut request) = local(run_id, false)?;
+        let reply = exchange(run_id, &launch, &mut request, "cancel").await?;
+        return Ok(observe(&reply, step));
     }
     if !step.acquired {
         let (launch, request) = local(run_id, false)?;
@@ -204,13 +314,14 @@ async fn drive(run_id: &str, cancelled: bool, step: &mut Step) -> Result<Observa
         step.acquired = true;
     }
     if !step.launched {
-        let (launch, request) = local(run_id, true)?;
-        let reply = remote(&launch, &request, "launch").await?;
+        let (launch, mut request) = local(run_id, true)?;
+        let reply = exchange(run_id, &launch, &mut request, "launch").await?;
         step.launched = reply["pending"] != true && reply["stopped"] != true;
         return Ok(observe(&reply, step));
     }
-    let (launch, request) = local(run_id, false)?;
-    Ok(observe(&remote(&launch, &request, "inspect").await?, step))
+    let (launch, mut request) = local(run_id, false)?;
+    let reply = exchange(run_id, &launch, &mut request, "inspect").await?;
+    Ok(observe(&reply, step))
 }
 
 async fn run_step(run_id: String, cancelled: bool, acquired: bool, launched: bool) -> Step {
@@ -323,8 +434,10 @@ impl Api for KaggleAccount {
             &marker,
             crate::downstream::bridge::store::now_ms().to_string(),
         )?;
-        let (launch, request) = request(&run.id, false)?;
-        operation(&launch, &request, "cancel").await?;
+        let (launch, mut request) = request(&run.id, false)?;
+        request["offset"] = json!(copied(&run.id)?);
+        let reply = operation(&launch, &request, "cancel").await?;
+        record(&run.id, &reply)?;
         Ok(())
     }
 
@@ -335,6 +448,15 @@ impl Api for KaggleAccount {
         let (launch, request) = request(&run.id, false)?;
         let reply = operation(&launch, &request, "release").await?;
         if reply["released"] == true || reply["stopped"] == true {
+            // The engine keeps the log before it finishes a run; the copy has served.
+            for suffix in [".log", ".log.complete"] {
+                match std::fs::remove_file(run_file(&run.id, suffix)?) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(error.into())
+                    }
+                    _ => {}
+                }
+            }
             Ok(())
         } else {
             Err(anyhow!(
@@ -344,6 +466,7 @@ impl Api for KaggleAccount {
         }
     }
 
+    /// Serves the local copy first, then asks the notebook for what the copy lacks.
     async fn logs(
         &self,
         run: &WatchedRun,
@@ -353,41 +476,49 @@ impl Api for KaggleAccount {
     ) -> Result<bool> {
         check(run)?;
         let deadline = tokio::time::Instant::now() + window;
-        let (launch, mut request) = request(&run.id, false)?;
+        let mut session: Option<(Launch, Value)> = None;
         let mut received = false;
         loop {
-            request["offset"] = json!(*cursor);
-            let reply = match operation(&launch, &request, "inspect").await {
+            if *cursor < copied(&run.id)? {
+                let mut file = std::fs::File::open(run_file(&run.id, ".log")?)?;
+                file.seek(SeekFrom::Start(*cursor))?;
+                let mut chunk = Vec::with_capacity(LOG_CHUNK);
+                file.take(LOG_CHUNK as u64).read_to_end(&mut chunk)?;
+                sink(&chunk);
+                *cursor += chunk.len() as u64;
+                received = true;
+                continue;
+            }
+            if complete(&run.id)? {
+                return Ok(true);
+            }
+            if session.is_none() {
+                session = Some(request(&run.id, false)?);
+            }
+            let (launch, request) = session.as_mut().expect("session set above");
+            request["offset"] = json!(copied(&run.id)?);
+            let reply = match operation(launch, request, "inspect").await {
                 Ok(reply) => reply,
                 Err(error) if !received => return Err(error),
                 Err(_) => return Ok(false),
             };
             if reply["stopped"] == true {
-                return Ok(true);
+                close_copy(&run.id)?;
+                continue;
             }
             if reply["unassigned"] == true && reply["waiting"] != true {
-                // No notebook was ever assigned and none will be: there is no log.
-                return Ok(true);
+                // No notebook was ever assigned and none will be: the log ends here.
+                let _guard = lock(&COPY);
+                mark_complete(&run.id)?;
+                continue;
             }
-            let bytes = match reply["log"].as_str() {
-                Some(encoded) => base64::engine::general_purpose::STANDARD.decode(encoded)?,
-                None => Vec::new(),
-            };
-            if !bytes.is_empty() {
-                sink(&bytes);
-                received = true;
-                *cursor += bytes.len() as u64;
+            if record(&run.id, &reply)? || complete(&run.id)? {
+                continue;
             }
-            let terminal = matches!(reply["stage"].as_str(), Some("COMPLETE" | "ERROR"));
-            if terminal && *cursor >= reply["logSize"].as_u64().unwrap_or(0) {
-                return Ok(true);
+            if tokio::time::Instant::now() + LOG_POLL >= deadline {
+                return Ok(false);
             }
-            if bytes.is_empty() {
-                if tokio::time::Instant::now() + LOG_POLL >= deadline {
-                    return Ok(false);
-                }
-                tokio::time::sleep(LOG_POLL).await;
-            }
+            tokio::time::sleep(LOG_POLL).await;
         }
     }
 }
@@ -442,6 +573,45 @@ mod tests {
             Observation::Queued { .. }
         ));
         assert!(s.launched);
+    }
+
+    fn log(bytes: &[u8], end: u64, stage: &str, size: u64) -> Value {
+        json!({
+            "log": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "offset": end,
+            "stage": stage,
+            "logSize": size,
+        })
+    }
+
+    #[test]
+    fn the_local_log_copy_takes_only_continuing_bytes_and_knows_when_it_is_whole() {
+        let run = uuid::Uuid::new_v4().to_string();
+        assert!(record(&run, &log(b"tick 1\n", 7, "RUNNING", 7)).unwrap());
+        // A replayed page and a page past a gap are both refused.
+        assert!(!record(&run, &log(b"tick 1\n", 7, "RUNNING", 7)).unwrap());
+        assert!(!record(&run, &log(b"tick 9\n", 30, "RUNNING", 30)).unwrap());
+        assert!(!complete(&run).unwrap());
+        assert!(record(&run, &log(b"done\n", 12, "COMPLETE", 12)).unwrap());
+        assert!(complete(&run).unwrap());
+        assert_eq!(
+            std::fs::read(run_file(&run, ".log").unwrap()).unwrap(),
+            b"tick 1\ndone\n"
+        );
+    }
+
+    #[test]
+    fn a_notebook_lost_before_the_copy_finished_says_what_is_missing() {
+        let run = uuid::Uuid::new_v4().to_string();
+        record(&run, &log(b"tick 1\n", 7, "RUNNING", 7)).unwrap();
+        close_copy(&run).unwrap();
+        let text =
+            String::from_utf8(std::fs::read(run_file(&run, ".log").unwrap()).unwrap()).unwrap();
+        assert!(text.starts_with("tick 1\n") && text.contains("after byte 7 is lost"));
+        assert!(complete(&run).unwrap());
+        // A complete copy is never annotated again.
+        close_copy(&run).unwrap();
+        assert_eq!(text.len() as u64, copied(&run).unwrap());
     }
 
     #[test]
