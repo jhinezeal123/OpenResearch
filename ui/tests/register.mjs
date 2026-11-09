@@ -5,6 +5,7 @@ import { after, afterEach } from "node:test";
 import { fileURLToPath } from "node:url";
 import { format } from "node:util";
 
+const ui = new URL("../", import.meta.url).href;
 const paraglide = new URL("../src/paraglide/", import.meta.url).href;
 const compiledParaglide = new URL("../node_modules/.cache/paraglide/", import.meta.url).href;
 const source = (url) => readFileSync(new URL(url), "utf8");
@@ -19,6 +20,9 @@ registerHooks({
     // Packages resolve to their browser builds, as Vite bundles them.
     context = { ...context, conditions: [...context.conditions, "browser"] };
     if (specifier.startsWith("@xterm/")) return { url: `${nextResolve(specifier, context).url}?umd`, shortCircuit: true };
+    // Like Vite's resolve.dedupe: packages imported from outside ui/ (downstream/) resolve from ui/.
+    if (!specifier.startsWith(".") && context.parentURL?.startsWith("file:") && !context.parentURL.startsWith(ui))
+      context = { ...context, parentURL: import.meta.url };
     if (!specifier.startsWith(".") || !context.parentURL?.startsWith("file:")) return nextResolve(specifier, context);
 
     const url = new URL(specifier, context.parentURL).href;
