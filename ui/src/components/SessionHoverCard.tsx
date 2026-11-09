@@ -1,12 +1,14 @@
+import { useWorkspace } from "../workspace";
 import { useQuery } from "@tanstack/react-query";
 import { FlaskConical, Folder } from "lucide-react";
 import { useCallback, useId, useState } from "react";
 import { createPortal } from "react-dom";
-import { getSessionExperimentsQuery } from "../queries/chat";
+
 import { m } from "../paraglide/messages.js";
 import { fmtNumber, ltr } from "../i18n";
-import { fmtDuration, runDisplayStatus, timeAgo } from "../api";
-import type { ChatSession, RunDisplayStatus, SessionExperiment } from "../api";
+import { fmtDuration, timeAgo } from "../api";
+import type { ChatSession, SessionExperiment } from "../api";
+import { runDisplay, type RunDisplayStatus } from "../runDisplay";
 import { harnessLabel } from "./ModelPicker";
 import { HarnessLogo } from "./HarnessLogo";
 import { statusLabel, statusStyle } from "./StatusBadge";
@@ -17,9 +19,11 @@ const CARD_WIDTH = 320;
 const GAP = 8;
 
 const ICON_TONES: Partial<Record<RunDisplayStatus, string>> = {
+  submitting: "text-accent-green",
   starting: "text-accent-green",
   running: "text-accent-green",
   cancelling: "text-accent-amber",
+  cancellation_pending: "text-accent-amber",
   failed: "text-accent-red",
 };
 
@@ -31,7 +35,8 @@ function ExperimentRow({ row, sessionProjectId, tabbable, onFocus, onOpen }: {
   onOpen: () => void;
 }) {
   const { experiment, currentRun, projectName } = row;
-  const status = currentRun ? runDisplayStatus(currentRun) : null;
+  const display = currentRun ? runDisplay(currentRun) : null;
+  const status = display?.status ?? null;
   const tone = status ? ICON_TONES[status] ?? "text-subtext" : "text-muted";
   const live = status !== null && statusStyle(status).live;
   const elapsed = currentRun && (live ? fmtDuration(Date.now() - currentRun.createdAt) : timeAgo(currentRun.endedAt ?? currentRun.createdAt));
@@ -54,7 +59,7 @@ function ExperimentRow({ row, sessionProjectId, tabbable, onFocus, onOpen }: {
         <span className="min-w-0 flex-1">
           <span className="block break-words">{experiment.title?.trim() || experiment.slug}</span>
           <span className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-xs text-subtext">
-            {status ? <span className="text-text">{statusLabel(status)}</span> : <span>{m.experiments_not_run_yet()}</span>}
+            {status ? <span className="text-text">{statusLabel(status, display?.stopping)}</span> : <span>{m.experiments_not_run_yet()}</span>}
             {elapsed && <span className="tabular-nums">{elapsed}</span>}
             {experiment.archived && <span>{m.tree_archived()}</span>}
             {experiment.projectId !== sessionProjectId && (
@@ -70,7 +75,7 @@ function ExperimentRow({ row, sessionProjectId, tabbable, onFocus, onOpen }: {
   );
 }
 
-export function SessionHoverCard({ session, modelName, projectName, harnessLogo, anchor, cardId, cardRef, onEnter, onLeave, onOpenExperiment, onReturnToRow, onContinue }: {
+export function SessionHoverCard({ session, modelName, projectName, harnessLogo, anchor, cardId, cardRef, container, onEnter, onLeave, onOpenExperiment, onReturnToRow, onContinue }: {
   session: ChatSession;
   modelName: string | null;
   projectName?: string;
@@ -78,12 +83,15 @@ export function SessionHoverCard({ session, modelName, projectName, harnessLogo,
   anchor: DOMRect;
   cardId: string;
   cardRef: React.RefObject<HTMLDivElement | null>;
+  container: Element;
   onEnter: () => void;
   onLeave: () => void;
   onOpenExperiment: (projectId: string, experimentId: string) => void;
   onReturnToRow: () => void;
   onContinue: () => void;
 }) {
+  const { getSessionExperimentsQuery } = useWorkspace().queries;
+
   const measure = useMeasure();
   const headingId = useId();
   const { data, isPending, error } = useQuery(getSessionExperimentsQuery(session.id));
@@ -130,7 +138,6 @@ export function SessionHoverCard({ session, modelName, projectName, harnessLogo,
       onMouseLeave={onLeave}
       onClick={(event) => event.stopPropagation()}
       onKeyDown={(event) => {
-        event.stopPropagation();
         const rows = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>("[data-experiment-row]"));
         const index = rows.findIndex((row) => row === event.target);
         const onCard = event.target === event.currentTarget;
@@ -190,6 +197,6 @@ export function SessionHoverCard({ session, modelName, projectName, harnessLogo,
         </div>
       </div>}
     </div>,
-    document.body,
+    container,
   );
 }

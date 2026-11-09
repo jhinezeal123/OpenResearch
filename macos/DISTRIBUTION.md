@@ -34,13 +34,14 @@ committed bundle. The artifact must still be available for manual re-attachments
 ## The app updater's contract
 
 The desktop app offers stable and canary update channels. A push to `main` runs
-`.github/workflows/release-canary.yml`: after CI succeeds, it builds the macOS
-app, Windows installer and Linux AppImages, and publishes versioned assets and
-`desktop-canary-v2.json` on the `canary` prerelease. The manifest records the
-build identity, source commit, and ancestry. Builds run sequentially, with up
-to 100 pending runs queued. An older rerun cannot replace the canary pointer,
-and publication retries retain already-published assets. The latest build and
-six other recent builds are retained.
+`.github/workflows/release-canary.yml`: alongside CI, it builds the macOS app,
+Windows installer and Linux AppImages; once CI succeeds, it publishes versioned
+assets and `desktop-canary-v2.json` on the `canary` prerelease. The manifest
+records the build identity, source commit, and ancestry. A running build always
+finishes; only the newest pending push waits behind it, so intermediate commits
+get no canary. An older rerun cannot replace the canary pointer, and
+publication retries retain already-published assets. The latest build and six
+other recent builds are retained.
 
 The first build after this change also publishes a compatibility release and
 `desktop-canary.json` for already-installed clients that download from a
@@ -107,8 +108,10 @@ dist does not generate this job's `needs: build-local-artifacts`, so
 `dist-workspace.toml` sets `allow-dirty = ["ci"]`, which makes `dist generate`
 skip `release.yml` entirely: dist config changes no longer reach CI on their own.
 To regenerate, remove `allow-dirty`, run the pinned `dist generate`, then restore
-the shared UI build, custom signing dependencies, release-only dispatch guard,
-immutable source SHA propagation, the full-history checkout and
+the shared UI build, the `build-host` job and its `needs` edges, the host artifact
+download and `ORX_EMBED_HOST_DIR` on embedding build steps, custom signing
+dependencies, release-only dispatch guard, immutable source SHA propagation,
+the full-history checkout and
 `desktop-ancestry.json` generation, and required publication checks before
 restoring `allow-dirty`.
 Release recovery requires an explicit version tag; set `source-sha` to the original
@@ -150,7 +153,7 @@ Never commit the `.p12`.
 
 ## Build / sign locally
 
-Use Node 22 and pnpm 10 for the UI build.
+Use Node 22 and the pnpm version pinned in `ui/package.json` for the UI build.
 
 ```bash
 pnpm -C ui install --frozen-lockfile && pnpm -C ui build

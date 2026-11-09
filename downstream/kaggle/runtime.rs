@@ -184,7 +184,7 @@ pub async fn call(settings: &Settings, mut request: Value, seconds: u64) -> Resu
         .create(true)
         .append(true)
         .open(root().join("adapter.log"))?;
-    let mut command = tokio::process::Command::new(python());
+    let mut command = crate::process::tokio_command(python());
     command
         .arg("-u")
         .arg(package.join("bridge.py"))

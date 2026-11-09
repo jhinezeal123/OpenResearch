@@ -37,10 +37,25 @@ impl ComputeBackend for KaggleCompute {
         ready()
     }
 
-    async fn submit(
+    async fn prepare(
+        &self,
+        _args: &crate::downstream::bridge::ExpRunArgs,
+        _source: &SourceSnapshot,
+        _run_id: &str,
+        _command: &str,
+    ) -> Result<crate::downstream::bridge::store::LaunchSpec> {
+        Err(anyhow!(
+            "Kaggle runs use the supervised launcher; the run engine has no Kaggle adapter."
+        ))
+    }
+}
+
+impl KaggleCompute {
+    /// The supervised launch: the run row is already reserved by `compute::submit_supervised`.
+    pub(crate) async fn submit(
         &self,
         args: &crate::downstream::bridge::ExpRunArgs,
-        source: StagedSource,
+        source: SourceSnapshot,
         run_id: String,
     ) -> Result<StoredRun> {
         let store = Store::open()?;
@@ -60,16 +75,10 @@ impl ComputeBackend for KaggleCompute {
         descriptor.job_id = Some(uuid::Uuid::parse_str(&run_id)?.simple().to_string());
         descriptor.flavor = Some(launch.accelerator.clone());
         descriptor.timeout_secs = Some(launch.ttl_seconds);
-        source.0.apply_to_descriptor(&mut descriptor);
+        source.apply_to_descriptor(&mut descriptor);
         record_submission_handle(&run_id, &descriptor)?;
         run.backend_json = descriptor.to_json();
         crate::downstream::bridge::spawn_supervisor(&run_id)?;
         Ok(run)
-    }
-
-    async fn status(&self, handle: &StoredRun) -> Result<StoredRun> {
-        Store::open()?
-            .get_run(&handle.id)?
-            .ok_or_else(|| anyhow!("Run {} not found", handle.id))
     }
 }

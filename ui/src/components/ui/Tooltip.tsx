@@ -6,22 +6,38 @@ export function Tooltip({
   children,
   className,
   interactive = false,
+  disabled = false,
+  side = "top",
 }: {
   content: string;
   children: ReactNode;
   className?: string;
   interactive?: boolean;
+  disabled?: boolean;
+  /** `start` opens beside the trigger, toward the reading start, so rows in a list stay visible. */
+  side?: "top" | "start";
 }) {
   const triggerRef = useRef<HTMLSpanElement>(null);
   const tooltipRef = useRef<HTMLSpanElement>(null);
 
   function show() {
+    if (disabled) return;
     const trigger = triggerRef.current;
     const tooltip = tooltipRef.current;
     if (!trigger || !tooltip) return;
     if (!tooltip.matches(":popover-open")) tooltip.showPopover();
     const anchor = trigger.getBoundingClientRect();
     const bounds = tooltip.getBoundingClientRect();
+    if (side === "start") {
+      const rtl = getComputedStyle(trigger).direction === "rtl";
+      const beside = rtl ? anchor.right + 6 : anchor.left - bounds.width - 6;
+      if (beside >= 8 && beside + bounds.width <= window.innerWidth - 8) {
+        const middle = anchor.top + anchor.height / 2 - bounds.height / 2;
+        tooltip.style.left = `${beside}px`;
+        tooltip.style.top = `${Math.max(8, Math.min(middle, window.innerHeight - bounds.height - 8))}px`;
+        return;
+      }
+    }
     const left = Math.max(8, Math.min(anchor.left + anchor.width / 2 - bounds.width / 2, window.innerWidth - bounds.width - 8));
     const above = anchor.top - bounds.height - 6;
     const top = above >= 8 ? above : anchor.bottom + 6;
@@ -35,10 +51,15 @@ export function Tooltip({
   }
 
   useEffect(() => {
+    if (disabled) tooltipRef.current?.hidePopover();
+  }, [disabled]);
+
+  useEffect(() => {
     const dismiss = () => tooltipRef.current?.hidePopover();
     window.addEventListener("scroll", dismiss, true);
     window.addEventListener("resize", dismiss);
     return () => {
+      dismiss();
       window.removeEventListener("scroll", dismiss, true);
       window.removeEventListener("resize", dismiss);
     };
@@ -55,6 +76,7 @@ export function Tooltip({
       tabIndex={interactive ? undefined : 0}
       role={interactive ? undefined : "img"}
       aria-label={interactive ? undefined : content}
+      onPointerDown={() => tooltipRef.current?.hidePopover()}
       onMouseEnter={show}
       onMouseLeave={hide}
       onFocus={(event) => {

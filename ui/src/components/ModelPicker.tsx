@@ -1,12 +1,25 @@
+import {
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ButtonHTMLAttributes,
+  type ReactNode,
+  type RefObject,
+} from "react";
+import { WorkspaceDomContext } from "../WorkspaceDom";
+import { useWorkspace } from "../workspace";
+import { EscapeScope } from "./EscapeScope";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Menu } from "@base-ui/react/menu";
 import { Popover } from "@base-ui/react/popover";
 import { DirectionProvider } from "@base-ui/react/direction-provider";
-import { getHarnessesQuery } from "../queries/settings";
+
 import { m } from "../paraglide/messages.js";
 import { ltr } from "../i18n";
-import { Check, ChevronDown, ChevronRight, Lock, Plus, Settings, Zap } from "lucide-react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ButtonHTMLAttributes, type ReactNode, type RefObject } from "react";
+import { Bot, CircleAlert, Check, ChevronDown, ChevronRight, Handshake, ListChecks, Lock, LockOpen, Pencil, Plus, Settings, ShieldCheck, Workflow, Zap, type LucideIcon } from "lucide-react";
 import {
   fmtNumber,
   harnessModelLabel,
@@ -30,7 +43,8 @@ import { HarnessLogo } from "./HarnessLogo";
 import { IconButton, MenuItem, SwitchIndicator, Tooltip } from "./ui";
 import { cn } from "./ui/cn";
 
-import { LocalModelSetup } from "./LocalModelSetup";
+import { LocalModelDialog } from "./LocalModelSetup";
+
 import { formatCodexModel, groupModels, resolveHarnessDefaultModel } from "../modelSelection";
 
 const MODEL_GROUP_CLASS_NAME = [
@@ -84,28 +98,96 @@ export function usePopover(triggerRef?: RefObject<HTMLButtonElement | null>) {
     const onDown = (e: MouseEvent) => {
       if (e.target instanceof Node && !ref.current?.contains(e.target) && !triggerRef?.current?.contains(e.target)) setOpen(false);
     };
-    const onKey = (e: KeyboardEvent) => {
-      // Escape closes the picker and must NOT bubble to other document-level
-      // Escape handlers (e.g. ChatPanel's stop-streaming listener) — closing an
-      // open picker shouldn't also interrupt an in-flight turn. Capture phase +
-      // stopPropagation makes this order-independent: relying on registration
-      // order and defaultPrevented among bubble-phase document listeners is
-      // fragile, since whichever registered first runs first.
-      if (e.key === "Escape") {
-        e.preventDefault();
-        e.stopPropagation();
-        setOpen(false);
-        triggerRef?.current?.focus();
-      }
-    };
     document.addEventListener("mousedown", onDown, true);
-    document.addEventListener("keydown", onKey, true);
     return () => {
       document.removeEventListener("mousedown", onDown, true);
-      document.removeEventListener("keydown", onKey, true);
     };
   }, [open, triggerRef]);
   return { open, setOpen, ref };
+}
+
+const PILL =
+  "composer-pill inline-flex h-7 min-w-0 shrink-0 items-center gap-1.5 rounded-md px-2 text-sm text-subtext whitespace-nowrap transition-[background,color] duration-150 ease-standard hover:bg-hover-muted hover:text-text data-[popup-open]:bg-hover-muted data-[popup-open]:text-text";
+
+const MENU_POPUP = "overflow-y-auto rounded-lg border border-border bg-background p-1 shadow-dropdown outline-none";
+
+const MENU_LABEL = "px-2 pt-1.5 pb-1 text-sm text-muted";
+
+/** Effort tiers fill more of a 3×3 grid; ids the grid does not know stay empty. */
+const EFFORT_DOTS: Record<string, { dots: number[]; tone: string }> = {
+  minimal: { dots: [4], tone: "text-muted" },
+  low: { dots: [4], tone: "text-accent-green" },
+  medium: { dots: [3, 4, 5], tone: "text-accent-amber" },
+  high: { dots: [1, 3, 4, 5, 7], tone: "text-accent-orange" },
+  xhigh: { dots: [0, 2, 4, 6, 8], tone: "text-accent-red" },
+  max: { dots: [0, 1, 2, 3, 4, 5, 6, 7, 8], tone: "text-accent-purple" },
+};
+
+/** Claude's `ultracode` is a session mode, `xhigh` plus dynamic workflows, so it toggles on top of the effort levels. */
+const ULTRACODE = "ultracode";
+
+function EffortIcon({ id }: { id: string | null | undefined }) {
+  if (id === ULTRACODE) return <Workflow size={14} aria-hidden="true" className="shrink-0 text-accent-purple" />;
+
+  const effort = (id && EFFORT_DOTS[id]) || (id?.startsWith("ultra") ? EFFORT_DOTS.max : null);
+  return (
+    <svg viewBox="0 0 14 14" className="size-3.5 shrink-0" aria-hidden="true">
+      {Array.from({ length: 9 }, (_, dot) => (
+        <rect
+          key={dot}
+          x={(dot % 3) * 5}
+          y={Math.floor(dot / 3) * 5}
+          width="4"
+          height="4"
+          rx="1"
+          fill="currentColor"
+          className={effort?.dots.includes(dot) ? effort.tone : "text-border"}
+        />
+      ))}
+    </svg>
+  );
+}
+
+/** Icons follow the shared policy behind each provider's permission id (`PermissionMode::from_id`). */
+const PERMISSION_ICONS: Record<string, { icon: LucideIcon; tone: string }> = {
+  ask: { icon: Lock, tone: "text-accent-amber" },
+  manual: { icon: Lock, tone: "text-accent-amber" },
+  default: { icon: Lock, tone: "text-accent-amber" },
+  "accept-edits": { icon: Pencil, tone: "text-accent-orange" },
+  acceptEdits: { icon: Pencil, tone: "text-accent-orange" },
+  plan: { icon: ListChecks, tone: "text-accent-teal" },
+  auto: { icon: ShieldCheck, tone: "text-accent-blue" },
+  "approve-for-me": { icon: ShieldCheck, tone: "text-accent-blue" },
+  "auto-approve": { icon: ShieldCheck, tone: "text-accent-blue" },
+  bypass: { icon: LockOpen, tone: "text-accent-red" },
+  bypassPermissions: { icon: LockOpen, tone: "text-accent-red" },
+  "full-access": { icon: LockOpen, tone: "text-accent-red" },
+};
+
+function PermissionIcon({ id }: { id: string | null | undefined }) {
+  const permission = id ? PERMISSION_ICONS[id] : undefined;
+  const Icon = permission?.icon ?? ShieldCheck;
+  return <Icon size={14} aria-hidden="true" className={cn("shrink-0", permission?.tone ?? "text-subtext")} />;
+}
+
+function DescribedRadioItem({ choice, icon, isDefault }: { choice: OptionChoice; icon?: ReactNode; isDefault: boolean }) {
+  return (
+    <Menu.RadioItem value={choice.id} closeOnClick label={choice.label} className={cn(SETTINGS_ROW, "items-start")}>
+      <span className="flex min-w-0 items-start gap-2">
+        {icon && <span className="flex h-5 items-center">{icon}</span>}
+        <span className="flex min-w-0 flex-col items-start gap-0.5">
+          <span>
+            {choice.label}
+            {isDefault && <span className="text-muted"> {m.model_picker_default()}</span>}
+          </span>
+          {choice.description && <span className="text-sm leading-snug text-muted">{choice.description}</span>}
+        </span>
+      </span>
+      <Menu.RadioItemIndicator className="flex h-5 shrink-0 items-center">
+        <Check size={14} aria-hidden="true" />
+      </Menu.RadioItemIndicator>
+    </Menu.RadioItem>
+  );
 }
 
 const SETTINGS_ROW =
@@ -126,14 +208,18 @@ function SettingsSubmenu({
   defaultId?: string | null;
   onSelect: (id: string) => void;
 }) {
+  const { portalContainer } = useContext(WorkspaceDomContext);
+
+  const [open, setOpen] = useState(false);
+
   return (
-    <Menu.SubmenuRoot>
+    <Menu.SubmenuRoot open={open} onOpenChange={setOpen}>
       <Menu.SubmenuTrigger delay={0} label={label} className={SETTINGS_ROW}>
         <span>{label}</span>
         <span className="ms-auto max-w-36 truncate text-muted">{detail}</span>
         <ChevronRight size={14} aria-hidden="true" className="shrink-0 text-muted rtl:rotate-180" />
       </Menu.SubmenuTrigger>
-      <Menu.Portal>
+      <Menu.Portal container={portalContainer}>
         <Menu.Positioner className="z-50" alignOffset={-6} collisionPadding={8} positionMethod="fixed">
           <Menu.Popup
             aria-label={label}
@@ -179,12 +265,12 @@ function SettingsSubmenu({
           </Menu.Popup>
         </Menu.Positioner>
       </Menu.Portal>
+      <EscapeScope enabled={open} onEscape={() => setOpen(false)} />
     </Menu.SubmenuRoot>
   );
 }
 
-/** Composer selector: pick the harness + model new sessions (and same-harness
- * turns) run on. Groups mirror the Harnesses settings tab. */
+/** Composer selector for the chat's harness and model. */
 export function ModelPicker({
   value,
   onSelect,
@@ -198,6 +284,7 @@ export function ModelPicker({
   autonomy,
   onSelectAutonomy,
   lockHarness = false,
+  disabled = false,
   openRequest = 0,
   className,
   sessionHarness,
@@ -217,6 +304,7 @@ export function ModelPicker({
   autonomy?: Autonomy;
   onSelectAutonomy?: (autonomy: Autonomy) => void;
   lockHarness?: boolean;
+  disabled?: boolean;
   openRequest?: number;
   className?: string;
   sessionHarness?: Harness;
@@ -224,14 +312,22 @@ export function ModelPicker({
   onSelectNativeOption?: (optionId: string, value: string) => void;
   onStartHarness?: (harness: Harness) => void;
 }) {
+  const { portalContainer } = useContext(WorkspaceDomContext);
+
+  const { showCustomDialog } = useWorkspace().dialogs;
+
+  const { getHarnessesQuery } = useWorkspace().queries;
+
   const { data: catalog = EMPTY_HARNESSES } = useQuery(getHarnessesQuery());
   const harnesses = useMemo(
     () => (sessionHarness ? [sessionHarness, ...catalog.filter((h) => h.id !== sessionHarness.id)] : catalog),
     [catalog, sessionHarness],
   );
   const queryClient = useQueryClient();
-  const [addingLocalModel, setAddingLocalModel] = useState(false);
-  const [menu, setMenu] = useState<"model" | "settings" | null>(null);
+  const localModelConnected = useRef<(model: string) => void>(() => {});
+  useEffect(() => () => { localModelConnected.current = () => {}; }, []);
+  const [menu, setMenu] = useState<"model" | "effort" | "permissions" | null>(null);
+  const [legacyMenu, setLegacyMenu] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const modelTriggerRef = useRef<HTMLButtonElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -246,10 +342,11 @@ export function ModelPicker({
   useEffect(() => {
     if (openRequest === handledOpenRequest.current) return;
     handledOpenRequest.current = openRequest;
+    if (disabled) return;
     setFilter("");
     setMenu("model");
     searchRef.current?.focus();
-  }, [openRequest]);
+  }, [openRequest, disabled]);
 
   const groups = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -282,6 +379,7 @@ export function ModelPicker({
   }, [harnesses, filter, lockHarness, value]);
 
   const pick = (harness: Harness, model: string | null) => {
+    if (disabled) return;
     const previous = value?.harness === harness.id ? value : null;
 
     onSelect({
@@ -299,6 +397,11 @@ export function ModelPicker({
     close();
   };
 
+  localModelConnected.current = (model) => {
+    const harness = queryClient.getQueryData(getHarnessesQuery().queryKey)?.find((entry) => entry.id === "opencode");
+    if (harness && (!lockHarness || value?.harness === "opencode")) pick(harness, model);
+  };
+
   const selectedHarness = harnesses.find((harness) => harness.id === value?.harness);
   const selected = selectedHarness?.models.find((model) => model.id === value?.model);
   const displayModel = (harness: Harness, model: Harness["models"][number]) => harness.id === "codex" ? formatCodexModel(harnessModelLabel(model)) : harnessModelLabel(model);
@@ -314,20 +417,25 @@ export function ModelPicker({
     : m.model_picker_model();
   const effectiveReasoningId = value?.reasoningLevel ?? defaultReasoningId ?? reasoningChoices[0]?.id;
   const reasoningLabel = reasoningChoices.find((choice) => choice.id === effectiveReasoningId)?.label;
+  const ultracodeChoice = reasoningChoices.find((choice) => choice.id === ULTRACODE);
+  const effortChoices = reasoningChoices.filter((choice) => choice.id !== ULTRACODE);
+  const ultracode = effectiveReasoningId === ULTRACODE;
   const effectivePermissionId = value?.permissionMode ?? defaultPermissionId ?? permissionChoices[0]?.id;
   const permissionLabel = permissionChoices.find((choice) => choice.id === effectivePermissionId)?.label;
   const effectiveServiceTier = reconcileServiceTier(selectedHarness, value?.model, value?.serviceTier);
   const fastChoice = serviceTiersFor(selectedHarness, value?.model).find((choice) => choice.id === "priority");
-  const autonomyChoices: (OptionChoice & { id: Autonomy })[] = [
+  const autonomyChoices: (OptionChoice & { id: Autonomy; icon: ReactNode })[] = [
     {
       id: "agentic",
       label: m.model_picker_autonomy_agentic(),
       description: m.model_picker_autonomy_agentic_description(),
+      icon: <Bot size={14} aria-hidden="true" className="shrink-0 text-accent-purple" />,
     },
     {
       id: "copilot",
       label: m.model_picker_autonomy_copilot(),
       description: m.model_picker_autonomy_copilot_description(),
+      icon: <Handshake size={14} aria-hidden="true" className="shrink-0 text-accent-green" />,
     },
   ];
   const autonomyLabel = autonomyChoices.find((choice) => choice.id === autonomy)?.label;
@@ -344,27 +452,9 @@ export function ModelPicker({
     items[(index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length]?.focus();
   };
 
-  const hasSettings =
-    reasoningChoices.length > 0 ||
-    nativeOptions.length > 0 ||
-    !!fastChoice ||
-    permissionChoices.length > 0 ||
-    !!onSelectAutonomy;
-
   useEffect(() => {
-    if (!menu) return;
-    if (menu === "settings" && !hasSettings) {
-      setMenu(null);
-      return;
-    }
-
-    const onKey = (event: KeyboardEvent) => {
-      // ChatPanel's interrupt listener can precede Base UI's document listener.
-      if (event.key === "Escape") event.preventDefault();
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [menu, hasSettings]);
+    if (menu !== "model") setLegacyMenu(null);
+  }, [menu]);
 
   return (
     <DirectionProvider direction={document.documentElement.dir === "rtl" ? "rtl" : "ltr"}>
@@ -373,7 +463,7 @@ export function ModelPicker({
         data-onboarding="model-picker"
       >
         <Popover.Root
-          open={menu === "model"}
+          open={!disabled && menu === "model"}
           onOpenChange={(open) => {
             setFilter("");
             setMenu((current) => (open ? "model" : current === "model" ? null : current));
@@ -383,14 +473,9 @@ export function ModelPicker({
             <Popover.Trigger
               ref={modelTriggerRef}
               type="button"
-              className={cn(
-                "composer-pill inline-flex h-8 min-w-0 max-w-full items-center gap-1 rounded-md px-2 text-sm text-text whitespace-nowrap transition-[background,color] duration-150 ease-standard hover:bg-surface",
-                className,
-              )}
-              aria-label={m.a11y_chat_model({
-                label:
-                  effectiveServiceTier === "priority" ? `${m.model_picker_fast_speed()} ${label}` : label,
-              })}
+              disabled={disabled}
+              className={cn(PILL, "max-w-full", className)}
+              aria-label={m.a11y_chat_model({ label })}
               onKeyDown={(event) => {
                 if (event.key === "ArrowDown") {
                   event.preventDefault();
@@ -400,9 +485,7 @@ export function ModelPicker({
                 }
               }}
             >
-              {effectiveServiceTier === "priority" ? (
-                <Zap size={14} fill="currentColor" aria-hidden="true" />
-              ) : value?.harness ? (
+              {value?.harness ? (
                 <HarnessLogo harness={value.harness} logo={selectedHarness?.logo} size={14} />
               ) : null}
               <span className="model-picker-label min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">
@@ -411,7 +494,7 @@ export function ModelPicker({
               <ChevronDown size={14} className="shrink-0 text-muted" />
             </Popover.Trigger>
           </Tooltip>
-          <Popover.Portal>
+          <Popover.Portal container={portalContainer}>
             <Popover.Positioner
               className="z-50"
               side="top"
@@ -453,35 +536,42 @@ export function ModelPicker({
                     <Settings size={16} aria-hidden="true" />
                   </IconButton>
                 </div>
-                <div className="model-menu-list min-h-0 overflow-y-auto p-1.5">
+                <div className="model-menu-list min-h-0 overflow-x-hidden overflow-y-auto p-1.5 [&_button]:min-w-0 [&_button]:[overflow-wrap:anywhere] [&_button>span]:min-w-0">
                   {groups.map(({ harness, models, legacy, hidden }) => (
                     <div key={harness.id}>
-                      <div className={MODEL_GROUP_CLASS_NAME}>
-                        <span className="inline-flex items-center gap-1.5">
-                          <HarnessLogo harness={harness.id} logo={harness.logo} size={14} />
-                          {harness.name}
-                        </span>
-                        {!harness.agentReady && (
-                          <span className="inline-flex items-center gap-1 text-accent-amber font-normal">
-                            {harness.catalogPending ? (
-                              m.onboarding_checking()
-                            ) : (
-                              <>
-                                <Lock size={10} /> {m.model_picker_unavailable()}
-                              </>
-                            )}
+                      {harness.agentReady ? (
+                        <div className={MODEL_GROUP_CLASS_NAME}>
+                          <span className="inline-flex items-center gap-1.5">
+                            <HarnessLogo harness={harness.id} logo={harness.logo} size={14} />
+                            {harness.name}
                           </span>
-                        )}
-                      </div>
-                      {!harness.agentReady ? (
-                        <div className={MODEL_MORE_CLASS_NAME}>
-                          {harness.catalogPending
-                            ? m.onboarding_checking()
-                            : harness.agentNote
-                              ? renderNote(harness.agentNote)
-                              : m.model_picker_not_available()}
+                        </div>
+                      ) : harness.catalogPending ? (
+                        <div className={MODEL_GROUP_CLASS_NAME}>
+                          <span className="inline-flex items-center gap-1.5">
+                            <HarnessLogo harness={harness.id} logo={harness.logo} size={14} />
+                            {harness.name}
+                          </span>
+                          <span className="font-normal text-muted">{m.onboarding_checking()}</span>
                         </div>
                       ) : (
+                        <MenuItem type="button" className="font-medium" onClick={() => { close(); onOpenSettings(); }}>
+                          <span className="inline-flex min-w-0 items-center gap-1.5">
+                            <HarnessLogo harness={harness.id} logo={harness.logo} size={14} />
+                            {harness.name}
+                          </span>
+                          <span className="inline-flex items-center gap-1 font-normal text-accent-amber">
+                            <CircleAlert size={14} aria-hidden="true" className="shrink-0" />
+                            {!harness.installed ? m.settings_page_not_installed()
+                              : harness.installBroken ? m.settings_page_install_broken()
+                              : harness.needsConfigRepair || harness.authCheckFailed ? m.settings_page_unable_to_verify()
+                              : harness.authState === "needsLogin" ? m.model_picker_needs_login()
+                              : harness.authState === "unsupported" ? m.settings_page_update_required()
+                              : m.settings_page_unable_to_verify()}
+                          </span>
+                        </MenuItem>
+                      )}
+                      {harness.agentReady && (
                         <>
                           {!filter.trim() && harness.id !== "codex" && !(harness.id === "claude-code" && harness.models.length > 0) && !harness.id.startsWith("acp:") && (
                             <MenuItem
@@ -514,14 +604,14 @@ export function ModelPicker({
                             </Tooltip>
                           ))}
                           {legacy.length > 0 && (
-                            <Menu.Root>
+                            <Menu.Root open={legacyMenu === harness.id} onOpenChange={(open) => setLegacyMenu(open ? harness.id : null)}>
                               <Menu.Trigger openOnHover delay={200} closeDelay={300} className={cn(SETTINGS_ROW, "ps-6")}>
                                 <span>{m.model_picker_legacy()}</span>
                                 <ChevronRight size={14} aria-hidden="true" className="text-muted rtl:rotate-180" />
                               </Menu.Trigger>
-                              <Menu.Portal>
+                              <Menu.Portal container={portalContainer}>
                                 <Menu.Positioner side="right" align="start" sideOffset={4} collisionPadding={8} className="z-50">
-                                  <Menu.Popup onKeyDown={(event) => event.stopPropagation()} aria-label={m.model_picker_legacy()} className="max-h-80 overflow-y-auto rounded-lg border border-border bg-background p-1.5 shadow-dropdown outline-none">
+                                  <Menu.Popup onKeyDown={(event) => { if (event.key !== "Escape") event.stopPropagation(); }} aria-label={m.model_picker_legacy()} className="max-h-80 overflow-y-auto rounded-lg border border-border bg-background p-1.5 shadow-dropdown outline-none">
                                     {legacy.map((model) => (
                                       <Menu.Item key={model.id} className={SETTINGS_ROW} onClick={() => pick(harness, model.id)}>
                                         <span>{displayModel(harness, model)}</span>
@@ -549,14 +639,19 @@ export function ModelPicker({
                             )}
                         </>
                       )}
-                      {harness.id === "opencode" && (
+                      {harness.agentReady && harness.id === "opencode" && (
                         <MenuItem
                           type="button"
                           className="font-medium"
                           aria-haspopup="dialog"
                           onClick={() => {
                             close();
-                            setAddingLocalModel(true);
+                            showCustomDialog({
+                              component: LocalModelDialog,
+                              props: { onConnected: (model) => localModelConnected.current(model) },
+                              onConfirm: (connect) => connect(),
+                              onCancel: "close",
+                            });
                           }}
                         >
                           <span className="inline-flex items-center gap-1.5">
@@ -612,68 +707,58 @@ export function ModelPicker({
             </Popover.Positioner>
           </Popover.Portal>
         </Popover.Root>
-        {hasSettings && (
+        {(reasoningChoices.length > 0 || nativeOptions.length > 0 || fastChoice) && (
           <Menu.Root
-            open={menu === "settings"}
+            open={!disabled && menu === "effort"}
             modal={false}
-            onOpenChange={(open) =>
-              setMenu((current) => (open ? "settings" : current === "settings" ? null : current))
-            }
+            onOpenChange={(open) => setMenu((current) => (open ? "effort" : current === "effort" ? null : current))}
           >
             <Menu.Trigger
-              className="composer-pill inline-flex h-8 shrink-0 items-center gap-1 rounded-md px-2 text-sm text-muted transition-[background,color] duration-150 ease-standard hover:bg-surface"
-              aria-label={
-                reasoningLabel
-                  ? `${m.settings_page_settings()}: ${reasoningLabel}`
-                  : m.settings_page_settings()
-              }
+              disabled={disabled}
+              className={PILL}
+              aria-label={[
+                reasoningLabel ? `${m.model_picker_effort()}: ${reasoningLabel}` : m.model_picker_effort(),
+                effectiveServiceTier === "priority" ? m.model_picker_fast_mode() : null,
+              ].filter(Boolean).join(" · ")}
             >
-              {reasoningLabel ? <span>{reasoningLabel}</span> : <Settings size={14} aria-hidden="true" />}
-              <ChevronDown size={14} className="shrink-0" />
+              {effectiveServiceTier === "priority" && <Zap size={14} fill="currentColor" aria-hidden="true" className="shrink-0 text-accent-amber" />}
+              {reasoningLabel ? (
+                <>
+                  <EffortIcon id={effectiveReasoningId} />
+                  <span>{reasoningLabel}</span>
+                </>
+              ) : (
+                <Settings size={14} aria-hidden="true" />
+              )}
+              <ChevronDown size={14} className="shrink-0 text-muted" />
             </Menu.Trigger>
-            <Menu.Portal>
-              <Menu.Positioner
-                className="z-50"
-                side="top"
-                align="end"
-                sideOffset={8}
-                collisionPadding={8}
-                positionMethod="fixed"
-              >
-                <Menu.Popup
-                  aria-label={m.settings_page_settings()}
-                  className="model-settings-menu overflow-y-auto rounded-lg border border-border bg-background p-1 shadow-dropdown outline-none"
-                  style={{
-                    width: "min(288px, calc(100vw - 16px))",
-                    maxHeight: "min(400px, var(--available-height))",
-                  }}
-                >
-                  <Menu.RadioGroup
-                    value={effectiveReasoningId}
-                    onValueChange={(id) => {
-                      if (typeof id === "string") onSelectReasoning?.(id);
-                    }}
-                  >
-                    {reasoningChoices.map((choice) => (
-                      <Menu.RadioItem
-                        key={choice.id}
-                        value={choice.id}
-                        closeOnClick
-                        label={choice.label}
-                        className={SETTINGS_ROW}
+            <Menu.Portal container={portalContainer}>
+              <Menu.Positioner className="z-50" side="top" align="end" sideOffset={8} collisionPadding={8} positionMethod="fixed">
+                <Menu.Popup aria-label={m.model_picker_effort()} className={MENU_POPUP} style={{ width: "min(240px, calc(100vw - 16px))", maxHeight: "min(400px, var(--available-height))" }}>
+                  {effortChoices.length > 0 && (
+                    <Menu.Group>
+                      <Menu.GroupLabel className={MENU_LABEL}>{m.model_picker_effort()}</Menu.GroupLabel>
+                      <Menu.RadioGroup
+                        value={ultracode ? "xhigh" : effectiveReasoningId}
+                        onValueChange={(id) => {
+                          if (typeof id === "string") onSelectReasoning?.(id);
+                        }}
                       >
-                        <span>
-                          {choice.label}
-                          {choice.id === defaultReasoningId && (
-                            <span className="text-muted"> {m.model_picker_default()}</span>
-                          )}
-                        </span>
-                        <Menu.RadioItemIndicator>
-                          <Check size={14} />
-                        </Menu.RadioItemIndicator>
-                      </Menu.RadioItem>
-                    ))}
-                  </Menu.RadioGroup>
+                        {effortChoices.map((choice) => (
+                          <Menu.RadioItem key={choice.id} value={choice.id} closeOnClick label={choice.label} className={SETTINGS_ROW}>
+                            <span className="inline-flex items-center gap-2">
+                              <EffortIcon id={choice.id} />
+                              {choice.label}
+                              {choice.id === defaultReasoningId && choice.id !== REASONING_DEFAULT_ID && <span className="text-muted">{m.model_picker_default()}</span>}
+                            </span>
+                            <Menu.RadioItemIndicator>
+                              <Check size={14} />
+                            </Menu.RadioItemIndicator>
+                          </Menu.RadioItem>
+                        ))}
+                      </Menu.RadioGroup>
+                    </Menu.Group>
+                  )}
                   {nativeOptions.map((option) => (
                     <SettingsSubmenu
                       key={option.id}
@@ -684,67 +769,107 @@ export function ModelPicker({
                       onSelect={(id) => onSelectNativeOption?.(option.id, id)}
                     />
                   ))}
-                  {(reasoningChoices.length > 0 || nativeOptions.length > 0) &&
-                    (fastChoice || permissionChoices.length > 0 || onSelectAutonomy) && (
-                      <Menu.Separator className="m-1 h-px bg-border-variant" />
-                    )}
+                  {(ultracodeChoice || fastChoice) && (effortChoices.length > 0 || nativeOptions.length > 0) && (
+                    <Menu.Separator className="m-1 h-px bg-border-variant" />
+                  )}
+                  {ultracodeChoice && (
+                    <Tooltip interactive side="start" content={m.model_picker_ultracode_description()} className="flex w-full rounded-sm">
+                      <Menu.CheckboxItem
+                        className={SETTINGS_ROW}
+                        checked={ultracode}
+                        onCheckedChange={(checked) => onSelectReasoning?.(checked ? ULTRACODE : "xhigh")}
+                      >
+                        <span className="inline-flex items-center gap-2">
+                          <EffortIcon id={ULTRACODE} />
+                          {ultracodeChoice.label}
+                        </span>
+                        <SwitchIndicator checked={ultracode} aria-hidden="true" />
+                      </Menu.CheckboxItem>
+                    </Tooltip>
+                  )}
                   {fastChoice && (
                     <Menu.CheckboxItem
-                      className={cn(SETTINGS_ROW, "min-h-9")}
+                      className={SETTINGS_ROW}
                       checked={effectiveServiceTier === fastChoice.id}
                       onCheckedChange={(checked) => {
                         if (value) onSelect({ ...value, serviceTier: checked ? fastChoice.id : "default" });
                       }}
                     >
-                      <span>{m.model_picker_fast_mode()}</span>
+                      <span className="inline-flex items-center gap-2">
+                        <Zap size={14} aria-hidden="true" className="text-accent-amber" />
+                        {m.model_picker_fast_mode()}
+                      </span>
                       <SwitchIndicator checked={effectiveServiceTier === fastChoice.id} aria-hidden="true" />
                     </Menu.CheckboxItem>
-                  )}
-                  {fastChoice && (permissionChoices.length > 0 || onSelectAutonomy) && (
-                    <Menu.Separator className="m-1 h-px bg-border-variant" />
-                  )}
-                  {permissionChoices.length > 0 && (
-                    <SettingsSubmenu
-                      label={m.model_picker_permissions()}
-                      detail={permissionLabel}
-                      choices={permissionChoices}
-                      value={effectivePermissionId}
-                      defaultId={defaultPermissionId}
-                      onSelect={(id) => onSelectPermission?.(id)}
-                    />
-                  )}
-                  {onSelectAutonomy && (
-                    <SettingsSubmenu
-                      label={m.model_picker_autonomy()}
-                      detail={autonomyLabel}
-                      choices={autonomyChoices}
-                      value={autonomy ?? DEFAULT_AUTONOMY}
-                      defaultId={DEFAULT_AUTONOMY}
-                      onSelect={(id) => {
-                        const choice = autonomyChoices.find((entry) => entry.id === id);
-                        if (choice) onSelectAutonomy(choice.id);
-                      }}
-                    />
                   )}
                 </Menu.Popup>
               </Menu.Positioner>
             </Menu.Portal>
           </Menu.Root>
         )}
-        {addingLocalModel && (
-          <LocalModelSetup
-            dialogOnly
-            installed={harnesses.find((harness) => harness.id === "opencode")?.installed ?? false}
-            onClose={() => setAddingLocalModel(false)}
-            onConnected={(model) => {
-              const harness = queryClient
-                .getQueryData(getHarnessesQuery().queryKey)
-                ?.find((entry) => entry.id === "opencode");
-              if (harness && (!lockHarness || value?.harness === "opencode")) pick(harness, model);
-            }}
-          />
+        {(permissionChoices.length > 0 || onSelectAutonomy) && (
+          <Menu.Root
+            open={!disabled && menu === "permissions"}
+            modal={false}
+            onOpenChange={(open) => setMenu((current) => (open ? "permissions" : current === "permissions" ? null : current))}
+          >
+            <Tooltip interactive content={[permissionLabel, autonomyLabel].filter(Boolean).join(" · ")} className="rounded-md">
+              <Menu.Trigger
+                disabled={disabled}
+                className={PILL}
+                aria-label={`${m.model_picker_permissions()}: ${[permissionLabel, autonomyLabel].filter(Boolean).join(", ")}`}
+              >
+                <PermissionIcon id={effectivePermissionId} />
+                <ChevronDown size={14} className="shrink-0 text-muted" />
+              </Menu.Trigger>
+            </Tooltip>
+            <Menu.Portal container={portalContainer}>
+              <Menu.Positioner className="z-50" side="top" align="end" sideOffset={8} collisionPadding={8} positionMethod="fixed">
+                <Menu.Popup
+                  aria-label={m.model_picker_permissions()}
+                  className={MENU_POPUP}
+                  style={{ width: "min(320px, calc(100vw - 16px))", maxHeight: "min(560px, var(--available-height))" }}
+                >
+                  {permissionChoices.length > 0 && (
+                    <Menu.Group>
+                      <Menu.GroupLabel className={MENU_LABEL}>{m.model_picker_permissions()}</Menu.GroupLabel>
+                      <Menu.RadioGroup
+                        value={effectivePermissionId}
+                        onValueChange={(id) => {
+                          if (typeof id === "string") onSelectPermission?.(id);
+                        }}
+                      >
+                        {permissionChoices.map((choice) => (
+                          <DescribedRadioItem key={choice.id} choice={choice} icon={<PermissionIcon id={choice.id} />} isDefault={choice.id === defaultPermissionId} />
+                        ))}
+                      </Menu.RadioGroup>
+                    </Menu.Group>
+                  )}
+                  {permissionChoices.length > 0 && onSelectAutonomy && <Menu.Separator className="m-1 h-px bg-border-variant" />}
+                  {onSelectAutonomy && (
+                    <Menu.Group>
+                      <Menu.GroupLabel className={MENU_LABEL}>{m.model_picker_autonomy()}</Menu.GroupLabel>
+                      <Menu.RadioGroup
+                        value={autonomy ?? DEFAULT_AUTONOMY}
+                        onValueChange={(id) => {
+                          const choice = autonomyChoices.find((entry) => entry.id === id);
+                          if (choice) onSelectAutonomy(choice.id);
+                        }}
+                      >
+                        {autonomyChoices.map((choice) => (
+                          <DescribedRadioItem key={choice.id} choice={choice} icon={choice.icon} isDefault={choice.id === DEFAULT_AUTONOMY} />
+                        ))}
+                      </Menu.RadioGroup>
+                    </Menu.Group>
+                  )}
+                </Menu.Popup>
+              </Menu.Positioner>
+            </Menu.Portal>
+          </Menu.Root>
         )}
       </div>
+      <EscapeScope enabled={menu !== null} onEscape={close} />
+      <EscapeScope enabled={menu === "model" && legacyMenu !== null} onEscape={() => setLegacyMenu(null)} />
     </DirectionProvider>
   );
 }
@@ -1007,6 +1132,7 @@ export function OptionPicker({
           </div>
         </div>
       )}
+      <EscapeScope enabled={open} onEscape={() => { setOpen(false); buttonRef.current?.focus(); }} />
     </div>
   );
 }

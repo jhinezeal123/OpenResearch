@@ -1,3 +1,4 @@
+mod hold;
 pub(crate) mod logs;
 mod state;
 mod transport;
@@ -81,6 +82,7 @@ struct Broker {
     slurm: Mutex<HashMap<String, Arc<Mutex<SlurmCache>>>>,
     shutdown: tokio::sync::Notify,
     stopping: std::sync::atomic::AtomicBool,
+    held: hold::Registry,
 }
 
 fn private_directory(path: &Path) -> Result<()> {
@@ -107,33 +109,103 @@ fn private_directory(path: &Path) -> Result<()> {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
     #[cfg(windows)]
-    {
-        let script = r#"$ErrorActionPreference = 'Stop'
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$acl = Get-Acl -LiteralPath $env:ORX_PRIVATE_DIRECTORY
-$owner = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
-if ($owner -notin @($identity.User.Value, 'S-1-5-32-544', 'S-1-5-18')) { throw 'SSH service directory has a different owner' }
-$acl.SetAccessRuleProtection($true, $false)
-foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleAll($rule) }
-$rule = [Security.AccessControl.FileSystemAccessRule]::new($identity.User, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
-$acl.SetAccessRule($rule)
-Set-Acl -LiteralPath $env:ORX_PRIVATE_DIRECTORY -AclObject $acl
-"#;
-        let status = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-NonInteractive", "-Command", script])
-            .env("ORX_PRIVATE_DIRECTORY", path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !status.success() {
-            return Err(anyhow!(
-                "Could not verify and protect the private SSH service directory."
-            ));
-        }
+    if !protect_directory(path) {
+        return Err(anyhow!(
+            "Could not verify and protect the private SSH service directory."
+        ));
     }
     verified.insert(path.to_owned());
     Ok(())
+}
+
+/// Writes only the DACL: rewriting the SACL needs a privilege normal users lack.
+#[cfg(windows)]
+fn protect_directory(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+    use windows_sys::Win32::Security::Authorization::{
+        GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        AddAccessAllowedAceEx, EqualSid, GetTokenInformation, InitializeAcl, IsWellKnownSid,
+        TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid, ACL_REVISION,
+        CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    // Sized for the longest SID, 68 bytes: a TOKEN_USER with its SID, and an ACL with one ACE.
+    let mut user = [0u64; 16];
+    let mut acl = [0u32; 32];
+    let mut token = null_mut();
+    let mut owner = null_mut();
+    let mut descriptor = null_mut();
+    let mut written = 0;
+
+    // SAFETY: every buffer outlives its call and its length is passed with it. `owner` points
+    // into `descriptor`, read before LocalFree; `sid` points into `user`.
+    unsafe {
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let token = OwnedHandle::from_raw_handle(token);
+        if GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            user.as_mut_ptr().cast(),
+            size_of_val(&user) as u32,
+            &mut written,
+        ) == 0
+        {
+            return false;
+        }
+        let sid = (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid;
+
+        if GetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut descriptor,
+        ) != ERROR_SUCCESS
+        {
+            return false;
+        }
+        let trusted_owner = EqualSid(owner, sid) != 0
+            || IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0
+            || IsWellKnownSid(owner, WinLocalSystemSid) != 0;
+        LocalFree(descriptor);
+
+        trusted_owner
+            && InitializeAcl(
+                acl.as_mut_ptr().cast(),
+                size_of_val(&acl) as u32,
+                ACL_REVISION,
+            ) != 0
+            && AddAccessAllowedAceEx(
+                acl.as_mut_ptr().cast(),
+                ACL_REVISION,
+                CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE,
+                FILE_ALL_ACCESS,
+                sid,
+            ) != 0
+            && SetNamedSecurityInfoW(
+                path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                acl.as_ptr().cast(),
+                null(),
+            ) == ERROR_SUCCESS
+    }
 }
 
 fn endpoint() -> Result<Endpoint> {
@@ -150,6 +222,14 @@ async fn exchange(
     target: Option<SshTarget>,
     operation: Value,
 ) -> Result<Value> {
+    Ok(open(endpoint, target, operation).await?.1)
+}
+
+async fn open(
+    endpoint: &Endpoint,
+    target: Option<SshTarget>,
+    operation: Value,
+) -> Result<(TcpStream, Value)> {
     let mut stream = tokio::time::timeout(
         Duration::from_secs(2),
         TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, endpoint.port)),
@@ -169,9 +249,10 @@ async fn exchange(
     if let Some(error) = response.error {
         return Err(anyhow!(error));
     }
-    response
+    let value = response
         .value
-        .ok_or_else(|| anyhow!("Missing SSH service response"))
+        .ok_or_else(|| anyhow!("Missing SSH service response"))?;
+    Ok((stream, value))
 }
 
 async fn ensure() -> Result<Endpoint> {
@@ -224,15 +305,12 @@ async fn ensure() -> Result<Endpoint> {
         .and_then(|path| path.parent())
         .ok_or_else(|| anyhow!("Missing test binary directory"))?
         .join(format!("orx{}", std::env::consts::EXE_SUFFIX));
-    let mut command = std::process::Command::new(executable);
+    let mut command = crate::process::command(executable);
     command
         .arg("ssh-service")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    crate::local::shell_env::export_to(|key, value| {
-        command.env(key, value);
-    });
     command.env("ORX_DATA_DIR", crate::store::data_dir());
     #[cfg(unix)]
     {
@@ -264,24 +342,29 @@ async fn ensure() -> Result<Endpoint> {
     ))
 }
 
+pub(crate) async fn reset_existing_backoff(target: &SshTarget) -> Result<()> {
+    if !state::root().join("state.sqlite3").try_exists()? {
+        return Ok(());
+    }
+    let resolved = state::resolve(target).await?;
+    state::database()?.execute(
+        "UPDATE connections SET failures = 0, next_at = 0, last_error = NULL WHERE id = ?1",
+        [resolved.key],
+    )?;
+    Ok(())
+}
+
+/// Opens a stream to a login the service holds for the engine: after `hold_start` or
+/// `hold_attach`, it carries that login's orx-host traffic.
+#[cfg(windows)]
+pub(crate) async fn hold(operation: Value) -> Result<(TcpStream, Value)> {
+    open(&ensure().await?, None, operation).await
+}
+
 pub(crate) async fn request(target: &SshTarget, operation: Value) -> Result<Value> {
     let endpoint = ensure().await?;
     // A lost response may follow a successful mutation: never replay it here.
     exchange(&endpoint, Some(target.clone()), operation).await
-}
-
-pub(crate) async fn healthy(target: &SshTarget) -> bool {
-    let Ok(endpoint) = endpoint() else {
-        return false;
-    };
-    exchange(&endpoint, Some(target.clone()), json!({"op":"status"}))
-        .await
-        .is_ok_and(|value| value["connected"] == true)
-}
-
-pub(crate) async fn attach(target: &SshTarget) -> Result<()> {
-    request(target, json!({"op":"attach"})).await?;
-    Ok(())
 }
 
 pub(crate) async fn execute(
@@ -612,10 +695,9 @@ impl Broker {
                 .or_default()
                 .clone();
             let mut cache = cache.lock().await;
-            if cache
-                .sampled
-                .is_none_or(|sampled| sampled.elapsed() >= Duration::from_secs(5))
-                || cache.values.get(run).is_none()
+            if cache.sampled.is_none_or(|sampled| {
+                sampled.elapsed() >= crate::config::paced(Duration::from_secs(5))
+            }) || cache.values.get(run).is_none()
             {
                 let mut jobs = vec![json!({"run":run, "job":job, "dir":operation["dir"]})];
                 let active = crate::store::Store::open()?.list_active_runs()?;
@@ -703,8 +785,11 @@ pub(crate) async fn run() -> Result<()> {
         slurm: Mutex::new(HashMap::new()),
         shutdown: tokio::sync::Notify::new(),
         stopping: std::sync::atomic::AtomicBool::new(false),
+        held: Mutex::new(HashMap::new()),
         endpoint,
     });
+    let sweeper = broker.clone();
+    tokio::spawn(async move { hold::sweep(&sweeper.held).await });
     let limit = Arc::new(Semaphore::new(128));
     loop {
         let (mut stream, _) = tokio::select! {
@@ -727,6 +812,14 @@ pub(crate) async fn run() -> Result<()> {
             if request.token != broker.endpoint.token || request.version != VERSION {
                 return;
             }
+            // A held login's stream lasts as long as its server, so it must not count as busy.
+            if request.operation["op"]
+                .as_str()
+                .is_some_and(|op| op.starts_with("hold_"))
+            {
+                drop(_permit);
+                return hold::serve(&broker.held, &request.operation, stream).await;
+            }
             let idle_only = request.operation["op"] == "shutdown_if_idle";
             let shutting_down = idle_only || request.operation["op"] == "shutdown";
             let result = if shutting_down {
@@ -744,6 +837,7 @@ pub(crate) async fn run() -> Result<()> {
                     broker
                         .stopping
                         .store(true, std::sync::atomic::Ordering::SeqCst);
+                    broker.held.lock().await.clear();
                     let mut error = None;
                     for host in broker.hosts.lock().await.values() {
                         if let Some(session) = &host.lock().await.session {
@@ -915,5 +1009,34 @@ mod tests {
         .await;
         assert_eq!(result.unwrap(), "accepted");
         server.await.unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_directory_grants_only_the_current_user() {
+        let dir = crate::local::git::TemporaryDirectory::new("orx-private-directory").unwrap();
+        let path = dir.path().join("ssh service");
+        let aces = |path: &Path| {
+            let output = crate::process::command("icacls")
+                .arg(path)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+
+        private_directory(&path).unwrap();
+        // Each process protects the directory again, over the DACL the last one wrote.
+        assert!(protect_directory(&path));
+
+        let directory = aces(&path);
+        assert_eq!(directory.matches(":(").count(), 1, "{directory}");
+        assert!(directory.contains(":(OI)(CI)(F)"), "{directory}");
+
+        let child = path.join("child");
+        std::fs::write(&child, "").unwrap();
+        let child = aces(&child);
+        assert_eq!(child.matches(":(").count(), 1, "{child}");
+        assert!(child.contains(":(I)(F)"), "{child}");
     }
 }

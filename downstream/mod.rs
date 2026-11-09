@@ -13,6 +13,22 @@ pub(crate) fn compute_backend(id: &str) -> Option<Box<dyn crate::compute::Comput
         _ => None,
     }
 }
+/// Supervised submission for a downstream backend whose run row is already reserved.
+pub(crate) async fn submit_supervised(
+    id: &str,
+    args: &crate::ExpRunArgs,
+    source: crate::compute::SourceSnapshot,
+    run_id: String,
+) -> crate::error::Result<crate::store::StoredRun> {
+    match id {
+        "kaggle" => {
+            kaggle::compute::KaggleCompute
+                .submit(args, source, run_id)
+                .await
+        }
+        _ => Err(crate::error::anyhow!("Unknown compute backend '{id}'.")),
+    }
+}
 pub(crate) fn routes() -> axum::Router<crate::commands::up::AppState> {
     use axum::routing::{get, post};
     axum::Router::new()

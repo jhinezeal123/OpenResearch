@@ -1,7 +1,7 @@
 import {useEffect,useState} from "react";
 import {useQuery,queryOptions} from "@tanstack/react-query";
-import {getKaggleSettings,saveKaggleSettings,kagglePreflight,getSessions,getQuota,closeSession,recoverCookie,type KaggleConfig,type KaggleAccountQuota,type KaggleQuotaHours} from "./api";
-import {queryClient,workspaceKey,workspaceScope,isCurrentScope,setScopedQueryData,Button} from "../../bridge/ui";
+import {kaggleApi,type KaggleConfig,type KaggleAccountQuota,type KaggleQuotaHours} from "./api";
+import {useWorkspace,Button} from "../../bridge/ui";
 
 const hours=(seconds:number)=>`${(seconds/3600).toFixed(1)}h`;
 
@@ -29,6 +29,9 @@ function AccountQuota({quota,loading}:{quota?:KaggleAccountQuota;loading:boolean
 }
 
 export function KaggleSection(){
+  const workspace=useWorkspace();
+  const {queryClient,workspaceKey,workspaceScope,isCurrentScope,setScopedQueryData}=workspace;
+  const {getKaggleSettings,saveKaggleSettings,kagglePreflight,getSessions,getQuota,closeSession,recoverCookie}=kaggleApi(workspace.api);
   const options=queryOptions({queryKey:workspaceKey("getKaggleSettings"),queryFn:({signal})=>getKaggleSettings(signal)});
   const query=useQuery(options);
   const sessions=useQuery({queryKey:workspaceKey("kaggleSessions"),queryFn:({signal})=>getSessions(signal),enabled:query.data?.runtimeReady===true,refetchInterval:5000});

@@ -1,63 +1,45 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { registerHooks } from "node:module";
 import test from "node:test";
-import ts from "typescript";
 
-test("immediate unmount lets xterm initialize before disposal and removes only its own element", () => {
-  const timers = [];
-  const events = [];
-  const children = new Set();
-  const observers = [];
-  const wrap = {
-    style: { overflowY: "" },
-    addEventListener() {}, removeEventListener() {},
-  };
-  class Terminal {
-    constructor() {
-      this.element = { remove: () => children.delete(this.element) };
-      this.options = {};
-      this.disposed = false;
-    }
-    loadAddon() {}
-    open() {
-      children.add(this.element);
-      timers.push(() => {
-        assert.equal(this.disposed, false, "xterm's initial viewport callback needs its renderer");
-        events.push("initialized");
-      });
-    }
-    onWriteParsed() { return { dispose() {} }; }
-    onScroll() { return { dispose() {} }; }
-    dispose() { this.disposed = true; events.push("disposed"); }
+/** xterm 5.5's open() schedules a viewport initialization that fails once the terminal is disposed. */
+globalThis.XtermWithInitTimer = class {
+  static events = [];
+  options = {};
+  disposed = false;
+  loadAddon() {}
+  open(parent) {
+    this.element = parent.appendChild(document.createElement("div"));
+    setTimeout(() => XtermWithInitTimer.events.push(this.disposed ? "initialized after dispose" : "initialized"));
   }
-  class ResizeObserver {
-    constructor() { observers.push(this); }
-    observe() {}
-    disconnect() { this.disconnected = true; }
+  resize() {}
+  onWriteParsed() { return { dispose() {} }; }
+  onScroll() { return { dispose() {} }; }
+  dispose() {
+    this.disposed = true;
+    XtermWithInitTimer.events.push("disposed");
   }
-  const mocks = {
-    "@xterm/xterm": { Terminal },
-    "@xterm/addon-fit": { FitAddon: class { proposeDimensions() { return undefined; } } },
-    "@xterm/addon-web-links": {},
-  };
-  const source = readFileSync(new URL("../src/components/terminal.ts", import.meta.url), "utf8");
-  const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS } }).outputText;
-  const exports = {};
-  new Function("require", "exports", "document", "getComputedStyle", "ResizeObserver", "setTimeout", code)(
-    (name) => mocks[name], exports, { documentElement: {} }, () => ({ getPropertyValue: () => "" }),
-    ResizeObserver, (callback) => timers.push(callback),
-  );
+};
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier !== "@xterm/xterm") return nextResolve(specifier, context);
+    return { url: "data:text/javascript,export const Terminal = globalThis.XtermWithInitTimer;", shortCircuit: true };
+  },
+});
+const { mountTerminal } = await import("../src/components/terminal.ts");
 
-  const first = exports.mountTerminal(wrap, false);
+test("immediate unmount lets xterm initialize before disposal and removes only its own element", async () => {
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 10));
+  const wrap = document.body.appendChild(document.createElement("div"));
+  const first = mountTerminal(wrap, false);
   first.dispose();
-  const second = exports.mountTerminal(wrap, false);
-  assert.deepEqual([...children], [second.terminal.element]);
-  assert.equal(observers[0].disconnected, true);
-  while (timers.length) timers.shift()();
-  assert.deepEqual(events, ["initialized", "disposed", "initialized"]);
-  assert.equal(second.terminal.disposed, false);
+  const second = mountTerminal(wrap, false);
+  assert.deepEqual([...wrap.children], [second.terminal.element]);
+  await tick();
+  assert.deepEqual(XtermWithInitTimer.events, ["initialized", "disposed", "initialized"]);
+
   second.dispose();
-  while (timers.length) timers.shift()();
-  assert.equal(children.size, 0);
+  await tick();
+  assert.equal(wrap.children.length, 0);
   assert.equal(second.terminal.disposed, true);
 });

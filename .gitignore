@@ -11,9 +11,8 @@ Claude.local.md
 # entry, which breaks `git checkout --recurse-submodules` in CI.
 .claude/worktrees/
 
-# Keep local skills private.
-.claude/skills/
-.agents/skills/
+# Repo skills live in .agents/skills; `pnpm install` in ui/ links Claude Code's copy.
+.claude/skills
 .cursor/skills/
 
 # Stray SQLite store if the binary is ever run from the repo root
@@ -23,3 +22,13 @@ Claude.local.md
 
 # This repo uses pnpm; ignore an accidental npm lockfile
 ui/package-lock.json
+
+# Per-worktree dev data, binaries, and states (dev.ts).
+/.dev/
+/.shots/
+
+# e2e harness dependencies and outputs.
+/e2e/node_modules/
+/e2e/.out/
+/e2e/playwright-report/
+/e2e/test-results/

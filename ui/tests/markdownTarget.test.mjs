@@ -57,6 +57,22 @@ test("markdown paths decode percent-encoded reserved filename characters once", 
   });
 });
 
+test("markdown link paths keep a percent that Markdown left literal", () => {
+  const processor = unified().use(remarkParse).use(remarkRehype);
+  const linked = (target) => {
+    const href = processor.runSync(processor.parse(`[x](${target})`)).children[0].children[0].properties.href;
+    return resolveMarkdownTarget("notes", href)?.path ?? null;
+  };
+  assert.equal(linked("数据.md"), "notes/数据.md");
+  assert.equal(linked("50%off.md"), "notes/50%off.md");
+  assert.equal(linked("50%off-数据.md"), "notes/50%off-数据.md");
+  assert.equal(linked("a%20b.md"), "notes/a b.md");
+  assert.equal(linked("50%.md"), "notes/50%.md");
+  // Two hex digits after `%` read as an escape, so these never name a literal `%ab` or `%E6` file.
+  assert.equal(linked("50%E6%95%B0.md"), "notes/50数.md");
+  assert.equal(linked("50%ab.md"), null);
+});
+
 test("re-resolved markdown paths are decoded only once", () => {
   for (const name of ["chart#1.png", "chart%231.png", "a?b&c:d.png", "100%.png", "my figs/a b.png"]) {
     assert.equal(resolveMarkdownTarget("", encodeMarkdownPath(name))?.path, name);
@@ -68,6 +84,20 @@ test("re-resolved markdown paths are decoded only once", () => {
   assert.equal(citedFilePath("%E0%A4%A"), null);
   const figure = chatImageTarget("figures/chart%231.png");
   assert.equal(docLink(encodeMarkdownPath(figure.path)), "docs/figures/chart#1.png");
+});
+
+test("chat file links decode reserved filename characters without a resolver", () => {
+  for (const [target, filename] of [
+    ["chart%231.png", "chart#1.png"],
+    ["chart%3F1.png", "chart?1.png"],
+    ["chart%26draft.png", "chart&draft.png"],
+    ["chart%3A42.py", "chart:42.py"],
+    ["chart%25231.png", "chart%231.png"],
+  ]) {
+    assert.equal(citedFilePath(target), filename);
+  }
+  assert.equal(citedFilePath("bad%escape.png"), null);
+  assert.equal(citedFilePath("%00.png"), null);
 });
 
 test("document assets resolve relative to the decoded document path once", () => {

@@ -50,7 +50,10 @@ pub(crate) async fn run(
         .create(true)
         .write(true)
         .truncate(false)
-        .open(crate::downstream::bridge::store::log_path(&run_id))?;
+        .open(crate::downstream::bridge::store::log_path(
+            &crate::downstream::bridge::store::data_dir(),
+            &run_id,
+        ))?;
     loop {
         let cancelled = local_cancel_requested(&store, &run_id);
         let action = next_action(acquired, launched, cancelled);

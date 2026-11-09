@@ -15,6 +15,9 @@ pub struct Rental {
     pub api_url: String,
     pub sandbox_id: String,
     pub token: String,
+    /// Fields a newer orx wrote, kept so an older supervisor's rewrite doesn't drop them.
+    #[serde(flatten)]
+    pub unknown: serde_json::Map<String, serde_json::Value>,
 }
 
 impl std::fmt::Debug for Rental {
@@ -55,13 +58,21 @@ impl Rental {
                 if let Err(error) = rental.operation("heartbeat").await {
                     eprintln!("rental heartbeat unavailable: {error}");
                 }
-                tokio::time::sleep(HEARTBEAT).await;
+                tokio::time::sleep(crate::config::paced(HEARTBEAT)).await;
             }
         }))
     }
 }
 
 pub struct Heartbeat(tokio::task::JoinHandle<()>);
+impl Heartbeat {
+    pub(crate) fn bounded(self, duration: Duration) -> Self {
+        Self(tokio::spawn(async move {
+            let _heartbeat = self;
+            tokio::time::sleep(duration).await;
+        }))
+    }
+}
 impl Drop for Heartbeat {
     fn drop(&mut self) {
         self.0.abort();
@@ -112,7 +123,7 @@ async fn supervise_with_collection_grace(config: &Path, collection_grace: Durati
     let code = if directory.join("cancel_requested").exists() {
         143
     } else {
-        let mut child = tokio::process::Command::new("bash")
+        let mut child = crate::process::tokio_command("bash")
             .arg(directory.join("payload.sh"))
             .current_dir(&directory)
             .stdin(std::process::Stdio::null())
@@ -152,6 +163,10 @@ pub async fn supervise(_config: &Path) -> Result<()> {
     ))
 }
 
+// Some hosts ship a ~/.config the login user cannot write; installers and orx need one.
+const WRITABLE_CONFIG_HOME: &str = "c=\"${XDG_CONFIG_HOME:-$HOME/.config}\"; \
+     { mkdir -p \"$c\" && [ -w \"$c\" ] && [ -x \"$c\" ]; } 2>/dev/null || export XDG_CONFIG_HOME=\"$HOME/.orx/config\"; ";
+
 fn remote_bash_command(script: &str) -> String {
     crate::commands::up_remote::remote_login_orx_cmd(&format!(
         "bash -c {}",
@@ -161,19 +176,23 @@ fn remote_bash_command(script: &str) -> String {
 
 fn remote_supervisor_command(binary: &str, directory: &str) -> String {
     use super::ssh::sh_quote;
-    // An asynchronous `cd && nohup` list keeps the SSH output pipes open.
-    format!(
-        "cd {} || exit; nohup {} rental-supervise {} </dev/null > supervisor.log 2>&1 &",
-        sh_quote(directory),
+    let launch = sh_quote(&format!(
+        "nohup {} rental-supervise {} </dev/null > supervisor.log 2>&1 &",
         sh_quote(binary),
         sh_quote(&format!("{directory}/rental.json"))
+    ));
+    // The foreground launcher establishes a session before Exec cleans up its original group.
+    format!(
+        "{WRITABLE_CONFIG_HOME}cd {} || exit; if command -v setsid >/dev/null 2>&1; then setsid /bin/sh -c {launch}; \
+         else python3 -c 'import os,sys; os.setsid(); os.execl(\"/bin/sh\", \"sh\", \"-c\", sys.argv[1])' {launch}; fi; exit $?",
+        sh_quote(directory),
     )
 }
 
-fn cancel_probe_script(directory: &str) -> String {
+fn cancel_probe_script(directory: &str, attempts: u32) -> String {
     format!(
         "d=\"$HOME/{directory}\"; umask 077; mkdir -p \"$d\"; touch \"$d/cancel_requested\"; \
-         for ((i=0;i<40;i++)); do \
+         for ((i=0;i<{attempts};i++)); do \
          if [ -f \"$d/exit_code\" ]; then echo EXIT; exit 0; fi; \
          if [ -f \"$d/pid\" ]; then echo PID; exit 0; fi; sleep 0.25; done; \
          echo 'Waiting for remote supervisor to acknowledge cancellation' >&2; exit 1"
@@ -182,7 +201,7 @@ fn cancel_probe_script(directory: &str) -> String {
 
 pub async fn cancel(target: &super::ssh::SshTarget, directory: &str) -> Result<()> {
     use super::ssh::{sh_quote, ssh_run};
-    let script = cancel_probe_script(directory);
+    let script = cancel_probe_script(directory, 40);
     let state = ssh_run(target, &format!("bash -c {}", sh_quote(&script)), None).await?;
     match state.trim() {
         "EXIT" => Ok(()),
@@ -202,7 +221,7 @@ pub async fn launch(
     let directory = super::openresearch::run_dir(run_id);
     let installer = crate::commands::up_remote::remote_installer(env!("CARGO_PKG_VERSION"));
     let install = format!(
-        "set -eo pipefail; touch \"$HOME/.no_auto_tmux\"; \
+        "set -eo pipefail; {WRITABLE_CONFIG_HOME}touch \"$HOME/.no_auto_tmux\"; \
          if ! command -v uv >/dev/null; then \
          curl --proto '=https' --tlsv1.2 -LsSf https://astral.sh/uv/0.8.22/install.sh | env UV_NO_MODIFY_PATH=1 sh; fi; \
          if ! command -v orx >/dev/null || ! orx rental-supervise --help >/dev/null 2>&1; then {installer}; fi; command -v orx"
@@ -245,40 +264,106 @@ pub async fn launch(
 mod tests {
     use super::*;
     #[cfg(unix)]
-    #[tokio::test]
-    async fn remote_launch_returns_without_waiting_for_the_supervisor() {
+    #[test]
+    fn remote_launch_survives_exec_cleanup_without_waiting_for_the_supervisor() {
+        use std::os::unix::fs::PermissionsExt;
+
         let temp = crate::local::git::TemporaryDirectory::new("orx-rental-detach").unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let python = crate::local::shell_env::find("python3").unwrap();
+        std::os::unix::fs::symlink(python, bin.join("python3")).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/nohup", bin.join("nohup")).unwrap();
+        let setsid = bin.join("setsid");
         std::fs::write(
-            temp.path().join("rental-supervise"),
-            "touch started; sleep 2\n",
-        )
-        .unwrap();
-        let command = remote_supervisor_command("/bin/sh", temp.path().to_str().unwrap());
-        let output = tokio::time::timeout(
-            Duration::from_secs(1),
-            tokio::process::Command::new("/bin/sh")
-                .args(["-c", &command])
-                .output(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(output.status.success());
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !temp.path().join("started").exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            &setsid,
+            "#!/bin/sh\nexec python3 -c 'import os,sys; os.setsid(); os.execv(sys.argv[1],sys.argv[1:])' \"$@\"\n",
+        ).unwrap();
+        std::fs::set_permissions(&setsid, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        for utility in [true, false] {
+            if !utility {
+                std::fs::remove_file(&setsid).unwrap();
             }
-        })
-        .await
-        .unwrap();
+            let dir = temp.path().join(if utility {
+                "with setsid"
+            } else {
+                "without setsid"
+            });
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(
+                dir.join("rental-supervise"),
+                "read -r value < \"$1\"; /bin/sleep 0.2; printf '%s' \"$value\" > survived\n",
+            )
+            .unwrap();
+            std::fs::write(dir.join("rental.json"), "detached\n").unwrap();
+
+            let command = remote_supervisor_command("/bin/sh", dir.to_str().unwrap());
+            let result = orx_host::exec::run(
+                crate::process::command("/bin/sh")
+                    .args(["-c", &command])
+                    .env("PATH", &bin),
+                &[],
+                Duration::from_secs(2),
+                None,
+            )
+            .unwrap();
+            assert_eq!(result.code, Some(0), "{result:?}");
+            assert!(!result.timed_out, "{result:?}");
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::fs::read_to_string(dir.join("survived"))
+                .ok()
+                .as_deref()
+                != Some("detached")
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "setsid available: {utility}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_config_home_falls_back_under_the_run_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = crate::local::git::TemporaryDirectory::new("orx-rental-config").unwrap();
+        let config_home = |home: &Path| {
+            let output = crate::process::command("/bin/sh")
+                .args([
+                    "-c",
+                    &format!("{WRITABLE_CONFIG_HOME}printf '%s' \"$XDG_CONFIG_HOME\""),
+                ])
+                .env("HOME", home)
+                .env_remove("XDG_CONFIG_HOME")
+                .output()
+                .unwrap();
+            String::from_utf8(output.stdout).unwrap()
+        };
+        assert_eq!(config_home(home.path()), "");
+        let config = home.path().join(".config");
+        for mode in [0o555, 0o600] {
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(mode)).unwrap();
+            // Root can write anywhere, so the fallback is only observable for other users.
+            if std::fs::write(config.join("probe"), "").is_err() {
+                assert_eq!(
+                    config_home(home.path()),
+                    format!("{}/.orx/config", home.path().display())
+                );
+            }
+        }
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn cancellation_waits_for_a_pid_or_terminal_acknowledgment() {
         let temp = crate::local::git::TemporaryDirectory::new("orx-rental-cancel").unwrap();
         let invoke = || {
-            std::process::Command::new("bash")
-                .args(["-c", &cancel_probe_script("run")])
+            crate::process::command("bash")
+                .args(["-c", &cancel_probe_script("run", 1)])
                 .env("HOME", temp.path())
                 .output()
                 .unwrap()
@@ -297,7 +382,7 @@ mod tests {
     fn rental_bootstrap_runs_bash_syntax_through_the_posix_login_shell() {
         let home = crate::local::git::TemporaryDirectory::new("orx-rental-shell").unwrap();
         let script = remote_bash_command("values=(first second); printf '%s' \"${values[1]}\"");
-        let output = std::process::Command::new("/bin/sh")
+        let output = crate::process::command("/bin/sh")
             .args(["-c", &script])
             .env("HOME", home.path())
             .env("SHELL", "/bin/sh")
@@ -318,6 +403,7 @@ mod tests {
             api_url: "https://example.invalid".into(),
             sandbox_id: "rental".into(),
             token: "secret".into(),
+            unknown: Default::default(),
         };
         assert!(!format!("{rental:?}").contains("secret"));
         assert_eq!(HEARTBEAT.as_secs(), 30);
@@ -385,6 +471,7 @@ mod tests {
                         api_url: format!("http://{addr}"),
                         sandbox_id: "rental".into(),
                         token: "capability".into(),
+                        unknown: Default::default(),
                     },
                 })
                 .unwrap(),

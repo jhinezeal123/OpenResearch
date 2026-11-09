@@ -1,148 +1,54 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
-import ts from "typescript";
-import { resolveHarnessDefaultModel } from "../src/modelSelection.ts";
-import { composerStashContent, EMPTY_COMPOSER_STASH } from "../src/composerStash.ts";
+import { act } from "react";
+import { m } from "../src/paraglide/messages.js";
+import { codex, composer, renderChat, session } from "./chat.mjs";
+import { settle } from "./render.mjs";
 
-const file = ts.createSourceFile("ChatPanel.tsx", readFileSync(new URL("../src/components/ChatPanel.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-let declaration;
-function visit(node) {
-  if (ts.isFunctionDeclaration(node) && node.name?.text === "startHarness") declaration = node;
-  ts.forEachChild(node, visit);
-}
-visit(file);
-assert.ok(declaration);
-const js = ts.transpileModule(`${declaration.getText(file)}\nreturn startHarness;`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+const claude = {
+  ...codex, id: "claude-code", name: "Claude Code", models: [{ id: "opus", displayName: "Opus 5.5" }],
+  options: { permissionModes: [{ id: "auto", label: "Auto" }], defaultPermissionMode: "auto", planActivation: "permission", reasoningLevels: [] },
+};
+const sideTab = (sessionId) => `?pane=${encodeURIComponent(JSON.stringify({ kind: "side", sessionId }))}`;
+const sessions = () => [session("s"), session("side", { sideParentSessionId: "s" }), session("other")];
 
-test("switching harness opens an uncreated draft with the selected harness", () => {
-  const calls = [];
-  const bindings = {
-    resolveHarnessDefaultModel,
-    reconcileServiceTier: () => null, reconcileReasoning: () => "medium",
-    projectId: "project", onStartHarnessDraft: undefined,
-    setSelection: (selection) => calls.push(["selection", selection]),
-    onPreferredAgentChange: (selection) => { calls.push(["preference", selection]); return Promise.resolve(); },
-    onActiveSessionChangeRef: { current: (id, options) => calls.push(["navigate", id, options]) },
-  };
-  const start = new Function(...Object.keys(bindings), js)(...Object.values(bindings));
-  start({ id: "codex", agentReady: true, models: [{ id: "gpt-6.10-sol" }], options: { defaultPermissionMode: "auto" } });
-  const selection = { harness: "codex", model: "gpt-6.10-sol", serviceTier: null, permissionMode: "auto", reasoningLevel: "medium" };
-  assert.deepEqual(calls, [["selection", selection], ["preference", selection], ["navigate", null, { projectId: "project" }]]);
+test("picking another harness on a busy chat opens an uncreated draft with it", async () => {
+  const chat = await renderChat("/projects/p/tasks/s", { sessions: [session("s", { busy: true })], harnesses: [codex, claude] });
+  await act(async () => document.querySelector('[data-onboarding="model-picker"] button').click());
+  await act(async () => [...document.querySelectorAll(`button[aria-description="${m.model_picker_new_chat_harness()}"]`)].find((item) => item.textContent.includes("Claude Code")).click());
+  await settle();
+  assert.equal(location.pathname, "/projects/p/tasks/new");
+  const preference = chat.requests.filter(({ request, body }) => request === "POST /api/settings/ui-state" && body.preferredAgent).at(-1).body.preferredAgent;
+  assert.deepEqual(preference, { harness: "claude-code", model: "opus", serviceTier: null, permissionMode: "auto", reasoningLevel: "default" });
+  assert.match(document.querySelector('[data-onboarding="model-picker"] button').getAttribute("aria-label"), /Opus 5\.5/);
 });
 
-test("a side composer restores its draft and attachments after unmount", () => {
-  let effect;
-  function findEffect(node) {
-    if (ts.isCallExpression(node) && node.expression.getText(file) === "useLayoutEffect"
-      && node.getText(file).includes("composerStashes.get(stashKey)")) effect = node;
-    ts.forEachChild(node, findEffect);
-  }
-  findEffect(file);
-  assert.ok(effect);
-  const mount = ts.transpileModule(effect.getText(file), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
-  const stashes = new Map();
-  const live = { current: EMPTY_COMPOSER_STASH };
-  let cleanup;
-  let restored;
-  const bindings = {
-    useLayoutEffect: (callback) => { cleanup = callback(); }, composerStashes: stashes,
-    stashKey: "side:session", composerPrefill: null, composerLiveRef: live, pendingClientTurn: { current: null }, pendingScope: { current: null },
-    EMPTY_COMPOSER_STASH, composerStashContent,
-    mountedComposers: new Map(), deletedSessionIds: new Set(), activeId: "session", sideParentSessionId: null,
-    isCurrentScope: () => true, sessionsOptions: { queryKey: [] },
-    setDraft: (draft) => { restored = { ...restored, draft }; },
-    setAttachments: (attachments) => { restored = { ...restored, attachments }; },
-    setAnnotations: (annotations) => { restored = { ...restored, annotations }; },
-    setUnconfirmedSend: (unconfirmedSend) => { restored = { ...restored, unconfirmedSend }; },
-    setImageRefusedFor: () => {},
-  };
-  const run = () => new Function(...Object.keys(bindings), mount)(...Object.values(bindings));
-  run();
-  live.current = { draft: "unsent", attachments: [{ dataUrl: "data:,image" }], annotations: [], unconfirmedSend: null };
-  cleanup();
-  run();
-  assert.deepEqual(restored, { draft: "unsent", attachments: [{ dataUrl: "data:,image" }], annotations: [], unconfirmedSend: null });
+test("a side composer restores its draft and attachments after unmount", async () => {
+  const chat = await renderChat(`/projects/p/tasks/s${sideTab("side")}`, { sessions: sessions() });
+  await composer(1).type("unsent");
+  await composer(1).attach();
+  const draft = composer(1).draft;
+  await chat.navigate("/projects");
+  await chat.navigate(`/projects/p/tasks/s${sideTab("side")}`);
+  assert.equal(composer(1).draft, draft);
+  assert.equal(composer(1).attachments, 1);
 });
 
-test("workspace changes clear old stashes and late panel cleanups cannot restore them", () => {
-  const registration = file.statements.find((node) => ts.isExpressionStatement(node)
-    && node.getText(file).startsWith("subscribeWorkspace("));
-  assert.ok(registration);
-  let workspaceChanged;
-  const stashes = new Map();
-  new Function("subscribeWorkspace", "composerStashes", registration.getText(file))(
-    (callback) => { workspaceChanged = callback; }, stashes,
-  );
-  let effect;
-  function visit(node) {
-    if (ts.isCallExpression(node) && node.expression.getText(file) === "useLayoutEffect"
-      && node.getText(file).includes("composerStashes.get(stashKey)")) effect = node;
-    ts.forEachChild(node, visit);
-  }
-  visit(file);
-  assert.ok(effect);
-  const code = ts.transpileModule(effect.getText(file), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
-  let generation = 1;
-  const mount = (key, value) => {
-    let cleanup;
-    const live = { current: EMPTY_COMPOSER_STASH };
-    const bindings = {
-      useLayoutEffect: (callback) => { cleanup = callback(); }, composerStashes: stashes,
-      stashKey: `${generation}:${key}`, composerPrefill: null, composerLiveRef: live, pendingClientTurn: { current: null }, pendingScope: { current: null },
-      EMPTY_COMPOSER_STASH, composerStashContent,
-      mountedComposers: new Map(), deletedSessionIds: new Set(), activeId: key, sideParentSessionId: null,
-      isCurrentScope: (scope) => scope[1] === generation, sessionsOptions: { queryKey: ["workspace", generation] },
-      setDraft: () => {}, setAttachments: () => {}, setAnnotations: () => {}, setUnconfirmedSend: () => {}, setImageRefusedFor: () => {},
-    };
-    new Function(...Object.keys(bindings), code)(...Object.values(bindings));
-    live.current = value;
-    return () => cleanup();
-  };
-  const main = { draft: "main", attachments: [{ dataUrl: "data:,main" }], annotations: [] };
-  const side = { draft: "side", attachments: [{ dataUrl: "data:,side" }], annotations: [] };
-  mount("main", main)();
-  mount("side", side)();
-  assert.deepEqual([...stashes.values()], [main, side]);
-  const lateMain = mount("main", main);
-  const lateSide = mount("side", side);
-  generation = 2;
-  workspaceChanged();
-  lateMain();
-  lateSide();
-  assert.equal(stashes.size, 0);
-  mount("main", main)();
-  mount("side", side)();
-  assert.deepEqual([...stashes.values()], [main, side]);
-});
+test("a new workspace starts with empty composers, and late panel cleanups cannot restore old drafts", async () => {
+  const chat = await renderChat(`/projects/p/tasks/s${sideTab("side")}`, { sessions: sessions(), remote: true });
+  await composer(0).type("main");
+  await composer(1).type("side");
+  await chat.navigate("/projects/p/tasks/other");
+  await chat.navigate(`/projects/p/tasks/s${sideTab("side")}`);
+  assert.deepEqual([composer(0).draft, composer(1).draft], ["main", "side"]);
 
-test("a file read finishing after a workspace change cannot update or recreate a stash", () => {
-  let addFiles;
-  function visit(node) {
-    if (ts.isFunctionDeclaration(node) && node.name?.text === "addFiles") addFiles = node;
-    ts.forEachChild(node, visit);
-  }
-  visit(file);
-  assert.ok(addFiles);
-  const code = ts.transpileModule(`${addFiles.getText(file)}\nreturn addFiles;`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
-  let reader;
-  let generation = 1;
-  let updates = 0;
-  const stashes = new Map();
-  const bindings = {
-    FileReader: class { constructor() { reader = this; this.result = "data:,image"; } readAsDataURL() {} },
-    attachments: [], noImageInputError: null, selectedModel: null,
-    setAttachError: () => {}, setImageRefusedFor: () => {}, setAttachments: () => { updates++; },
-    composerScopeRef: { current: { projectId: "p", activeId: "s" } }, composerMountedRef: { current: true },
-    stashKey: "1:side:s", composerStashes: stashes, EMPTY_COMPOSER_STASH,
-    sessionsOptions: { queryKey: ["workspace", 1] }, isCurrentScope: (scope) => scope[1] === generation,
-  };
-  const add = new Function(...Object.keys(bindings), code)(...Object.values(bindings));
-  add([{ type: "image/png", name: "image.png", size: 1 }]);
-  generation = 2;
-  reader.onload();
-  bindings.composerMountedRef.current = false;
-  reader.onload();
-  assert.equal(updates, 0);
-  assert.equal(stashes.size, 0);
+  await chat.reconnect();
+  await chat.navigate(`/projects/p/tasks/s${sideTab("side")}`);
+  assert.deepEqual([composer(0).draft, composer(1).draft], ["", ""]);
+
+  await composer(0).type("main");
+  await composer(1).type("side");
+  await chat.navigate("/projects/p/tasks/other");
+  await chat.navigate(`/projects/p/tasks/s${sideTab("side")}`);
+  assert.deepEqual([composer(0).draft, composer(1).draft], ["main", "side"]);
 });
