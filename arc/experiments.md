@@ -63,6 +63,7 @@ A default flavor applies only to its own backend and never leaks onto an explici
 
 A run has two independent fields.
 
+- **Queue detail** explains a backend wait without changing phase or contact. It is stored as optional `queueDetail` in the run descriptor, reaches the dashboard and CLI, and clears when the run starts, ends or loses contact.
 - **Phase** is the lifecycle: submitting, starting, running, done, failed, cancelled or lost.
 - **Contact** is how fresh that knowledge is: live, unreachable, needs auth (SSH Connect or provider credentials), unreconciled (an outcome the engine cannot establish) or stopping (a cancelled run with processes left).
 

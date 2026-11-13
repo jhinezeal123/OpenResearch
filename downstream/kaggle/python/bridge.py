@@ -68,6 +68,22 @@ def control(session, action, sid, account, state_root):
     return result
 
 
+def progress(row):
+    if row['state']!='provisioning': return {}
+    checked=row.get('provider_checked_at')
+    if checked is not None and time.time()-checked>90:
+        return {'error':'Kaggle notebook status has not been checked for over 90 seconds. The same notebook remains reserved.'}
+    if row.get('provider_error'): return {'error':row['provider_error']}
+    status=row.get('provider_status')
+    if status=='queued':
+        return {'detail':'Queued on Kaggle. Waiting for Kaggle to start the notebook; do not submit another notebook.'}
+    if status=='running':
+        return {'detail':'Kaggle has started the notebook. Waiting for its SSH connection.'}
+    if status:
+        return {'detail':'Kaggle notebook status: '+status+'. Waiting for its SSH connection.'}
+    return {'detail':'Checking whether Kaggle has queued or started the notebook.'}
+
+
 def configure(request):
     import os,socket
     home=Path(request.get('home') or Path(request['stateRoot']).parent).resolve()
@@ -173,7 +189,7 @@ def dispatch(request):
     if action=='sessions':
         for row in pool.reconcile(): ensure_worker(session,pool,row,request)
         rows=pool.list()
-        return {'sessions':[{k:v for k,v in r.items() if k not in ('spec',)} for r in rows]}
+        return {'sessions':[{**{k:v for k,v in r.items() if k not in ('spec',)},**progress(r)} for r in rows]}
     if action=='close-session':
         row=pool.get(request['sessionId']);pool.close(row['id']);ensure_worker(session,pool,row,request)
         return {'closing':True}
@@ -239,8 +255,11 @@ def dispatch(request):
     if action=='acquire':
         pool.touch(row['id'],request['runId'])
         try: health=contact(folder,{'action':'health'},timeout=3)
-        except (OSError,ValueError): return {'pending':True,'sessionId':row['id'],'account':row['account']}
-        return {**health,'sessionId':row['id'],'account':row['account'],'deadline':row['deadline']}
+        except (OSError,ValueError) as error:
+            return {'pending':True,'sessionId':row['id'],'account':row['account'],
+                    'error':'Could not contact the local Kaggle notebook worker: '+str(error)}
+        health={k:v for k,v in health.items() if k!='error' or v is not None}
+        return {**progress(pool.get(row['id'])),**health,'sessionId':row['id'],'account':row['account'],'deadline':row['deadline']}
     if action=='release':
         # A supervisor can time out or restart while its remote process lives.
         # Never make the notebook reusable on the strength of local state alone.

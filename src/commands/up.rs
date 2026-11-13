@@ -1176,6 +1176,8 @@ struct ApiRun {
     exit_code: Option<i64>,
     contact: Option<crate::store::Contact>,
     cancelling: bool,
+    #[serde(default)]
+    queue_detail: Option<String>,
     cancel_unconfirmed: Option<Vec<u32>>,
     lost_reason: Option<String>,
     host: Option<String>,
@@ -1212,12 +1214,18 @@ impl ApiRun {
             .is_some_and(|state| state.cancel_accepted_at.is_some());
         let launch = state.as_ref().and_then(|state| state.launch.as_ref());
         let collection = store.log_collection(&run.id)?;
+        let backend = crate::store::public_backend(&run.backend_json, launch);
+        let queue_detail = backend
+            .as_ref()
+            .and_then(|backend| backend["queueDetail"].as_str())
+            .map(str::to_owned);
         Ok(Self {
             id: run.id.clone(),
             experiment_id: run.experiment_id.clone(),
             project_id: run.project_id.clone(),
             status: run.status.clone(),
-            backend: crate::store::public_backend(&run.backend_json, launch),
+            backend,
+            queue_detail,
             command: Some(run.command.clone()).filter(|c| !c.is_empty()),
             commit_sha: run.commit_sha.clone(),
             result_markdown: run.result_markdown.clone(),
@@ -10802,6 +10810,15 @@ mod tests {
         let legacy = serde_json::to_value(&run).unwrap();
         assert!(!legacy.to_string().contains("private-rental-token"));
         assert!(run.backend_json.contains("private-rental-token"));
+        assert!(value["queueDetail"].is_null());
+        let mut queued = run.clone();
+        queued.status = "starting".into();
+        queued.cancel_requested = false;
+        queued.backend_json =
+            json!({"kind":"kaggle_job", "queueDetail":"Queued on Kaggle"}).to_string();
+        let waiting = serde_json::to_value(ApiRun::new(&store, &queued).unwrap()).unwrap();
+        assert_eq!(waiting["status"], "starting");
+        assert_eq!(waiting["queueDetail"], "Queued on Kaggle");
 
         // An engine run shows what it launched, its reachability, and an accepted cancel.
         let metadata = crate::jobs::BackendDescriptor::parse(r#"{"kind":"engine"}"#).unwrap();

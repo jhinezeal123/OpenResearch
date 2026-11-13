@@ -197,9 +197,6 @@ impl LocalPlane {
                         if backend.job_id.is_some() {
                             println!("  {}", crate::local::slurm::status_resources(&backend));
                         }
-                        if let Some(error) = backend.monitoring_error.as_deref() {
-                            println!("  {error}");
-                        }
                         if scheduler {
                             match backend.slurm_ref() {
                                 Ok((host, job_id)) => match tokio::time::timeout(
@@ -235,15 +232,6 @@ impl LocalPlane {
                 println!("  run {}: {}", run.id, run.display_status());
             } else if let Some(detail) = run.contact_detail() {
                 println!("  run {}: {detail}", run.id);
-            }
-            if !matches!(older.status.as_str(), "starting" | "running") {
-                continue;
-            }
-            let error = crate::jobs::BackendDescriptor::parse(&older.backend_json)
-                .ok()
-                .and_then(|backend| backend.monitoring_error);
-            if let Some(error) = error {
-                println!("  older live run {}: {error}", older.id);
             }
         }
         Ok(())
@@ -795,10 +783,12 @@ impl ApiClient {
                     return Ok(());
                 }
                 if filter.project.is_none() {
-                    experiment_wait_progress(
-                        Some((&run.id, &run.display_status())),
-                        &mut last_status,
-                    );
+                    let status = run.display_status();
+                    let progress = match run.contact_detail() {
+                        Some(detail) => format!("{status}: {detail}"),
+                        None => status.into_owned(),
+                    };
+                    experiment_wait_progress(Some((&run.id, &progress)), &mut last_status);
                 }
             }
             drop(events);

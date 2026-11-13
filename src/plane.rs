@@ -19,6 +19,10 @@ pub struct Run {
     #[serde(default)]
     pub cancelling: bool,
     #[serde(default)]
+    pub queue_detail: Option<String>,
+    #[serde(default)]
+    pub backend_json: Option<String>,
+    #[serde(default)]
     pub cancel_unconfirmed: Option<Vec<u32>>,
     pub host: Option<String>,
     pub commit_sha: Option<String>,
@@ -34,6 +38,9 @@ impl From<&StoredRun> for Run {
             id: run.id.clone(),
             experiment_id: run.experiment_id.clone(),
             status: run.status.clone(),
+            backend_json: Some(run.backend_json.clone()),
+            queue_detail: crate::store::public_backend(&run.backend_json, None)
+                .and_then(|backend| backend["queueDetail"].as_str().map(str::to_owned)),
             contact: crate::store::Contact::Live,
             cancelling: run.cancel_requested
                 && !crate::engine::Phase::parse(&run.status)
@@ -66,7 +73,36 @@ impl Run {
     pub fn contact_detail(&self) -> Option<String> {
         use crate::store::Contact;
         let (contact, since, cause) = match &self.contact {
-            Contact::Live | Contact::Stopping { .. } => return None,
+            Contact::Live => {
+                if matches!(self.status.as_str(), "submitting" | "starting" | "running")
+                    && !self.cancelling
+                {
+                    if let Some(backend) = &self.backend_json {
+                        match serde_json::from_str::<serde_json::Value>(backend) {
+                            Ok(value) => {
+                                if let Some(error) = value["monitoringError"]
+                                    .as_str()
+                                    .filter(|error| !error.is_empty())
+                                {
+                                    return Some(error.to_owned());
+                                }
+                            }
+                            Err(error) => {
+                                return Some(format!(
+                                    "Could not read backend status for run {}: {error}",
+                                    self.id
+                                ))
+                            }
+                        }
+                    }
+                }
+                return self
+                    .queue_detail
+                    .as_ref()
+                    .filter(|_| self.status == "starting" && !self.cancelling)
+                    .map(|detail| format!("waiting: {detail}"));
+            }
+            Contact::Stopping { .. } => return None,
             Contact::Unreachable { since, cause } => ("unreachable", since, cause),
             Contact::NeedsAuth { since, cause } => ("needs_auth", since, cause),
             Contact::Unreconciled { since, detail } => ("unreconciled", since, detail),
@@ -109,6 +145,12 @@ impl Run {
                 "status_cancelling"
             };
             return LABELS[key].as_str().into();
+        }
+        if self.status == "starting"
+            && self.contact == crate::store::Contact::Live
+            && self.queue_detail.is_some()
+        {
+            return LABELS["status_queued"].as_str().into();
         }
         self.status.as_str().into()
     }
@@ -364,6 +406,38 @@ mod tests {
 #[cfg(test)]
 mod cancel_tests {
     use super::*;
+
+    #[test]
+    fn cli_waiting_reason_and_legacy_monitoring_failure_stay_distinct() {
+        let mut value = serde_json::json!({
+            "id":"run", "experimentId":"exp", "status":"starting", "contact":{"type":"live"},
+            "host":null, "commitSha":null, "durationSecs":1, "updatedDisplay":"now",
+            "resultMarkdown":null, "cancelReason":null, "queueDetail":"Queued on Kaggle",
+            "backendJson":"{\"kind\":\"kaggle_job\"}"
+        });
+        let queued: Run = serde_json::from_value(value.clone()).unwrap();
+        assert!(queued
+            .contact_detail()
+            .unwrap()
+            .contains("Queued on Kaggle"));
+        value["backendJson"] = serde_json::json!({"kind":"kaggle_job", "monitoringError":"Could not contact the local Kaggle worker"}).to_string().into();
+        let failed_check: Run = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            failed_check.contact_detail().as_deref(),
+            Some("Could not contact the local Kaggle worker")
+        );
+        value["backendJson"] = "unreadable".into();
+        assert!(serde_json::from_value::<Run>(value.clone())
+            .unwrap()
+            .contact_detail()
+            .unwrap()
+            .contains("Could not read backend status"));
+        value["status"] = "done".into();
+        assert!(serde_json::from_value::<Run>(value)
+            .unwrap()
+            .contact_detail()
+            .is_none());
+    }
 
     #[test]
     fn cli_labels_decode_the_v2_cancel_fields_without_replacing_the_phase() {

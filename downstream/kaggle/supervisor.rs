@@ -66,6 +66,7 @@ pub(crate) async fn run(
                 value
             }
             Err(error) => {
+                descriptor.unknown.remove("queueDetail");
                 let text = format!("Kaggle monitoring will retry the same session: {error}");
                 if last_error.as_ref() != Some(&text) {
                     eprintln!("{text}");
@@ -93,6 +94,8 @@ pub(crate) async fn run(
             }
         };
         if observed["stopped"] == true {
+            descriptor.unknown.remove("queueDetail");
+            store.set_backend_json(&run_id, &descriptor.to_json())?;
             let status = if cancelled {
                 RunStatus::Cancelled
             } else {
@@ -110,6 +113,7 @@ pub(crate) async fn run(
             return Ok(());
         }
         if action == "acquire" {
+            let had_queue = descriptor.unknown.remove("queueDetail").is_some();
             if observed["ready"] == true {
                 acquired = true;
                 descriptor.job_id = observed["sessionId"].as_str().map(str::to_owned);
@@ -123,7 +127,13 @@ pub(crate) async fn run(
                 // Surface bootstrap trouble while the notebook owner keeps retrying.
                 descriptor.monitoring_error = Some(format!("Kaggle notebook not ready: {error}"));
                 store.set_backend_json(&run_id, &descriptor.to_json())?;
-            } else if descriptor.monitoring_error.take().is_some() {
+            } else if let Some(detail) = observed["detail"].as_str() {
+                descriptor.monitoring_error = None;
+                descriptor
+                    .unknown
+                    .insert("queueDetail".into(), json!(detail));
+                store.set_backend_json(&run_id, &descriptor.to_json())?;
+            } else if descriptor.monitoring_error.take().is_some() || had_queue {
                 // A recovered poll must not keep showing an earlier failure.
                 store.set_backend_json(&run_id, &descriptor.to_json())?;
             }

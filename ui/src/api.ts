@@ -95,7 +95,7 @@ export interface SessionExperiment {
   experiment: Experiment;
   projectName: string;
   /** Its newest live run, else its newest run: a forced relaunch can leave an older run live. Null until it has been run. */
-  currentRun: (Pick<Run, "status" | "createdAt" | "endedAt" | "contact" | "cancelling" | "cancelUnconfirmed" | "host" | "lostReason"> & { cancelRequested: boolean }) | null;
+  currentRun: (Pick<Run, "status" | "createdAt" | "endedAt" | "contact" | "cancelling" | "cancelUnconfirmed" | "host" | "lostReason" | "queueDetail"> & { cancelRequested: boolean }) | null;
 }
 
 export type RunStatus = "submitting" | "starting" | "running" | "done" | "failed" | "cancelled" | "lost";
@@ -122,6 +122,7 @@ export interface Run {
   exitCode?: number | null;
   contact: RunContact | null;
   cancelling: boolean;
+  queueDetail?: string | null;
   cancelUnconfirmed?: number[] | null;
   lostReason: string | null;
   /** The SSH alias or Slurm login node the run's job lives on. */

@@ -121,9 +121,11 @@ impl Api {
                     .as_ref()
                     .is_some_and(|state| state.cancel_accepted_at.is_some()));
         let mut value = serde_json::to_value(run)?;
+        value["queueDetail"] = Value::Null;
         value["startedAt"] = json!(state.as_ref().and_then(|state| state.started_at));
         let launch = state.as_ref().and_then(|state| state.launch.as_ref());
         if let Some(backend) = crate::store::public_backend(&run.backend_json, launch) {
+            value["queueDetail"] = backend["queueDetail"].clone();
             value["backendJson"] = json!(backend.to_string());
         }
         value["cancelUnconfirmed"] = json!(state

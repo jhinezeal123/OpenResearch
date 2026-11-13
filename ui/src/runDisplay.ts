@@ -2,6 +2,7 @@ import type { Run, RunContact, RunStatus } from "./api";
 
 export type RunDisplayStatus =
   | RunStatus
+  | "queued"
   | "cancelling"
   | "cancellation_pending"
   | "not_fully_stopped"
@@ -11,7 +12,7 @@ export type RunDisplayStatus =
   | "unconfirmed"
   | "abandoned";
 
-type RunState = Pick<Run, "status"> & Partial<Pick<Run, "contact" | "cancelling" | "lostReason" | "host" | "cancelUnconfirmed">> & { cancelRequested?: boolean };
+type RunState = Pick<Run, "status"> & Partial<Pick<Run, "contact" | "cancelling" | "lostReason" | "host" | "cancelUnconfirmed" | "queueDetail">> & { cancelRequested?: boolean };
 
 export interface RunDisplay {
   status: RunDisplayStatus;
@@ -23,6 +24,7 @@ export interface RunDisplay {
 }
 
 export type RunNotice =
+  | { kind: "queued"; detail: string }
   | { kind: "unreachable"; host: string | null; since: number; cause: string }
   | { kind: "needs_auth"; host: string | null; since: number; cause: string }
   | { kind: "unconfirmed_launch"; detail: string }
@@ -77,7 +79,7 @@ export function runDisplay(run: RunState): RunDisplay {
     const pending = run.status === "submitting" || contact?.type === "unreachable" || contact?.type === "needs_auth";
     return { status: pending ? "cancellation_pending" : "cancelling", stale: contact !== null, since };
   }
-  if (contact === null) return { status: run.status, stale: false, since };
+  if (contact === null) return { status: run.status === "starting" && run.queueDetail ? "queued" : run.status, stale: false, since };
 
   if (contact.type === "needs_auth") return { status: "needs_auth", stale: true, since };
   const status = contact.type === "unreconciled" || contact.type === "stopping" ? "unconfirmed" : contact.type;
@@ -87,7 +89,7 @@ export function runDisplay(run: RunState): RunDisplay {
 /** What the run detail strip says about a run, or null when there is nothing to add. */
 type CollectionFields = Partial<Pick<Run, "logCollection" | "logCollectionError" | "noticeError">>;
 
-export function runNotice(run: Pick<Run, "status" | "backend"> & Partial<Pick<Run, "contact" | "cancelling" | "lostReason" | "host" | "cancelUnconfirmed">> & CollectionFields): RunNotice | null {
+export function runNotice(run: Pick<Run, "status" | "backend"> & Partial<Pick<Run, "contact" | "cancelling" | "lostReason" | "host" | "cancelUnconfirmed" | "queueDetail">> & CollectionFields): RunNotice | null {
   const contact: RunContact | null = run.contact ?? null;
   const host = run.host ?? null;
 
@@ -103,7 +105,8 @@ export function runNotice(run: Pick<Run, "status" | "backend"> & Partial<Pick<Ru
     }
     if (runCancelling(run)) return { kind: run.status === "submitting" ? "cancel_pending_launch" : "cancelling" };
     const error = run.backend?.monitoringError;
-    return typeof error === "string" && error ? { kind: "monitoring", error } : null;
+    if (typeof error === "string" && error) return { kind: "monitoring", error };
+    return run.status === "starting" && run.queueDetail ? { kind: "queued", detail: run.queueDetail } : null;
   }
   if (contact.type === "stopping") return null;
   if (!runActive(run.status)) {

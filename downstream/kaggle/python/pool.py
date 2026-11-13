@@ -61,6 +61,9 @@ class Pool:
             for name in ('idle_since', 'leased_at'):
                 if name not in columns:
                     db.execute(f'ALTER TABLE sessions ADD COLUMN {name} REAL')
+            for name, kind in (('provider_status', 'TEXT'), ('provider_error', 'TEXT'), ('provider_checked_at', 'REAL')):
+                if name not in columns:
+                    db.execute(f'ALTER TABLE sessions ADD COLUMN {name} {kind}')
             # Give existing idle notebooks one grace period after upgrading.
             db.execute("UPDATE sessions SET idle_since=? WHERE state='idle' AND idle_since IS NULL", (time.time(),))
             db.execute('UPDATE sessions SET leased_at=created WHERE active_run IS NOT NULL AND leased_at IS NULL')
@@ -208,6 +211,9 @@ class Pool:
     def ready(self, sid, pid):
         with self.db() as db:
             db.execute("UPDATE sessions SET state=CASE WHEN active_run IS NULL THEN 'idle' ELSE 'busy' END,worker_pid=?,idle_since=CASE WHEN active_run IS NULL THEN COALESCE(idle_since,?) ELSE NULL END WHERE id=? AND state IN ('provisioning','busy','idle')",(pid,time.time(),sid))
+    def observe_provider(self, sid, status, error=None):
+        with self.db() as db:
+            db.execute("UPDATE sessions SET provider_status=?,provider_error=?,provider_checked_at=? WHERE id=? AND state='provisioning'",(status,error,time.time(),sid))
     def touch(self, sid, run_id):
         # Activity before launch may include a large source upload. Only the
         # current lease holder can extend this grace, never the notebook TTL.

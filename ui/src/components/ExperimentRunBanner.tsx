@@ -21,7 +21,7 @@ function RunRow({ item, onOpenRun, onOpenExperiment }: { item: ChatActiveRun; on
   const [error, setError] = useState<string | null>(null);
   const display = runDisplay(pending ? { ...run, cancelling: true } : run);
   const cancelling = pending || run.cancelling;
-  const label = display.stale || cancelling
+  const label = display.stale || cancelling || display.status === "queued"
     ? statusLabel(display.status, display.stopping)
     : run.status === "running" ? m.chat_experiment_running() : m.chat_experiment_starting();
   const connectHost = runConnectHost(run);
@@ -63,6 +63,7 @@ function RunRow({ item, onOpenRun, onOpenExperiment }: { item: ChatActiveRun; on
           </Button>
         )}
       </div>
+      {display.status === "queued" && run.queueDetail && <span className="w-full wrap-anywhere text-subtext" role="status">{run.queueDetail}</span>}
       {error && <span className="w-full text-accent-red" role="alert">{error}</span>}
     </div>
   );

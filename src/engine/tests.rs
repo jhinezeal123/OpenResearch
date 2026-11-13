@@ -2244,3 +2244,83 @@ async fn tombstone_finish_time_does_not_stage_terminal_effects_again() {
         assert!(f.store().pending_telemetry().unwrap().is_empty());
     }
 }
+
+#[tokio::test]
+async fn queue_detail_survives_restart_reaches_cli_and_clears_on_contact_loss_or_progress() {
+    let mut f = Fixture::new();
+    f.backend.then_launch(Ok(handle()));
+    f.submit("queued").await.unwrap();
+    let queue = || Observation::Queued {
+        detail: "Queued on Kaggle".into(),
+    };
+    f.engine.observe("queued", queue()).unwrap();
+    let row = f.store().get_run("queued").unwrap().unwrap();
+    let descriptor = BackendDescriptor::parse(&row.backend_json).unwrap();
+    assert_eq!(descriptor.unknown["queueDetail"], "Queued on Kaggle");
+    let rewritten = descriptor.to_json();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&rewritten).unwrap()["queueDetail"],
+        "Queued on Kaggle"
+    );
+    assert!(handle_of(&row).is_some());
+    let cli = crate::plane::Run::from_store(&f.store(), &row).unwrap();
+    assert_eq!(cli.queue_detail.as_deref(), Some("Queued on Kaggle"));
+    assert!(cli.contact_detail().unwrap().contains("Queued on Kaggle"));
+    f.restart();
+    assert_eq!(
+        crate::plane::Run::from_store(&f.store(), &f.store().get_run("queued").unwrap().unwrap())
+            .unwrap()
+            .queue_detail,
+        cli.queue_detail
+    );
+    while f.events.try_recv().is_ok() {}
+    f.engine.observe("queued", queue()).unwrap();
+    assert!(
+        f.events.try_recv().is_err(),
+        "unchanged queue should not publish another event"
+    );
+    f.engine
+        .observe(
+            "queued",
+            Observation::Unreachable {
+                cause: "Provider did not answer".into(),
+            },
+        )
+        .unwrap();
+    let row = f.store().get_run("queued").unwrap().unwrap();
+    assert!(crate::plane::Run::from_store(&f.store(), &row)
+        .unwrap()
+        .queue_detail
+        .is_none());
+    f.engine.observe("queued", queue()).unwrap();
+    assert!(f.events.try_recv().is_ok());
+    f.engine
+        .observe("queued", Observation::Running { started_at: None })
+        .unwrap();
+    f.engine.observe("queued", queue()).unwrap();
+    let row = f.store().get_run("queued").unwrap().unwrap();
+    assert_eq!(row.status, "running");
+    assert!(crate::plane::Run::from_store(&f.store(), &row)
+        .unwrap()
+        .queue_detail
+        .is_none());
+}
+
+#[tokio::test]
+async fn unreadable_backend_status_can_still_reach_the_user() {
+    let f = Fixture::new();
+    f.backend.then_launch(Ok(handle()));
+    f.submit("unreadable").await.unwrap();
+    f.store()
+        .set_backend_json("unreadable", "unreadable")
+        .unwrap();
+    f.engine
+        .unreconciled(
+            "unreadable",
+            &anyhow!("Could not read the run's backend descriptor"),
+        )
+        .unwrap();
+    assert!(
+        matches!(f.contact("unreadable"), Contact::Unreconciled { detail, .. } if detail.contains("backend descriptor"))
+    );
+}

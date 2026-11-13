@@ -128,6 +128,20 @@ def observe_sessions(account):
     from account_runtime import account_readiness
     return account_readiness(account)
 
+def observe_provision(session,pool,sid,row,root):
+    from bridge import control
+    try:
+        result=control(session,'status',sid,row['account'],root)
+        pool.observe_provider(sid,result['status'])
+        if result.get('stopped'):
+            pool.close(sid,'Kaggle ended the notebook before SSH was ready (status: '+result['status']+').')
+            pool.stopped(sid)
+    except Exception as error:
+        message='Could not check the Kaggle notebook status: '+type(error).__name__+': '+str(error)[:300]
+        pool.observe_provider(sid,None,message)
+        print(message,file=sys.stderr,flush=True)
+
+
 def not_running(sid,account,root,row):
     """Whether verified account session lists, minutes apart, omit this notebook.
 
@@ -223,7 +237,10 @@ def serve(config):
                 size=int(self.headers.get('Content-Length','0'))
                 if not 0<size<=2*1024*1024: raise ValueError('Invalid packet size')
                 r=json.loads(self.rfile.read(size))
-                if r['action']=='health': result={'ready':state['channel'] is not None,'error':state['error'],'fatal':state['fatal'],'receipt':state['receipt'],'connections':state['channel'].connections if state['channel'] else 0}
+                if r['action']=='health':
+                    from bridge import progress
+                    result={**progress(pool.get(sid)),'ready':state['channel'] is not None,'fatal':state['fatal'],'receipt':state['receipt'],'connections':state['channel'].connections if state['channel'] else 0}
+                    if state['error']: result['error']=state['error']
                 elif r['action']=='close': pool.close(sid);result={'closing':True}
                 elif pool.get(sid)['state'] in ('closing','stopped'): result={'pending':True,'closing':True}
                 elif state['channel'] is None: result={'pending':True,'error':state['error']}
@@ -266,6 +283,7 @@ def serve(config):
                     r=start(account=row['account'],request_id=sid,ttl_seconds=config['ttlSeconds'],accelerator=config['accelerator'],
                         competition_sources=config.get('competitionSources',[]),dataset_sources=config.get('datasetSources',[]),wait_seconds=5)
                     state['receipt']=r
+                    state['error']=None
                     if r.get('ssh_status')=='READY':
                         saved=session.state_for(sid)
                         channel=Channel(session,saved,log)
@@ -290,6 +308,7 @@ def serve(config):
                         last_probe=time.monotonic()
                         if settle_unsubmitted(session,pool,sid,sessions,row):
                             state['error']=pool.get(sid)['note'];state['fatal']=True;return
+                        observe_provision(session,pool,sid,row,sessions)
                     if r.get('submission_status')=='NOT_SUBMITTED':
                         give_up('Kaggle notebook was not submitted ('+str(r.get('error_type') or 'no detail')+')');return
                     failures=0
@@ -359,7 +378,7 @@ def serve(config):
             elif current['state']=='idle' and state['channel']:
                 # Preserve the notebook's packages, not an unused terminal pipe.
                 state['channel'].close()
-            if current['state']!='closing' and time.monotonic()-last_status>=60:
+            if state['channel'] and current['state']!='closing' and time.monotonic()-last_status>=60:
                 last_status=time.monotonic()
                 try:
                     if control(session,'status',sid,row['account'],Path(config['home'])/'sessions').get('stopped'):

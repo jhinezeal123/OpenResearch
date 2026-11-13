@@ -1,7 +1,7 @@
 import {useEffect,useState} from "react";
 import {useQuery,queryOptions} from "@tanstack/react-query";
 import {kaggleApi,type KaggleConfig,type KaggleAccountQuota,type KaggleQuotaHours} from "./api";
-import {useWorkspace,Button} from "../../bridge/ui";
+import {useWorkspace,Button,m} from "../../bridge/ui";
 
 const hours=(seconds:number)=>`${(seconds/3600).toFixed(1)}h`;
 
@@ -103,7 +103,8 @@ export function KaggleSection(){
       {sessions.error&&<p className="error" role="alert">{sessions.error.message}</p>}
       {!live.length&&<p className="m-0 text-sm text-subtext">No live notebooks. A session is allocated when the next Run starts.</p>}
       {live.map(s=><article key={s.id} className="flex flex-col gap-2 rounded-lg border border-border p-3 text-sm">
-        <div className="flex flex-wrap items-center justify-between gap-2"><strong>{data?.accounts.find(a=>a.id===s.account)?.username??s.account}</strong><span>{s.state}</span></div>
+        <div className="flex flex-wrap items-center justify-between gap-2"><strong>{data?.accounts.find(a=>a.id===s.account)?.username??s.account}</strong><span>{s.state==="provisioning"?(s.error?m.status_unconfirmed():s.provider_status==="queued"?m.status_queued():m.status_starting()):s.state}</span></div>
+        {(s.error??s.detail??s.note)&&<p role="status" className={`m-0 text-xs wrap-anywhere ${s.error?"text-accent-amber":"text-subtext"}`}>{s.error??s.detail??s.note}</p>}
         <span className="text-xs text-subtext">Session {s.id.slice(0,12)} · expires {new Date(s.deadline*1000).toLocaleTimeString()}</span>
         {s.active_run&&<span className="text-xs text-subtext">Run {s.active_run.slice(0,12)}</span>}
         <Button type="button" disabled={busy||s.state==="closing"} onClick={()=>void act(async()=>{await closeSession(s.id);await sessions.refetch()})}>Close session</Button>

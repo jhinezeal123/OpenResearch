@@ -71,6 +71,12 @@ test("each cancellation state agrees across the badge, notice, lineage and sessi
   }
 });
 
+test("queue reason and label agree across run, lineage and chat hover surfaces", async () => {
+  const shown = await surfaces(run({ status: "starting", queueDetail: "Queued on Kaggle" }));
+  for (const surface of ["badge", "notice", "lineage", "hover"]) assert.ok(shown[surface].includes(m.status_queued()), surface);
+  assert.equal(shown.noticeStatus, true);
+});
+
 test("pending cancellation offers Abandon", async () => {
   for (const contact of [{ type: "unreachable", since: 1, cause: "Offline" }, { type: "needs_auth", since: 1, cause: "Connect" }]) {
     assert.ok((await surfaces(run({ status: "running", cancelling: true, contact }))).notice.includes(m.run_abandon()));

@@ -14,7 +14,7 @@ export interface KaggleSettings {
   runtimeReady:boolean;
   error:string|null;
 }
-export interface KaggleSession {id:string;account:string;created:number;deadline:number;state:string;active_run:string|null;note:string|null}
+export interface KaggleSession {id:string;account:string;created:number;deadline:number;state:string;active_run:string|null;note:string|null;provider_status?:string|null;detail?:string;error?:string}
 export interface KaggleQuotaHours {used:number;reserved:number;total:number;remaining:number}
 export interface KaggleAccountQuota {
   account:string;

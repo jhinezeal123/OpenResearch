@@ -1762,5 +1762,6 @@
   "share_post_x": "Опубликовать в X",
   "share_post_text": "{name}: откройте весь исследовательский проект в OpenResearch",
   "open_shared_link_body": "Откройте «{name}», опубликованный на openresearch.sh, как новый проект.",
-  "open_shared_link_publisher": "Поделился(-ась): {name}"
+  "open_shared_link_publisher": "Поделился(-ась): {name}",
+  "status_queued": "В очереди"
 }

@@ -164,6 +164,14 @@ list. Diagnostics live under `<data>/kaggle/scheduler.log` and
 the exact local process instance. Do not manually free a database reservation
 or mass-kill every Python/terminal process to recover an uncertain stop.
 
+During provisioning, workers check the notebook's Kaggle status every 30
+seconds. Sessions and Run details distinguish Kaggle's confirmed queue from
+waiting for a free pool account and waiting for SSH after the notebook starts.
+Failed checks and observations older than 90 seconds report unknown status.
+`orx exp status` and `orx runs` expose the same waiting reason. Run descriptors
+keep this optional `queueDetail` separately from monitoring errors; old
+descriptors and pools migrate without changing notebook or Run identities.
+
 ## Ownership and maintenance
 
 `compute.rs`, `engine.rs`, `runtime.rs`, `supervisor.rs`, `settings.rs`, `ui/`, `python/`,

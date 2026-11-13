@@ -1762,5 +1762,6 @@
   "share_post_x": "انشر على X",
   "share_post_text": "{name}: افتح مشروع البحث الكامل في OpenResearch",
   "open_shared_link_body": "افتح “{name}” المنشور على openresearch.sh كمشروع جديد.",
-  "open_shared_link_publisher": "شاركه {name}"
+  "open_shared_link_publisher": "شاركه {name}",
+  "status_queued": "في قائمة الانتظار"
 }

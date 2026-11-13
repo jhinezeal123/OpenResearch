@@ -445,9 +445,10 @@ def notebook_status(account, kernel_ref, session_id=None):
                        response is None or response.status_code >= 400)
     response.raise_for_status()
     payload = response.json()
-    current = str(payload.get('status', '')).lower()
-    if not current:
+    current = payload.get('status')
+    if not isinstance(current, str) or not current.strip():
         raise RuntimeError('Kaggle returned no bootstrap status')
+    current = current.strip().lower()
     return {'session_id': session_id, 'notebook_ref': kernel_ref,
             'status': current, 'stopped': current in {'complete', 'completed', 'error', 'cancelled', 'canceled'},
             'observed_at': datetime.now(timezone.utc).isoformat()}

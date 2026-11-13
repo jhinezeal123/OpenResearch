@@ -22,6 +22,8 @@ function copy(notice: RunNotice, nextRetryMs: number | null, provider: string | 
   const authLead = provider === "k8s_job" ? m.run_notice_cluster_auth() : provider ? m.run_notice_provider_auth() : null;
   const host = (name: string | null) => ltr(name ?? m.run_notice_the_host());
   switch (notice.kind) {
+    case "queued":
+      return { lead: notice.detail, detail: null, tone: "quiet" };
     case "monitoring":
       return { lead: notice.error, detail: null, tone: "warning" };
     case "unreachable": {

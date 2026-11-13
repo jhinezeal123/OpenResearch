@@ -16,6 +16,12 @@ Launch every Run you intend to run now: Runs beyond free capacity wait in a
 durable queue and start as notebooks free up. Do not hold Runs back to match
 the account count, pin a project to an account, or submit notebooks yourself.
 
+`orx exp status <experiment-id>` and `orx runs` report why a Run is waiting.
+"Queued on Kaggle" means Kaggle confirmed its notebook is queued, separately
+from waiting for a free pool account or waiting for SSH after Kaggle starts it.
+A failed or stale provider check reports unknown status, not a confirmed queue.
+Keep the same Run and notebook while waiting; never resubmit to bypass a queue.
+
 Experiments and notebook Sessions have different lifetimes. A failed Run does
 not close its notebook: fix code in the experiment worktree, commit it, and
 launch another Run. Compatible Runs reuse the notebook and installed packages,

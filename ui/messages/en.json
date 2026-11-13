@@ -1762,5 +1762,6 @@
   "share_post_x": "Post on X",
   "share_post_text": "{name}: open the full research project in OpenResearch",
   "open_shared_link_body": "Open “{name}”, published on openresearch.sh, as a new project.",
-  "open_shared_link_publisher": "Shared by {name}"
+  "open_shared_link_publisher": "Shared by {name}",
+  "status_queued": "Queued"
 }

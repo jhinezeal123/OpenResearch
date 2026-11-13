@@ -23,6 +23,7 @@ pub(super) struct Change {
     pub reason: Option<String>,
     pub cancel_unconfirmed: Option<Option<Vec<u32>>>,
     pub contact: Option<Contact>,
+    pub queue_detail: Option<Option<String>>,
     /// Raise the outage's attention notice even though the contact did not change.
     pub attention: bool,
 }
@@ -134,7 +135,10 @@ fn observed(phase: Phase, contact: &Contact, observation: Observation, now: i64)
         ..Change::default()
     };
     match observation {
-        Queued { .. } => progressed(Phase::Starting),
+        Queued { detail } => Change {
+            queue_detail: Some(Some(detail)),
+            ..progressed(Phase::Starting)
+        },
         Running { started_at } => Change {
             started_at: Some(started_at.unwrap_or(now)),
             ..progressed(Phase::Running)
@@ -489,6 +493,29 @@ impl Engine {
                 _ => state.contact.clone(),
             };
             let contact_changed = contact != state.contact;
+            let queue_detail = if phase != Phase::Starting
+                || contact != Contact::Live
+                || run.cancel_requested
+                || state.cancel_accepted_at.is_some()
+            {
+                Some(None)
+            } else {
+                change.queue_detail
+            };
+            let queue_changed = match queue_detail {
+                Some(Some(detail)) if !detail.is_empty() => tx.execute(
+                    "UPDATE runs SET backend_json = json_set(backend_json, '$.queueDetail', ?2), updated_at = ?3
+                     WHERE id = ?1 AND json_extract(backend_json, '$.queueDetail') IS NOT ?2",
+                    rusqlite::params![run_id, detail, now],
+                )? > 0,
+                Some(_) => tx.execute(
+                    "UPDATE runs SET backend_json = json_remove(backend_json, '$.queueDetail'), updated_at = ?2
+                     WHERE id = ?1 AND CASE WHEN json_valid(backend_json)
+                     THEN json_type(backend_json, '$.queueDetail') IS NOT NULL ELSE 0 END",
+                    rusqlite::params![run_id, now],
+                )? > 0,
+                None => false,
+            };
             if contact_changed {
                 store.set_run_contact(run_id, &contact)?;
             }
@@ -551,7 +578,7 @@ impl Engine {
                 contact,
                 cancelling,
                 chats,
-                moved || contact_changed || recorded,
+                moved || contact_changed || recorded || queue_changed,
             )
         };
 

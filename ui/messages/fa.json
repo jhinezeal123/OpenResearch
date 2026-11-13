@@ -1762,5 +1762,6 @@
   "share_post_x": "ارسال در X",
   "share_post_text": "{name}: پروژهٔ پژوهشی کامل را در OpenResearch باز کنید",
   "open_shared_link_body": "«{name}» منتشرشده در openresearch.sh را به‌عنوان پروژهٔ جدید باز کنید.",
-  "open_shared_link_publisher": "به اشتراک گذاشته‌شده توسط {name}"
+  "open_shared_link_publisher": "به اشتراک گذاشته‌شده توسط {name}",
+  "status_queued": "در صف"
 }

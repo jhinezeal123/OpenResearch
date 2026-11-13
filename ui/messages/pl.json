@@ -1762,5 +1762,6 @@
   "share_post_x": "Opublikuj na X",
   "share_post_text": "{name}: otwórz cały projekt badawczy w OpenResearch",
   "open_shared_link_body": "Otwórz „{name}”, opublikowany na openresearch.sh, jako nowy projekt.",
-  "open_shared_link_publisher": "Udostępnia: {name}"
+  "open_shared_link_publisher": "Udostępnia: {name}",
+  "status_queued": "W kolejce"
 }

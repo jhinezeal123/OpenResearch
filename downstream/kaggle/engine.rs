@@ -218,7 +218,11 @@ fn waiting(reply: &Value) -> Observation {
         (None, Some(error)) => format!("Kaggle notebook not ready: {error}"),
         (None, None) => "Waiting for the Kaggle notebook".to_owned(),
     };
-    Observation::Queued { detail }
+    if reply["error"].as_str().is_some() {
+        Observation::Unreachable { cause: detail }
+    } else {
+        Observation::Queued { detail }
+    }
 }
 
 /// Reads a remote run's state from a launch, inspect or cancel reply.
@@ -644,12 +648,19 @@ mod tests {
     fn queued_runs_say_why_they_wait() {
         let Observation::Queued { detail } = waiting(&json!({
             "queued": true,
-            "detail": "Waiting for a compatible idle notebook.",
-            "error": "No Kaggle account is ready. a: busy"
+            "detail": "Queued on Kaggle. Waiting for Kaggle to start the notebook."
         })) else {
             panic!("not queued");
         };
-        assert!(detail.contains("idle notebook") && detail.contains("a: busy"));
+        assert!(detail.contains("Queued on Kaggle"));
+        assert!(matches!(
+            waiting(&json!({"queued":true,"detail":"Waiting for a free account."})),
+            Observation::Queued { detail } if detail.contains("free account")
+        ));
+        assert!(matches!(
+            waiting(&json!({"error":"Could not check Kaggle status"})),
+            Observation::Unreachable { cause } if cause.contains("Could not check Kaggle status")
+        ));
     }
 
     #[test]
