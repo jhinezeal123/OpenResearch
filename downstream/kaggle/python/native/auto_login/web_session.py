@@ -45,15 +45,6 @@ BASE = os.environ["ORX_KAGGLE_HOME"]
 REGISTRY_PATH = os.path.join(BASE, 'profiles', 'accounts.json')
 PROFILES_DIR = os.path.join(BASE, 'profiles')
 
-BROWSERS = {
-    'coccoc': {
-        'exe': r'C:\Program Files\CocCoc\Browser\Application\browser.exe',
-    },
-    'chrome': {
-        'exe': None,  # playwright channel='chrome'
-    },
-}
-
 GOOGLE_LOGIN_METHODS = {'google_passkey', 'google_password'}
 KAGGLE_ORIGIN = 'https://www.kaggle.com'
 KAGGLE_LOGIN = KAGGLE_ORIGIN + '/account/login?returnUrl=%2F'
@@ -220,9 +211,9 @@ def _banner_js(label):
 
 
 def _launch(pw, profile_dir, browser, headless, label=None, debug_port=None):
-    spec = BROWSERS.get(browser or 'coccoc', BROWSERS['coccoc'])
     os.makedirs(profile_dir, exist_ok=True)
     launch = dict(
+        channel='chrome',
         user_data_dir=profile_dir,
         headless=headless,
         args=[
@@ -234,12 +225,6 @@ def _launch(pw, profile_dir, browser, headless, label=None, debug_port=None):
     )
     if debug_port:
         launch['args'] = launch['args'] + ['--remote-debugging-port=%d' % debug_port]
-    if spec.get('exe'):
-        if not os.path.exists(spec['exe']):
-            raise RuntimeError('Browser %s không tìm thấy: %s' % (browser, spec['exe']))
-        launch['executable_path'] = spec['exe']
-    else:
-        launch['channel'] = 'chrome'
     try:
         ctx = pw.chromium.launch_persistent_context(**launch)
     except Exception as exc:
@@ -299,7 +284,7 @@ class KaggleAccountMismatch(RuntimeError):
     """Chrome is signed in to a different Kaggle account."""
 
 
-def extract_cookies(profile_dir, browser='coccoc', headless=True, out=None, expected_username=None, timeout_s=60):
+def extract_cookies(profile_dir, browser='chrome', headless=True, out=None, expected_username=None, timeout_s=60):
     """Đọc cookie kaggle từ profile chuyên dụng. Mặc định HEADLESS.
     Từ chối session khách (guest): Kaggle cấp __Host-KAGGLEID cho cả người chưa
     đăng nhập — chỉ lưu cookie khi có login thật (CLIENT-TOKEN không-anonymous)."""
@@ -387,8 +372,8 @@ def login_google_interactive(profile_dir, expected_username, timeout_minutes=15,
 def _launch_incognito(pw, browser, label=None, debug_port=None, headless=False):
     """Khởi động browser ẩn danh (không dùng profile trên đĩa; cookies chỉ trong RAM).
     login_headed đọc cookies trực tiếp từ context nên vẫn lưu được web-session.json."""
-    spec = BROWSERS.get(browser or 'coccoc', BROWSERS['coccoc'])
     launch = dict(
+        channel='chrome',
         headless=headless,
         args=[
             '--no-first-run',
@@ -399,12 +384,6 @@ def _launch_incognito(pw, browser, label=None, debug_port=None, headless=False):
     )
     if debug_port:
         launch['args'] = launch['args'] + ['--remote-debugging-port=%d' % debug_port]
-    if spec.get('exe'):
-        if not os.path.exists(spec['exe']):
-            raise RuntimeError('Browser %s không tìm thấy: %s' % (browser, spec['exe']))
-        launch['executable_path'] = spec['exe']
-    else:
-        launch['channel'] = 'chrome'
     try:
         b = pw.chromium.launch(**launch)
     except Exception as exc:
@@ -419,7 +398,7 @@ def _launch_incognito(pw, browser, label=None, debug_port=None, headless=False):
     return ctx
 
 
-def login_headed(profile_dir, browser='coccoc', timeout_minutes=15, out=None, label=None,
+def login_headed(profile_dir, browser='chrome', timeout_minutes=15, out=None, label=None,
                  incognito=False, debug_port=None):
     """Mở headed 1 lần để đăng nhập; poll tới khi có LOGIN THẬT (không phải cookie
     khách — __Host-KAGGLEID có cả khi chưa đăng nhập) rồi tự đóng + lưu.
@@ -663,11 +642,11 @@ def _detect_login_block(page):
     return None
 
 
-def auto_login(profile_dir, browser='coccoc', username=None, password=None,
+def auto_login(profile_dir, browser='chrome', username=None, password=None,
                timeout_s=180, out=None, isolated=True, expected_username=None):
     """Tự đăng nhập Kaggle bằng username+password (headless, stealth).
     Mặc định dùng browser context tạm, độc lập với profile đang mở, rồi chỉ
-    lưu cookie kết quả ra `out`. Điều này cho phép bấm Recovery khi CocCoc
+    lưu cookie kết quả ra `out`. Điều này cho phép bấm Recovery khi Chrome
     profile chính vẫn đang mở.
     - Thành công: trả record cookie (đã lưu ra `out` nếu có).
     - Kaggle yêu cầu xác minh bổ sung: dừng auto-login để caller chuyển sang đăng nhập thủ công.
@@ -1000,7 +979,7 @@ def _cli():
     ap.add_argument('--account', help='account (key token file) hoặc alias')
     ap.add_argument('--alias', help='alias (tên profile); mặc định = stem của account')
     ap.add_argument('--profile-dir', help='trỏ thẳng profile dir (bỏ qua registry)')
-    ap.add_argument('--browser', choices=list(BROWSERS), default='coccoc')
+    ap.add_argument('--browser', choices=['chrome'], default='chrome')
     ap.add_argument('--headless', dest='headless', action='store_true', default=True)
     ap.add_argument('--headed', dest='headless', action='store_false')
     ap.add_argument('--out', help='đường dẫn file cookie đầu ra')
@@ -1035,8 +1014,12 @@ def _cli():
                                        if entry and entry.get('profile_dir') else profile_dir_for(alias))
         out = args.out or (os.path.join(BASE, entry['cookie_file'])
                            if entry and entry.get('cookie_file') else os.path.join(profile, 'web-session.json'))
-        if login_method in GOOGLE_LOGIN_METHODS and not args.profile_dir and entry.get('login_profile_dir'):
-            profile = os.path.join(BASE, entry['login_profile_dir'])
+        if entry and not args.profile_dir:
+            if entry.get('login_profile_dir'):
+                profile = os.path.join(BASE, entry['login_profile_dir'])
+            elif entry.get('browser') == 'coccoc':
+                # Keep the old browser's data intact when switching to Chrome.
+                profile = os.path.join(profile, 'chrome')
     else:
         profile = args.profile_dir
         alias = alias or 'default'
@@ -1087,7 +1070,7 @@ def _cli():
         result = resolve_session_id(out, args.resolve, args.version, args.wait_seconds)
         print(json.dumps(result, ensure_ascii=False, indent=1))
         return
-    record = extract_cookies(profile, 'chrome' if login_method in GOOGLE_LOGIN_METHODS else args.browser,
+    record = extract_cookies(profile, args.browser,
                              headless=args.headless, out=out, expected_username=expected_username)
     print(json.dumps({'mode': 'extract', 'headless': args.headless, 'saved_to': out,
                       'expires_iso': record['auth_cookie'].get('expires_iso')},

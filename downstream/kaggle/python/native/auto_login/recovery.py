@@ -124,7 +124,7 @@ def _recover_cookie(a, headless_timeout):
     """Recovery cookie 1 click.
 
     Có credential thì ưu tiên auto-login (tự điền username + password) trong
-    browser context riêng, để không bị khóa bởi cửa sổ CocCoc đang mở. Chỉ khi
+    browser context riêng, để không bị khóa bởi cửa sổ Chrome đang mở. Chỉ khi
     auto-login không dùng được mới thử lấy lại session từ profile hiện tại rồi
     mới mở cửa sổ login tay.
     """

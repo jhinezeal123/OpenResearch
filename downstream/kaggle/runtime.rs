@@ -212,6 +212,8 @@ pub async fn call(settings: &Settings, mut request: Value, seconds: u64) -> Resu
             "PATHEXT",
             "PROGRAMDATA",
             "PROGRAMFILES",
+            // Chrome lookups (ours and Playwright's) also check Program Files (x86).
+            "PROGRAMFILES(X86)",
             "SYSTEMDRIVE",
             "SYSTEMROOT",
             "TEMP",

@@ -17,7 +17,7 @@ def _account(account):
     alias = entry.get('alias') or Path(key).stem
     profile = account_store.PROFILES / alias
     return {'account': key, 'username': entry.get('username'), 'alias': alias,
-            'browser': entry.get('browser', 'coccoc'), 'login_method': entry.get('login_method'), 'profile_dir': str(profile),
+            'browser': 'chrome', 'login_method': entry.get('login_method'), 'profile_dir': str(profile),
             'cookie_file': str(profile / 'web-session.json')}
 
 

@@ -26,6 +26,11 @@ Python, modules or profiles from AI Scientist at runtime. Windows' native
 OpenSSH and the selected installed browser remain OS dependencies. Tailcat is
 downloaded from its official release and checked against pinned hashes.
 
+Kaggle sign-in and cookie recovery use Google Chrome. Existing account entries
+with a legacy browser and no explicit `login_profile_dir` get a separate Chrome
+directory under their account profile. Set `login_profile_dir` to reuse an
+existing Chrome profile.
+
 ## Configure
 
 1. Open **Compute → More compute options → Kaggle SSH**.
