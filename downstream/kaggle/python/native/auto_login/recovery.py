@@ -78,7 +78,7 @@ def _ensure_cookie(a, headless=True):
     def usable_cookie(selected):
         path = selected['cookie_file']
         return not web_session.cookie_status(path)['expired'] and (
-            method not in web_session.GOOGLE_LOGIN_METHODS or web_session.identify_user(path) == selected['username'])
+            method not in web_session.GOOGLE_LOGIN_METHODS or web_session.same_user(web_session.identify_user(path), selected['username']))
 
     if usable_cookie(a):
         return a
@@ -157,7 +157,7 @@ def _recover_cookie(a, headless_timeout):
     except Exception as exc:
         errors.append('headless refresh: %s' % str(exc)[:200])
     try:
-        if (method not in web_session.GOOGLE_LOGIN_METHODS or web_session.identify_user(a['cookie_file']) == a['username']) and _probe_cookie_liveness(account):
+        if (method not in web_session.GOOGLE_LOGIN_METHODS or web_session.same_user(web_session.identify_user(a['cookie_file']), a['username'])) and _probe_cookie_liveness(account):
             st = web_session.cookie_status(a['cookie_file'])
             return {'account': a['account'], 'stage': 'refreshed',
                     'expires_iso': st['expires_iso'],
@@ -215,7 +215,7 @@ def recover_notebook_cookie(account, profile_path):
             return result('retry', 'This account’s Chrome session is already being recovered. Try again in a moment.')
         if web_session._chrome_profile_open(profile_dir):
             cookie = web_session.identify_user(a['cookie_file'])
-            if (cookie and cookie.casefold() == username.casefold()
+            if (web_session.same_user(cookie, username)
                     and not web_session.cookie_status(a['cookie_file'])['expired']
                     and _probe_cookie_liveness(account, timeout=8)):
                 return result('browser_open', 'The Chrome profile is open and the saved Kaggle session is valid.')

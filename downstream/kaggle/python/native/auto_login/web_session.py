@@ -316,7 +316,7 @@ def extract_cookies(profile_dir, browser='coccoc', headless=True, out=None, expe
         raise KaggleSignInRequired('Profile này chưa đăng nhập (vẫn là session khách). '
                                    'Chạy login_account để đăng nhập lại 1 lần.')
     record = build_record(browser, cookies)
-    if expected_username and record['username'].casefold() != expected_username.casefold():
+    if expected_username and not same_user(record['username'], expected_username):
         raise KaggleAccountMismatch(f'Chrome is signed in to a different Kaggle account. Sign out and sign in as {expected_username}.')
     save_session(record, out)
     return record
@@ -536,7 +536,7 @@ def _google_password_session(context, email, password, expected_username, deadli
     def session():
         cookies = context.cookies([KAGGLE_ORIGIN])
         username = _session_username(cookies)
-        if username and username.casefold() != expected_username.casefold():
+        if username and not same_user(username, expected_username):
             raise AutoLoginBlocked('Google sign-in returned a different Kaggle account.')
         return build_record('chrome', cookies) if username else None
 
@@ -744,7 +744,7 @@ def auto_login(profile_dir, browser='coccoc', username=None, password=None,
         if expected_username:
             raise AutoLoginNeedsVerification('Kaggle auto-login timed out. Finish signing in in Chrome.')
         raise RuntimeError('Kaggle auto-login timed out before a signed-in session was available.')
-    if expected_username and session_username.casefold() != expected_username.casefold():
+    if expected_username and not same_user(session_username, expected_username):
         raise AutoLoginBlocked('Kaggle signed in as a different account. The saved cookie was not changed.')
     record = build_record(browser, last)
     if out:
@@ -856,6 +856,11 @@ def _session_username(cookies):
         return data.get('sub') or data.get('username')
     except Exception:
         return None
+
+
+def same_user(a, b):
+    """Kaggle usernames ignore case."""
+    return bool(a) and bool(b) and a.casefold() == b.casefold()
 
 
 def identify_user(cookie_file):
