@@ -183,6 +183,9 @@ def dispatch(request):
     if action=='recover-cookie':
         from auto_login.recovery import recover_cookie_core
         return recover_cookie_core(request['account'])
+    if action=='recover-notebook-cookie':
+        from auto_login.recovery import recover_notebook_cookie
+        return recover_notebook_cookie(request['account'], request['chromeProfile'])
     if action=='readiness':
         from account_runtime import account_readiness
         return account_readiness(request['account'])

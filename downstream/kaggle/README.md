@@ -42,6 +42,18 @@ downloaded from its official release and checked against pinned hashes.
 orx exp run <experiment-id> --backend kaggle --flavor cpu --timeout 10m
 ```
 
+For an account that signs in with a Google passkey, set `login_method` to
+`google_passkey` in its entry in `<data>/kaggle/profiles/accounts.json` and set
+`username` to the expected Kaggle username. Set `login_profile_dir` to the
+absolute path of an existing account-specific Chrome user data directory to
+reuse that profile. **Recover cookie** first checks the saved browser session.
+If it needs sign-in, choose **Sign in with Google**, confirm the passkey, then
+close that account's Chrome windows so recovery can read and verify the session.
+For Google email and password, use `login_method: "google_password"` with the
+Google email and password in the private `profiles/credentials.json` entry.
+Recovery uses Kaggle's **Sign in with Google** flow and only saves a session
+that matches the configured Kaggle username.
+
 `--flavor` overrides the accelerator. `--timeout` bounds notebook lifetime;
 otherwise defaults apply. Lifetime starts at reservation and is never reset
 when a notebook is reused. A later Run is bounded by the remaining lifetime.

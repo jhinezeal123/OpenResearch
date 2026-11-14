@@ -1,5 +1,7 @@
 """Original cookie recovery orchestration adapted to the bundled account core."""
+import hashlib
 import os, json, sys, subprocess, time
+from pathlib import Path
 import web_session
 
 
@@ -71,8 +73,14 @@ def _ensure_cookie(a, headless=True):
       (2) hết hạn / server_invalid -> refresh headless (hồi phục im lặng nếu browser còn login);
       (3) vẫn hết hạn & có credential -> thử auto_login bằng username/password;
       (4) không có credential hoặc auto-login thất bại -> tự động MỞ CỬA SỔ HEADED LOGIN cho user."""
-    st = web_session.cookie_status(a['cookie_file'])
-    if not st['expired']:
+    method = a.get('login_method')
+
+    def usable_cookie(selected):
+        path = selected['cookie_file']
+        return not web_session.cookie_status(path)['expired'] and (
+            method not in web_session.GOOGLE_LOGIN_METHODS or web_session.identify_user(path) == selected['username'])
+
+    if usable_cookie(a):
         return a
     # (2) Refresh headless (profile còn login)
     try:
@@ -82,26 +90,36 @@ def _ensure_cookie(a, headless=True):
     except Exception:
         pass
     a2 = _account(a['account'])
-    if not web_session.cookie_status(a2['cookie_file'])['expired']:
+    if usable_cookie(a2):
         return a2
     # (3) Vẫn hết hạn -> auto_login bằng credential (nếu account có lưu password)
-    reg = _get_registry_entry(a['account'])
+    reg = {} if method == 'google_passkey' else _get_registry_entry(a['account'])
     if reg.get('kaggle_username') and reg.get('kaggle_password'):
         try:
             auto = auto_login_core(a['account'])
             if auto.get('status') == 'ok':
                 a3 = _account(a['account'])
-                if not web_session.cookie_status(a3['cookie_file'])['expired']:
+                if usable_cookie(a3):
                     return a3
         except Exception:
             pass
     # (4) Vẫn không được (hoặc account không có password) -> mở cửa sổ headed login
-    login_account_core(a['account'])
-    raise RuntimeError(_COOKIE_LOGIN_MSG % (a['account'], a['account'],
-                                            'cookie hết hạn và auto-login không thành công'))
+    login = login_account_core(a['account'])
+    raise RuntimeError(_COOKIE_LOGIN_MSG % (a['account'], a['account'], login['note']))
 
 
 def recover_cookie_core(account, headless_timeout=120):
+    from account_runtime import _account
+    from processes import lock
+
+    a = _account(account)
+    with lock(a['cookie_file'] + '.recovery.lock') as acquired:
+        if not acquired:
+            return {'account': a['account'], 'stage': 'retry', 'note': 'This Kaggle session is already being recovered. Try again in a moment.'}
+        return _recover_cookie(a, headless_timeout)
+
+
+def _recover_cookie(a, headless_timeout):
     from account_runtime import _account, _get_registry_entry, _probe_cookie_liveness, auto_login_core, get_web_session_core, login_account_core
     """Recovery cookie 1 click.
 
@@ -110,12 +128,13 @@ def recover_cookie_core(account, headless_timeout=120):
     auto-login không dùng được mới thử lấy lại session từ profile hiện tại rồi
     mới mở cửa sổ login tay.
     """
-    a = _account(account)
+    account = a['account']
     errors = []
     auto = None
 
     # (1) Click Recovery phải thực sự chạy auto-login trước nếu đã lưu credential.
-    reg = _get_registry_entry(account)
+    method = a.get('login_method')
+    reg = {} if method == 'google_passkey' else _get_registry_entry(account)
     if reg.get('kaggle_username') and reg.get('kaggle_password'):
         auto = auto_login_core(account)
         if auto.get('status') == 'ok':
@@ -123,7 +142,7 @@ def recover_cookie_core(account, headless_timeout=120):
                 if _probe_cookie_liveness(account):
                     st = web_session.cookie_status(a['cookie_file'])
                     return {'account': a['account'], 'stage': 'auto_login',
-                            'expires_iso': st['expires_iso'], 'via': 'password',
+                            'expires_iso': st['expires_iso'], 'via': auto.get('via', 'password'),
                             'note': 'Đã tự điền username/mật khẩu, đăng nhập lại và kiểm tra cookie thành công.'}
                 errors.append('auto-login tạo cookie nhưng probe liveness không thành công')
             except Exception as exc:
@@ -138,7 +157,7 @@ def recover_cookie_core(account, headless_timeout=120):
     except Exception as exc:
         errors.append('headless refresh: %s' % str(exc)[:200])
     try:
-        if _probe_cookie_liveness(account):
+        if (method not in web_session.GOOGLE_LOGIN_METHODS or web_session.identify_user(a['cookie_file']) == a['username']) and _probe_cookie_liveness(account):
             st = web_session.cookie_status(a['cookie_file'])
             return {'account': a['account'], 'stage': 'refreshed',
                     'expires_iso': st['expires_iso'],
@@ -157,29 +176,119 @@ def recover_cookie_core(account, headless_timeout=120):
     return login
 
 
+def recover_notebook_cookie(account, profile_path):
+    """Refresh the selected VS Code Chrome profile before the editor opens it."""
+    import account_store
+    from account_runtime import _account, _probe_cookie_liveness
+    from processes import lock
+
+    if account not in account_store.load_registry()['accounts']:
+        return {'stage': 'unavailable', 'note': 'Import this Kaggle account into OpenResearch to recover its session.'}
+    a = _account(account)
+    username = a['username']
+    if not username:
+        return {'stage': 'unavailable', 'note': 'Set the Kaggle username for this account in OpenResearch.'}
+
+    profile = Path(profile_path)
+    digest = hashlib.sha256(account.encode()).hexdigest()
+    if not profile.is_absolute() or profile.name != digest or profile.parent.name != 'kaggle-chrome':
+        raise ValueError('Invalid Chrome profile for the selected Kaggle account.')
+    profile_dir = str(profile.resolve())
+    if Path(profile_dir) != profile:
+        raise ValueError('The selected Chrome profile resolves outside its account directory.')
+
+    def result(stage, note):
+        return {'account': account, 'stage': stage, 'note': note}
+
+    def verify(record):
+        from cookie_client import _IClient
+        status, body = _IClient(account=account, cookies=record['cookies']).call('kernels.KernelsService/ListKernelSessions', {}, timeout=8)
+        if status == 200 and isinstance(body, dict):
+            web_session.save_session(record, a['cookie_file'])
+            return True
+        if web_session.cookie_rejected(status, body):
+            return False
+        raise RuntimeError('Kaggle could not verify the recovered Chrome session (HTTP %s).' % status)
+
+    with lock(a['cookie_file'] + '.recovery.lock') as acquired:
+        if not acquired:
+            return result('retry', 'This account’s Chrome session is already being recovered. Try again in a moment.')
+        if web_session._chrome_profile_open(profile_dir):
+            cookie = web_session.identify_user(a['cookie_file'])
+            if (cookie and cookie.casefold() == username.casefold()
+                    and not web_session.cookie_status(a['cookie_file'])['expired']
+                    and _probe_cookie_liveness(account, timeout=8)):
+                return result('browser_open', 'The Chrome profile is open and the saved Kaggle session is valid.')
+            return result('retry', 'Close this account’s Chrome windows and select it again to recover the Kaggle session.')
+
+        try:
+            record = web_session.extract_cookies(profile_dir, 'chrome', expected_username=username)
+            if verify(record):
+                return result('refreshed', 'Kaggle session refreshed from Chrome.')
+        except web_session.KaggleSignInRequired:
+            pass
+        except web_session.KaggleAccountMismatch as exc:
+            return result('sign_in_required', str(exc))
+
+        method = a['login_method']
+        sign_in = ('Choose Sign in with Google and confirm your passkey.' if method == 'google_passkey'
+                   else 'Choose Sign in with Google and finish signing in.' if method == 'google_password'
+                   else 'Sign in to the selected Kaggle account.')
+        if method == 'google_passkey':
+            return result('sign_in_required', sign_in)
+
+        credentials = account_store.credentials(account)
+        user, password = credentials['kaggle_username'], credentials['kaggle_password']
+        if not user or not password:
+            return result('sign_in_required', sign_in)
+        try:
+            if method == 'google_password':
+                record = web_session.auto_login_google(profile_dir, user, password, username, 60, None)
+            else:
+                record = web_session.auto_login(profile_dir, 'chrome', user, password, timeout_s=60,
+                                                isolated=False, expected_username=username)
+        except (web_session.AutoLoginNeedsVerification, web_session.AutoLoginBlocked) as exc:
+            return result('sign_in_required', f'{exc} {sign_in}')
+        if verify(record):
+            return result('auto_login', 'Kaggle session recovered in Chrome.')
+        return result('sign_in_required', sign_in)
+
+
 def login_account_core(account, timeout_minutes=15):
     from account_runtime import _account, _launch_login_detached
     a = _account(account)
+    method = a.get('login_method')
+    if method in web_session.GOOGLE_LOGIN_METHODS:
+        if not a['username']:
+            raise RuntimeError('Set the expected Kaggle username before using Google sign-in recovery.')
+        web_session.google_login_chrome()
     os.makedirs(a['profile_dir'], exist_ok=True)
     _launch_login_detached(a['account'], timeout_minutes)
+    if method in web_session.GOOGLE_LOGIN_METHODS:
+        action = 'dùng passkey' if method == 'google_passkey' else 'hoàn tất đăng nhập Google'
+        return {'account': a['account'], 'login_window_opened': True, 'via': method,
+                'note': f'Chọn Sign in with Google, {action}, rồi đóng các cửa sổ Chrome của tài khoản này để lưu cookie.'}
     return {'account': a['account'], 'login_window_opened': True,
             'note': 'Đăng nhập trong cửa sổ vừa mở; sau đó chạy get_web_session để lưu cookie.'}
 
 
 def auto_login_core(account, timeout_minutes=3):
-    from account_runtime import _account, _get_registry_entry, _set_registry, _web_cli
-    """Tự đăng nhập lại Kaggle bằng credential đã lưu (headless, stealth).
+    from account_runtime import _account, _get_registry_entry, _set_registry, _web_cli, login_account_core
+    """Khôi phục đăng nhập bằng mật khẩu hoặc mở Chrome để xác nhận passkey.
     - ok: đã login + lưu cookie.
-    - needs_manual_verification: Kaggle cần xác minh thêm -> hoàn tất trong cửa sổ login.
+    - needs_manual_verification: hoàn tất trong cửa sổ login.
     - no_credentials / error: tương ứng."""
     a = _account(account)
+    method = a.get('login_method')
+    if method == 'google_passkey':
+        return {**login_account_core(a['account'], timeout_minutes), 'status': 'needs_manual_verification'}
     reg = _get_registry_entry(account)
     user = reg.get('kaggle_username')
     pwd = reg.get('kaggle_password')
     if not user or not pwd:
         return {'account': a['account'], 'status': 'no_credentials',
                 'note': 'Chưa lưu credential. Chạy store_credentials trước.'}
-    env = {'KG_AUTO_USER': user, 'KG_AUTO_PASS': pwd}
+    env = None if method == 'google_password' else {'KG_AUTO_USER': user, 'KG_AUTO_PASS': pwd}
     cli_args = ['--auto-login', '--account', a['account'], '--timeout-minutes', str(timeout_minutes)]
     try:
         result = _web_cli(cli_args, timeout=timeout_minutes * 60 + 60, env=env)
@@ -193,6 +302,7 @@ def auto_login_core(account, timeout_minutes=3):
         if result.get('expires_iso'):
             _set_registry(a['account'], cookie_expires=result['expires_iso'])
         return {'account': a['account'], 'status': 'ok',
+                'via': 'google_password' if method == 'google_password' else 'password',
                 'expires_iso': result.get('expires_iso'), 'username': result.get('username'),
                 'note': 'Đã tự đăng nhập lại và lưu cookie.'}
     if status == 'needs_manual_verification':

@@ -58,6 +58,10 @@ pub(crate) fn routes() -> axum::Router<crate::commands::up::AppState> {
             "/api/settings/kaggle/recover-cookie",
             post(kaggle::settings::recover_cookie),
         )
+        .route(
+            "/api/settings/kaggle/recover-cookie/notebook",
+            post(kaggle::settings::recover_notebook_cookie),
+        )
 }
 
 pub(crate) const COMPUTE_ID: &str = "kaggle";

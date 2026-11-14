@@ -22,9 +22,11 @@ import datetime
 import http.cookiejar
 import json
 import os
+from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -51,6 +53,11 @@ BROWSERS = {
         'exe': None,  # playwright channel='chrome'
     },
 }
+
+GOOGLE_LOGIN_METHODS = {'google_passkey', 'google_password'}
+KAGGLE_ORIGIN = 'https://www.kaggle.com'
+KAGGLE_LOGIN = KAGGLE_ORIGIN + '/account/login?returnUrl=%2F'
+GOOGLE_ORIGIN = 'https://accounts.google.com'
 
 _ALIAS_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$')
 
@@ -284,7 +291,15 @@ def _sync_playwright():
 
 # ---------------------------------------------------------------- extraction
 
-def extract_cookies(profile_dir, browser='coccoc', headless=True, out=None):
+class KaggleSignInRequired(RuntimeError):
+    """Chrome has a guest Kaggle session."""
+
+
+class KaggleAccountMismatch(RuntimeError):
+    """Chrome is signed in to a different Kaggle account."""
+
+
+def extract_cookies(profile_dir, browser='coccoc', headless=True, out=None, expected_username=None):
     """Đọc cookie kaggle từ profile chuyên dụng. Mặc định HEADLESS.
     Từ chối session khách (guest): Kaggle cấp __Host-KAGGLEID cho cả người chưa
     đăng nhập — chỉ lưu cookie khi có login thật (CLIENT-TOKEN không-anonymous)."""
@@ -298,15 +313,75 @@ def extract_cookies(profile_dir, browser='coccoc', headless=True, out=None):
         finally:
             ctx.close()
     if not _session_username(cookies):
-        raise RuntimeError('Profile này chưa đăng nhập (vẫn là session khách). '
-                           'Chạy login_account để đăng nhập lại 1 lần.')
+        raise KaggleSignInRequired('Profile này chưa đăng nhập (vẫn là session khách). '
+                                   'Chạy login_account để đăng nhập lại 1 lần.')
     record = build_record(browser, cookies)
+    if expected_username and record['username'].casefold() != expected_username.casefold():
+        raise KaggleAccountMismatch(f'Chrome is signed in to a different Kaggle account. Sign out and sign in as {expected_username}.')
+    save_session(record, out)
+    return record
+
+
+def save_session(record, out):
     if out:
         os.makedirs(os.path.dirname(out), exist_ok=True)
-        with open(out, 'w', encoding='utf-8') as f:
-            json.dump(record, f, indent=1, ensure_ascii=False)
-        protect_acl(out)
-    return record
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=os.path.dirname(out), delete=False) as f:
+            temporary = f.name
+        try:
+            protect_acl(temporary)
+            with open(temporary, 'w', encoding='utf-8') as f:
+                json.dump(record, f, indent=1, ensure_ascii=False)
+            os.replace(temporary, out)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+def google_login_chrome():
+    if os.name != 'nt':
+        raise RuntimeError('Google sign-in recovery currently requires Google Chrome on Windows.')
+    for var in ('ProgramFiles', 'ProgramFiles(x86)', 'LOCALAPPDATA'):
+        if os.environ.get(var):
+            path = os.path.join(os.environ[var], 'Google', 'Chrome', 'Application', 'chrome.exe')
+            if os.path.isfile(path):
+                return path
+    raise RuntimeError('Install Google Chrome to use Google sign-in recovery.')
+
+
+def _chrome_profile_open(profile_dir):
+    if os.name != 'nt':
+        try:
+            os.lstat(os.path.join(profile_dir, 'SingletonLock'))
+        except FileNotFoundError:
+            return False
+        return True
+    # Windows Chrome holds an exclusive handle while it uses this user data directory.
+    try:
+        with open(os.path.join(profile_dir, 'lockfile'), 'rb'):
+            return False
+    except FileNotFoundError:
+        return False
+    except PermissionError:
+        return True
+
+
+def login_google_interactive(profile_dir, expected_username, timeout_minutes=15, out=None):
+    if not expected_username:
+        raise RuntimeError('Set the expected Kaggle username before using Google sign-in recovery.')
+    chrome = google_login_chrome()
+    os.makedirs(profile_dir, exist_ok=True)
+    process = subprocess.Popen(
+        [chrome, '--user-data-dir=' + profile_dir, '--no-first-run', '--no-default-browser-check', '--disable-background-mode',
+         KAGGLE_LOGIN],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+    )
+    deadline = time.monotonic() + timeout_minutes * 60
+    while time.monotonic() < deadline:
+        if process.poll() is not None and not _chrome_profile_open(profile_dir):
+            return extract_cookies(profile_dir, 'chrome', out=out, expected_username=expected_username)
+        time.sleep(2)
+    raise RuntimeError('Google sign-in recovery timed out. Close all Chrome windows for this account after signing in to Kaggle.')
 
 
 def _launch_incognito(pw, browser, label=None, debug_port=None, headless=False):
@@ -405,6 +480,113 @@ class AutoLoginNeedsVerification(RuntimeError):
     """Kaggle yêu cầu xác minh bổ sung ngoài username/password."""
 
 
+def auto_login_google(profile_dir, email, password, expected_username, timeout_s, out):
+    if _chrome_profile_open(profile_dir):
+        raise AutoLoginNeedsVerification('Close this account’s Chrome windows to run Google auto-login.')
+    chrome = google_login_chrome()
+    os.makedirs(profile_dir, exist_ok=True)
+    marker = Path(profile_dir) / 'DevToolsActivePort'
+    started = time.time()
+    process = subprocess.Popen(
+        [chrome, '--user-data-dir=' + profile_dir, '--remote-debugging-port=0', '--no-first-run',
+         '--no-default-browser-check', '--disable-background-mode', KAGGLE_LOGIN],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+    )
+    deadline = time.monotonic() + timeout_s
+    try:
+        port = None
+        launch_deadline = min(deadline, time.monotonic() + 15)
+        while time.monotonic() < launch_deadline:
+            if process.poll() is not None:
+                break
+            try:
+                if marker.stat().st_mtime >= started:
+                    port = int(marker.read_text(encoding='utf-8').splitlines()[0])
+                    break
+            except (OSError, ValueError, IndexError):
+                pass
+            time.sleep(.25)
+        if not port:
+            raise AutoLoginNeedsVerification('Chrome could not start Google auto-login for this profile.')
+
+        with _sync_playwright()() as pw:
+            browser = pw.chromium.connect_over_cdp('http://127.0.0.1:%d' % port, timeout=10000)
+            try:
+                context = browser.contexts[0]
+                record = _google_password_session(context, email, password, expected_username, deadline)
+                save_session(record, out)
+                return record
+            finally:
+                try:
+                    browser.new_browser_cdp_session().send('Browser.close')
+                except Exception:
+                    pass
+    finally:
+        try:
+            process.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+
+
+def _google_password_session(context, email, password, expected_username, deadline):
+    def at_google(page):
+        return not page.is_closed() and urllib.parse.urlsplit(page.url).netloc == 'accounts.google.com' and page.url.startswith(GOOGLE_ORIGIN + '/')
+
+    def session():
+        cookies = context.cookies([KAGGLE_ORIGIN])
+        username = _session_username(cookies)
+        if username and username.casefold() != expected_username.casefold():
+            raise AutoLoginBlocked('Google sign-in returned a different Kaggle account.')
+        return build_record('chrome', cookies) if username else None
+
+    page = context.pages[0] if context.pages else context.new_page()
+    try:
+        page.goto(KAGGLE_LOGIN, wait_until='domcontentloaded', timeout=25000)
+        if record := session():
+            return record
+        google_button = re.compile(r'sign in with google|continue with google', re.I)
+        page.get_by_role('button', name=google_button).or_(page.get_by_role('link', name=google_button)).first.click(timeout=20000)
+        while time.monotonic() < deadline:
+            if record := session():
+                return record
+            google = next((tab for tab in context.pages if at_google(tab)), None)
+            if google:
+                break
+            time.sleep(.25)
+        else:
+            raise AutoLoginNeedsVerification('Google sign-in did not open.')
+
+        identifier = google.locator('#identifierId')
+        identifier.wait_for(state='visible', timeout=15000)
+        if not at_google(google):
+            raise AutoLoginNeedsVerification('Google sign-in left the expected origin.')
+        identifier.fill(email, timeout=8000)
+        google.locator('#identifierNext').click(timeout=8000)
+        password_field = google.locator('input[type="password"]:not([name="hiddenPassword"]):visible').first
+        password_field.wait_for(state='visible', timeout=16000)
+        if not at_google(google):
+            raise AutoLoginNeedsVerification('Google sign-in left the expected origin.')
+        password_field.fill(password, timeout=8000)
+        google.locator('#passwordNext').click(timeout=8000)
+        while time.monotonic() < deadline:
+            if record := session():
+                return record
+            if at_google(google):
+                error = google.get_by_text(re.compile(r'wrong password|incorrect password|sai mật khẩu', re.I)).first
+                if error.is_visible():
+                    raise AutoLoginBlocked('Google rejected the saved password.')
+                challenge = google.get_by_text(re.compile(r'verify it.s you|2-step verification|check your phone|browser or app may not be secure', re.I)).first
+                if challenge.is_visible():
+                    raise AutoLoginNeedsVerification('Google requires you to finish signing in in Chrome.')
+            time.sleep(.4)
+    except (AutoLoginBlocked, AutoLoginNeedsVerification):
+        raise
+    except Exception:
+        raise AutoLoginNeedsVerification('Google auto-login could not complete. Finish signing in in Chrome.') from None
+    raise AutoLoginNeedsVerification('Google sign-in did not establish a Kaggle session before the timeout.')
+
+
 def _click_button_by_text(page, text, timeout=8000):
     try:
         for b in page.query_selector_all('button'):
@@ -474,7 +656,7 @@ def _detect_login_block(page):
 
 
 def auto_login(profile_dir, browser='coccoc', username=None, password=None,
-               timeout_s=180, out=None, isolated=True):
+               timeout_s=180, out=None, isolated=True, expected_username=None):
     """Tự đăng nhập Kaggle bằng username+password (headless, stealth).
     Mặc định dùng browser context tạm, độc lập với profile đang mở, rồi chỉ
     lưu cookie kết quả ra `out`. Điều này cho phép bấm Recovery khi CocCoc
@@ -557,10 +739,13 @@ def auto_login(profile_dir, browser='coccoc', username=None, password=None,
                     browser_obj.close()
                 except Exception:
                     pass
-    if not _session_username(last):
-        raise RuntimeError('auto_login không thành công cho %s sau %ss '
-                           '(chưa có login thật — có thể Kaggle yêu cầu xác minh bổ sung hoặc chặn bot).'
-                           % (username, timeout_s))
+    session_username = _session_username(last)
+    if not session_username:
+        if expected_username:
+            raise AutoLoginNeedsVerification('Kaggle auto-login timed out. Finish signing in in Chrome.')
+        raise RuntimeError('Kaggle auto-login timed out before a signed-in session was available.')
+    if expected_username and session_username.casefold() != expected_username.casefold():
+        raise AutoLoginBlocked('Kaggle signed in as a different account. The saved cookie was not changed.')
     record = build_record(browser, last)
     if out:
         os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -572,11 +757,12 @@ def auto_login(profile_dir, browser='coccoc', username=None, password=None,
 
 # ---------------------------------------------------------------- /api/i/ resolve
 
-def cookie_jar(cookie_file):
-    with open(cookie_file, encoding='utf-8') as f:
-        rec = json.load(f)
+def cookie_jar(cookie_file=None, *, cookies=None):
+    if cookies is None:
+        with open(cookie_file, encoding='utf-8') as f:
+            cookies = json.load(f).get('cookies', [])
     jar = http.cookiejar.CookieJar()
-    for c in rec.get('cookies', []):
+    for c in cookies:
         domain = c['domain'].lstrip('.')
         exp = int(c['expires']) if c.get('expires') and c['expires'] > 0 else None
         jar.set_cookie(http.cookiejar.Cookie(
@@ -820,29 +1006,51 @@ def _cli():
         ap.error('cần --account hoặc --profile-dir')
 
     alias = args.alias
+    login_method = None
+    expected_username = None
     if args.account:
         entry = resolve_account(args.account)
+        login_method = entry.get('login_method') if entry else None
+        if login_method in GOOGLE_LOGIN_METHODS:
+            expected_username = entry.get('username')
+            if not expected_username:
+                ap.error('Google sign-in requires the expected Kaggle username in the account registry')
         alias = alias or (entry.get('alias') if entry else
                           os.path.splitext(os.path.basename(args.account))[0])
         profile = args.profile_dir or (os.path.join(BASE, entry['profile_dir'])
                                        if entry and entry.get('profile_dir') else profile_dir_for(alias))
         out = args.out or (os.path.join(BASE, entry['cookie_file'])
                            if entry and entry.get('cookie_file') else os.path.join(profile, 'web-session.json'))
+        if login_method in GOOGLE_LOGIN_METHODS and not args.profile_dir and entry.get('login_profile_dir'):
+            profile = os.path.join(BASE, entry['login_profile_dir'])
     else:
         profile = args.profile_dir
         alias = alias or 'default'
         out = args.out or os.path.join(profile, 'web-session.json')
 
+    if login_method in GOOGLE_LOGIN_METHODS and (args.login or (args.auto_login and login_method == 'google_passkey')):
+        record = login_google_interactive(profile, expected_username, args.timeout_minutes, out)
+        print(json.dumps({'mode': login_method, 'status': 'ok', 'saved_to': out,
+                          'expires_iso': record['auth_cookie'].get('expires_iso'),
+                          'username': record['username']}))
+        return
+
     if args.auto_login:
         auser = os.environ.get('KG_AUTO_USER') or ''
         apass = os.environ.get('KG_AUTO_PASS') or ''
+        if login_method == 'google_password' and not (auser and apass):
+            credentials = account_store.credentials(args.account)
+            auser, apass = credentials['kaggle_username'], credentials['kaggle_password']
         if not auser or not apass:
             print(json.dumps({'mode': 'auto_login', 'status': 'error',
                               'error': 'thiếu credential (env KG_AUTO_USER/KG_AUTO_PASS)'}, ensure_ascii=False))
             return
         try:
-            record = auto_login(profile, args.browser, auser, apass,
-                                timeout_s=args.timeout_minutes * 60, out=out)
+            if login_method == 'google_password':
+                record = auto_login_google(profile, auser, apass, expected_username, args.timeout_minutes * 60, out)
+            else:
+                record = auto_login(profile, args.browser, auser, apass,
+                                    timeout_s=args.timeout_minutes * 60, out=out)
             print(json.dumps({'mode': 'auto_login', 'status': 'ok', 'saved_to': out,
                               'expires_iso': record['auth_cookie'].get('expires_iso'),
                               'username': record.get('username')}, ensure_ascii=False, indent=1))
@@ -865,7 +1073,8 @@ def _cli():
         result = resolve_session_id(out, args.resolve, args.version, args.wait_seconds)
         print(json.dumps(result, ensure_ascii=False, indent=1))
         return
-    record = extract_cookies(profile, args.browser, headless=args.headless, out=out)
+    record = extract_cookies(profile, 'chrome' if login_method in GOOGLE_LOGIN_METHODS else args.browser,
+                             headless=args.headless, out=out, expected_username=expected_username)
     print(json.dumps({'mode': 'extract', 'headless': args.headless, 'saved_to': out,
                       'expires_iso': record['auth_cookie'].get('expires_iso')},
                      ensure_ascii=False, indent=1))

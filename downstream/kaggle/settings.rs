@@ -105,6 +105,26 @@ pub(crate) async fn recover_cookie(Json(value): Json<Value>) -> ApiResult {
         .map_err(bad_request)?,
     ))
 }
+
+pub(crate) async fn recover_notebook_cookie(Json(value): Json<Value>) -> ApiResult {
+    let account = value["account"]
+        .as_str()
+        .ok_or_else(|| bad_request("Choose a Kaggle account."))?;
+    let profile = value["chromeProfile"]
+        .as_str()
+        .ok_or_else(|| bad_request("The Kaggle Chrome profile is missing."))?;
+    let settings = kaggle::load_settings()?.unwrap_or_else(defaults);
+    Ok(Json(
+        kaggle::call(
+            &settings,
+            json!({"action":"recover-notebook-cookie","account":account,"chromeProfile":profile}),
+            180,
+        )
+        .await
+        .map_err(bad_request)?,
+    ))
+}
+
 pub(crate) fn summary() -> Value {
     json!({"id":"kaggle","configured":kaggle::configured(),"summary":kaggle::load_settings().ok().flatten().filter(|s|s.validate().is_ok()).map(|s|format!("{} accounts · {} · {} min",s.accounts.len(),s.accelerator,s.ttl_minutes)).unwrap_or_else(||"Configure the packaged Kaggle account pool".into())})
 }

@@ -17,7 +17,7 @@ def _account(account):
     alias = entry.get('alias') or Path(key).stem
     profile = account_store.PROFILES / alias
     return {'account': key, 'username': entry.get('username'), 'alias': alias,
-            'browser': entry.get('browser', 'coccoc'), 'profile_dir': str(profile),
+            'browser': entry.get('browser', 'coccoc'), 'login_method': entry.get('login_method'), 'profile_dir': str(profile),
             'cookie_file': str(profile / 'web-session.json')}
 
 
@@ -30,9 +30,9 @@ def _set_registry(account_key, **fields):
     return web_session.update_registry(account_key, **fields)
 
 
-def _probe_cookie_liveness(account):
+def _probe_cookie_liveness(account, timeout=60):
     from cookie_client import _client_for
-    status, body = _client_for(account).call('kernels.KernelsService/ListKernelSessions', {})
+    status, body = _client_for(account).call('kernels.KernelsService/ListKernelSessions', {}, timeout=timeout)
     return status == 200 and isinstance(body, dict)
 
 

@@ -9,10 +9,10 @@ class _IClient:
     thay vì mở mới mỗi request (tiết kiệm TCP+TLS handshake). Cookie header được build
     từ cookie jar của account; X-XSRF-TOKEN lấy từ cookie XSRF-TOKEN/CSRF-TOKEN."""
 
-    def __init__(self, cookie_file, account='external'):
+    def __init__(self, cookie_file=None, account='external', *, cookies=None):
         self._account = account
-        self._cookie_file = cookie_file  # để invalidate_cookie() khi server từ chối cookie
-        jar = web_session.cookie_jar(cookie_file)
+        self._cookie_file = cookie_file
+        jar = web_session.cookie_jar(cookie_file) if cookies is None else web_session.cookie_jar(cookies=cookies)
         self._cookie_header = '; '.join('%s=%s' % (c.name, c.value) for c in jar if c.value)
         # QUAN TRỌNG: phải ưu tiên cookie XSRF-TOKEN (CSRF-TOKEN là giá trị KHÁC —
         # dùng nhầm sẽ bị server trả 400).
@@ -60,7 +60,7 @@ class _IClient:
                         parsed = json.loads(text)
                     except Exception:
                         parsed = text
-                    if web_session.cookie_rejected(status, text):
+                    if self._cookie_file and web_session.cookie_rejected(status, text):
                         web_session.invalidate_cookie(self._cookie_file, 'HTTP %s in _IClient (%s)' % (status, method))
                     return status, parsed
                 except (http.client.HTTPException, OSError) as exc:
