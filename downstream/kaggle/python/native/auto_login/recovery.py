@@ -179,7 +179,7 @@ def _recover_cookie(a, headless_timeout):
 def recover_notebook_cookie(account, profile_path):
     """Refresh the selected VS Code Chrome profile before the editor opens it."""
     import account_store
-    from account_runtime import _account, _probe_cookie_liveness
+    from account_runtime import _account
     from processes import lock
 
     if account not in account_store.load_registry()['accounts']:
@@ -213,13 +213,10 @@ def recover_notebook_cookie(account, profile_path):
     with lock(a['cookie_file'] + '.recovery.lock') as acquired:
         if not acquired:
             return result('retry', 'This account’s Chrome session is already being recovered. Try again in a moment.')
+        # Chrome locks and encrypts an open profile, so its session cannot be checked.
+        # Open the notebook in that window; Kaggle asks there if it needs sign-in.
         if web_session._chrome_profile_open(profile_dir):
-            cookie = web_session.identify_user(a['cookie_file'])
-            if (web_session.same_user(cookie, username)
-                    and not web_session.cookie_status(a['cookie_file'])['expired']
-                    and _probe_cookie_liveness(account, timeout=8)):
-                return result('browser_open', 'The Chrome profile is open and the saved Kaggle session is valid.')
-            return result('retry', 'Close this account’s Chrome windows and select it again to recover the Kaggle session.')
+            return result('browser_open', 'Chrome is already open for this account. The notebook opens in that window.')
 
         try:
             record = web_session.extract_cookies(profile_dir, 'chrome', expected_username=username)
