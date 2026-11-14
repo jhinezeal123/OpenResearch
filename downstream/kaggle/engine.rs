@@ -121,9 +121,18 @@ fn append(run_id: &str, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Writes an empty marker file next to the run's log copy, creating the folder.
+fn mark(run_id: &str, suffix: &str) -> Result<()> {
+    let path = run_file(run_id, suffix)?;
+    if let Some(runs) = path.parent() {
+        std::fs::create_dir_all(runs)?;
+    }
+    std::fs::write(&path, b"")
+        .with_context(|| format!("Could not write the Kaggle run marker {}", path.display()))
+}
+
 fn mark_complete(run_id: &str) -> Result<()> {
-    std::fs::write(run_file(run_id, ".log.complete")?, b"")?;
-    Ok(())
+    mark(run_id, ".log.complete")
 }
 
 fn complete(run_id: &str) -> Result<bool> {
@@ -326,8 +335,7 @@ async fn drive(run_id: &str, cancelled: bool, step: &mut Step) -> Result<Observa
         let reply = exchange(run_id, &launch, &mut request, "launch").await?;
         step.launched = reply["pending"] != true && reply["stopped"] != true;
         if step.launched {
-            std::fs::write(run_file(run_id, ".launched").map_err(Failure::Local)?, b"")
-                .map_err(|error| Failure::Local(error.into()))?;
+            mark(run_id, ".launched").map_err(Failure::Local)?;
         }
         return Ok(observe(&reply, step));
     }
