@@ -193,9 +193,12 @@ def recover_notebook_cookie(account, profile_path):
     digest = hashlib.sha256(account.encode()).hexdigest()
     if not profile.is_absolute() or profile.name != digest or profile.parent.name != 'kaggle-chrome':
         raise ValueError('Invalid Chrome profile for the selected Kaggle account.')
-    profile_dir = str(profile.resolve())
-    if Path(profile_dir) != profile:
+    # A junction or symlink in VS Code's storage path is fine; the real
+    # directory must still be this account's folder inside kaggle-chrome.
+    resolved = profile.resolve()
+    if resolved.name != digest or resolved.parent.name != 'kaggle-chrome':
         raise ValueError('The selected Chrome profile resolves outside its account directory.')
+    profile_dir = str(resolved)
 
     def result(stage, note):
         return {'account': account, 'stage': stage, 'note': note}
