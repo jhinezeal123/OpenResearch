@@ -299,7 +299,7 @@ class KaggleAccountMismatch(RuntimeError):
     """Chrome is signed in to a different Kaggle account."""
 
 
-def extract_cookies(profile_dir, browser='coccoc', headless=True, out=None, expected_username=None):
+def extract_cookies(profile_dir, browser='coccoc', headless=True, out=None, expected_username=None, timeout_s=60):
     """Đọc cookie kaggle từ profile chuyên dụng. Mặc định HEADLESS.
     Từ chối session khách (guest): Kaggle cấp __Host-KAGGLEID cho cả người chưa
     đăng nhập — chỉ lưu cookie khi có login thật (CLIENT-TOKEN không-anonymous)."""
@@ -307,7 +307,7 @@ def extract_cookies(profile_dir, browser='coccoc', headless=True, out=None, expe
         ctx = _launch(pw, profile_dir, browser, headless=headless)
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
-            page.goto('https://www.kaggle.com/', wait_until='domcontentloaded', timeout=60000)
+            page.goto('https://www.kaggle.com/', wait_until='domcontentloaded', timeout=int(timeout_s * 1000))
             page.wait_for_timeout(2000)
             cookies = [c for c in ctx.cookies() if 'kaggle' in c.get('domain', '')]
         finally:
@@ -480,6 +480,14 @@ class AutoLoginNeedsVerification(RuntimeError):
     """Kaggle yêu cầu xác minh bổ sung ngoài username/password."""
 
 
+def _ms_left(deadline, cap_ms):
+    """A Playwright timeout that is at most cap_ms and ends by the monotonic deadline."""
+    left = int((deadline - time.monotonic()) * 1000)
+    if left <= 0:
+        raise AutoLoginNeedsVerification('Sign-in did not finish in time.')
+    return min(cap_ms, left)
+
+
 def auto_login_google(profile_dir, email, password, expected_username, timeout_s, out):
     if _chrome_profile_open(profile_dir):
         raise AutoLoginNeedsVerification('Close this account’s Chrome windows to run Google auto-login.')
@@ -511,7 +519,7 @@ def auto_login_google(profile_dir, email, password, expected_username, timeout_s
             raise AutoLoginNeedsVerification('Chrome could not start Google auto-login for this profile.')
 
         with _sync_playwright()() as pw:
-            browser = pw.chromium.connect_over_cdp('http://127.0.0.1:%d' % port, timeout=10000)
+            browser = pw.chromium.connect_over_cdp('http://127.0.0.1:%d' % port, timeout=_ms_left(deadline, 10000))
             try:
                 context = browser.contexts[0]
                 record = _google_password_session(context, email, password, expected_username, deadline)
@@ -542,11 +550,11 @@ def _google_password_session(context, email, password, expected_username, deadli
 
     page = context.pages[0] if context.pages else context.new_page()
     try:
-        page.goto(KAGGLE_LOGIN, wait_until='domcontentloaded', timeout=25000)
+        page.goto(KAGGLE_LOGIN, wait_until='domcontentloaded', timeout=_ms_left(deadline, 25000))
         if record := session():
             return record
         google_button = re.compile(r'sign in with google|continue with google', re.I)
-        page.get_by_role('button', name=google_button).or_(page.get_by_role('link', name=google_button)).first.click(timeout=20000)
+        page.get_by_role('button', name=google_button).or_(page.get_by_role('link', name=google_button)).first.click(timeout=_ms_left(deadline, 20000))
         while time.monotonic() < deadline:
             if record := session():
                 return record
@@ -558,17 +566,17 @@ def _google_password_session(context, email, password, expected_username, deadli
             raise AutoLoginNeedsVerification('Google sign-in did not open.')
 
         identifier = google.locator('#identifierId')
-        identifier.wait_for(state='visible', timeout=15000)
+        identifier.wait_for(state='visible', timeout=_ms_left(deadline, 15000))
         if not at_google(google):
             raise AutoLoginNeedsVerification('Google sign-in left the expected origin.')
-        identifier.fill(email, timeout=8000)
-        google.locator('#identifierNext').click(timeout=8000)
+        identifier.fill(email, timeout=_ms_left(deadline, 8000))
+        google.locator('#identifierNext').click(timeout=_ms_left(deadline, 8000))
         password_field = google.locator('input[type="password"]:not([name="hiddenPassword"]):visible').first
-        password_field.wait_for(state='visible', timeout=16000)
+        password_field.wait_for(state='visible', timeout=_ms_left(deadline, 16000))
         if not at_google(google):
             raise AutoLoginNeedsVerification('Google sign-in left the expected origin.')
-        password_field.fill(password, timeout=8000)
-        google.locator('#passwordNext').click(timeout=8000)
+        password_field.fill(password, timeout=_ms_left(deadline, 8000))
+        google.locator('#passwordNext').click(timeout=_ms_left(deadline, 8000))
         while time.monotonic() < deadline:
             if record := session():
                 return record
@@ -680,7 +688,8 @@ def auto_login(profile_dir, browser='coccoc', username=None, password=None,
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             # Vào thẳng phase emailSignIn (bỏ qua trang chọn phương thức đăng nhập)
             page.goto('https://www.kaggle.com/account/login?phase=emailSignIn&returnUrl=%2F',
-                      wait_until='domcontentloaded', timeout=60000)
+                      wait_until='domcontentloaded',
+                      timeout=max(1000, min(60000, int((deadline - time.time()) * 1000))))
             pass_submitted_at = 0.0
             pass_attempts = 0
             MAX_PASS_ATTEMPTS = 2

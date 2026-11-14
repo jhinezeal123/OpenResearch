@@ -210,6 +210,9 @@ def recover_notebook_cookie(account, profile_path):
             return False
         raise RuntimeError('Kaggle could not verify the recovered Chrome session (HTTP %s).' % status)
 
+    # Finish well inside the bridge's 180 s limit, so Chrome is always closed before a kill.
+    deadline = time.monotonic() + 150
+
     with lock(a['cookie_file'] + '.recovery.lock') as acquired:
         if not acquired:
             return result('retry', 'This account’s Chrome session is already being recovered. Try again in a moment.')
@@ -219,7 +222,7 @@ def recover_notebook_cookie(account, profile_path):
             return result('browser_open', 'Chrome is already open for this account. The notebook opens in that window.')
 
         try:
-            record = web_session.extract_cookies(profile_dir, 'chrome', expected_username=username)
+            record = web_session.extract_cookies(profile_dir, 'chrome', expected_username=username, timeout_s=30)
             if verify(record):
                 return result('refreshed', 'Kaggle session refreshed from Chrome.')
         except web_session.KaggleSignInRequired:
@@ -238,11 +241,15 @@ def recover_notebook_cookie(account, profile_path):
         user, password = credentials['kaggle_username'], credentials['kaggle_password']
         if not user or not password:
             return result('sign_in_required', sign_in)
+        # Keep 30 s to close Chrome and verify the session.
+        login_seconds = min(60, deadline - time.monotonic() - 30)
+        if login_seconds < 15:
+            return result('sign_in_required', f'Recovery ran out of time. {sign_in}')
         try:
             if method == 'google_password':
-                record = web_session.auto_login_google(profile_dir, user, password, username, 60, None)
+                record = web_session.auto_login_google(profile_dir, user, password, username, login_seconds, None)
             else:
-                record = web_session.auto_login(profile_dir, 'chrome', user, password, timeout_s=60,
+                record = web_session.auto_login(profile_dir, 'chrome', user, password, timeout_s=login_seconds,
                                                 isolated=False, expected_username=username)
         except (web_session.AutoLoginNeedsVerification, web_session.AutoLoginBlocked) as exc:
             return result('sign_in_required', f'{exc} {sign_in}')
