@@ -1,14 +1,12 @@
-//! Job backends — external compute that orx launches and supervises itself.
+//! Job backends — provider clients the run engine's adapters drive.
 //!
-//! Orx submits natively (HF Jobs, Modal, Vercel Sandbox, Kubernetes, SSH, Slurm, an OpenResearch
-//! box, Tinker through a local controller, or this machine) and a detached
-//! `orx supervise` watches the job beside it. The run's `backend_json` descriptor
-//! is the serialized handle a later supervisor uses to reattach.
+//! A run launched by orx 0.2 keeps its handle in `backend_json` as a [`BackendDescriptor`], which
+//! the engine reads to watch or adopt it.
 
 pub mod huggingface;
 pub mod kubernetes;
 pub mod localbox;
-mod managed_env;
+pub(crate) mod managed_env;
 pub mod modal;
 pub mod openresearch;
 pub mod ray;
@@ -18,7 +16,7 @@ pub mod ssh;
 pub mod tinker;
 pub mod vercel;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +43,43 @@ pub fn default_python_env(env: &HashMap<String, String>) -> HashMap<String, Stri
         .or_insert_with(|| "utf-8".to_string());
     env
 }
+
+/// This process's interpreter overrides, for `orx up` to check against its own.
+pub fn caller_python_overrides() -> BTreeMap<String, String> {
+    [modal::MODAL_ENV, vercel::VERCEL_ENV]
+        .iter()
+        .filter_map(|env| env.override_var)
+        .filter_map(|var| Some((var.to_string(), std::env::var(var).ok()?)))
+        .filter(|(_, python)| !python.trim().is_empty())
+        .collect()
+}
+
+/// A provider's answer to a launch that nothing started: its HTTP status, which the engine
+/// judges, or `None` when nothing is left running for certain.
+#[derive(Debug, Deserialize)]
+pub struct Refused {
+    pub status: Option<u16>,
+    pub message: String,
+}
+
+/// Launchers exit with this code after printing a [`Refused`] as JSON on stderr.
+const LAUNCHER_REFUSED: i32 = 6;
+
+/// A Python launcher's refusal, if its exit says it printed one.
+fn launcher_refusal(code: Option<i32>, stderr: &str) -> Option<Refused> {
+    if code != Some(LAUNCHER_REFUSED) {
+        return None;
+    }
+    serde_json::from_str(stderr.trim()).ok()
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Refused {}
 
 /// Backend descriptor stored on the local run; `kind` discriminates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,7 +122,7 @@ pub struct BackendDescriptor {
     pub ssh_port: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_user: Option<String>,
-    /// Requested execution limit for OpenResearch and Slurm jobs.
+    /// Requested execution limit for OpenResearch, Hugging Face, and Slurm jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
     /// Requested `#SBATCH --cpus-per-task` (slurm_job only).
@@ -117,21 +152,10 @@ impl BackendDescriptor {
         serde_json::from_str(json).map_err(|e| anyhow!("Unreadable backend descriptor: {}", e))
     }
 
+    /// Writes a 0.2.x row for tests; orx no longer writes descriptors.
+    #[cfg(test)]
     pub fn to_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
-    }
-
-    /// The HF (namespace, jobId) handle, or an error naming what's missing.
-    pub fn hf_ref(&self) -> Result<(&str, &str)> {
-        if self.kind != "hf_job" {
-            return Err(anyhow!("Unsupported backend kind: {}", self.kind));
-        }
-        match (self.namespace.as_deref(), self.job_id.as_deref()) {
-            (Some(ns), Some(id)) => Ok((ns, id)),
-            _ => Err(anyhow!(
-                "Backend descriptor is missing namespace/jobId — was the job submitted?"
-            )),
-        }
+        serde_json::to_string(self).unwrap()
     }
 
     /// The k8s (namespace, job name) handle; context rides on `self.context`.
@@ -145,16 +169,6 @@ impl BackendDescriptor {
                 "Backend descriptor is missing namespace/jobName — was the job submitted?"
             )),
         }
-    }
-
-    /// The Modal sandbox id (the reattach handle); `namespace` holds the app.
-    pub fn modal_ref(&self) -> Result<&str> {
-        if self.kind != "modal_job" {
-            return Err(anyhow!("Unsupported backend kind: {}", self.kind));
-        }
-        self.job_id.as_deref().ok_or_else(|| {
-            anyhow!("Backend descriptor is missing the Modal sandbox id — was the job submitted?")
-        })
     }
 
     /// The Vercel (sandbox name, process id) handle; the name rides on
@@ -181,30 +195,6 @@ impl BackendDescriptor {
             (Some(host), Some(id)) => Ok((host, id)),
             _ => Err(anyhow!(
                 "Backend descriptor is missing the slurm host/job id — was the job submitted?"
-            )),
-        }
-    }
-
-    /// The local run dir (the reattach handle) for a local controller.
-    pub fn local_ref(&self) -> Result<&str> {
-        if !matches!(self.kind.as_str(), "local_job" | "tinker_job") {
-            return Err(anyhow!("Unsupported backend kind: {}", self.kind));
-        }
-        self.job_id.as_deref().ok_or_else(|| {
-            anyhow!("Backend descriptor is missing the run dir — was the job submitted?")
-        })
-    }
-
-    /// The Ray Jobs (address, submission id) handle; address rides on
-    /// `namespace`, dashboard link on `url`.
-    pub fn ray_ref(&self) -> Result<(&str, &str)> {
-        if self.kind != "ray_job" {
-            return Err(anyhow!("Unsupported backend kind: {}", self.kind));
-        }
-        match (self.namespace.as_deref(), self.job_id.as_deref()) {
-            (Some(addr), Some(id)) => Ok((addr, id)),
-            _ => Err(anyhow!(
-                "Backend descriptor is missing the Ray address/submission id — was the job submitted?"
             )),
         }
     }
@@ -257,34 +247,6 @@ impl BackendDescriptor {
         target.managed_generation = Some(self.job_id.clone()?);
         Some(target)
     }
-}
-
-/// Map an HF job stage onto the local run-status vocabulary. `UPDATING` appears
-/// in the wild as a live state (see huggingface_hub).
-pub fn stage_to_run_status(stage: &str) -> crate::store::RunStatus {
-    use crate::store::RunStatus;
-    match stage {
-        "SCHEDULING" => RunStatus::Starting,
-        "RUNNING" | "UPDATING" => RunStatus::Running,
-        "COMPLETED" => RunStatus::Done,
-        "ERROR" => RunStatus::Failed,
-        "CANCELED" | "DELETED" => RunStatus::Cancelled,
-        _ => RunStatus::Running,
-    }
-}
-
-pub fn is_terminal_stage(stage: &str) -> bool {
-    matches!(stage, "COMPLETED" | "CANCELED" | "ERROR" | "DELETED")
-}
-
-/// A run log's lines. An unterminated last line may still be mid-flush, so it
-/// only counts once the writer has exited (`drain`).
-pub fn log_lines(text: &str, drain: bool) -> impl Iterator<Item = &str> {
-    text.split_inclusive('\n')
-        .filter_map(move |line| match line.strip_suffix('\n') {
-            Some(line) => Some(line.strip_suffix('\r').unwrap_or(line)),
-            None => drain.then_some(line),
-        })
 }
 
 #[cfg(test)]
@@ -424,7 +386,6 @@ mod tests {
     fn tinker_descriptor_round_trips_as_a_local_handle() {
         let json = r#"{"kind":"tinker_job","jobId":"/tmp/run"}"#;
         let descriptor = BackendDescriptor::parse(json).unwrap();
-        assert_eq!(descriptor.local_ref().unwrap(), "/tmp/run");
         assert_eq!(
             BackendDescriptor::parse(&descriptor.to_json())
                 .unwrap()
@@ -475,16 +436,5 @@ mod tests {
             got.get(PYTHONIOENCODING).map(String::as_str),
             Some("cp1252")
         );
-    }
-
-    #[test]
-    fn log_lines_hold_back_a_partial_last_line_until_drained() {
-        let text = "a\r\nb\n{\"partial\": ";
-        assert_eq!(log_lines(text, false).collect::<Vec<_>>(), ["a", "b"]);
-        assert_eq!(
-            log_lines(text, true).collect::<Vec<_>>(),
-            ["a", "b", "{\"partial\": "]
-        );
-        assert_eq!(log_lines("", true).count(), 0);
     }
 }

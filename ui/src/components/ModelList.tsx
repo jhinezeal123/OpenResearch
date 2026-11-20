@@ -1,0 +1,527 @@
+import { useEffect, useId, useLayoutEffect, useRef, useState, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
+import { flushSync } from "react-dom";
+import { Check, ChevronDown, ChevronRight, Gift, History, Star } from "lucide-react";
+import { fmtNumber, tidyModelName } from "../api";
+import { m } from "../paraglide/messages.js";
+import { CLAUDE_TIERS, type ModelLine, type ModelOffer } from "../modelLines";
+import { harnessKey } from "../modelSelection";
+import { AgentIconTile } from "./AgentIcon";
+import { agentLab, LabMark, LABS, ModelMark, modelLab } from "./HarnessLogo";
+import type { PickerAgent } from "./pickerAgents";
+import { Tooltip } from "./ui";
+import { cn } from "./ui/cn";
+
+export type PickerLine = ModelLine<PickerAgent>;
+export type PickedFrom = "free" | "favorites" | "lab" | "older" | "search";
+type PickerOffer = ModelOffer<PickerAgent>;
+
+/** A section's title bar: stuck, it spans the list's padding and covers the rows scrolling under it. */
+const BAR = "sticky -top-1 z-10 -mx-1 bg-background px-1 after:absolute after:inset-x-0 after:top-full after:h-px data-stuck:after:bg-border-variant";
+const HEADER = "flex h-7 w-full items-center gap-1.5 rounded-md ps-2.5 pe-2 pt-1 text-xs font-medium text-muted outline-none";
+const ROW = [
+  "flex min-h-8 items-center gap-1 rounded-md ps-2 pe-1 hover:bg-hover-muted has-[[data-nav]:focus]:bg-hover-muted",
+  "has-[[data-nav]:focus-visible]:bg-hover-muted has-[[data-nav]:focus-visible]:outline-2 has-[[data-nav]:focus-visible]:outline-solid has-[[data-nav]:focus-visible]:outline-focus has-[[data-nav]:focus-visible]:-outline-offset-2",
+].join(" ");
+/** The row Enter picks from the search, marked as a focused row is so it never reads as the picked model. */
+const ENTRY = "group-has-[input:focus]/picker:bg-hover-muted group-has-[input:focus]/picker:outline-2 group-has-[input:focus]/picker:outline-solid group-has-[input:focus]/picker:outline-focus group-has-[input:focus]/picker:-outline-offset-2";
+const MAIN = "flex min-w-0 flex-1 items-center gap-2 self-stretch text-start text-sm outline-none";
+const BADGE = "shrink-0 rounded-sm px-1 text-xs leading-4";
+
+/** A catalog this long (OpenRouter's) lists only what another agent offers too until a search finds the rest. */
+const CATALOG_LINES = 60;
+/** How many of the free models Free lists until expanded. */
+const FREE_SHOWN = 2;
+
+export const FREE = "free";
+const FAVORITES = "favorites";
+export const OTHER = "other";
+const OLDER = "older";
+
+interface Section {
+  id: string;
+  name: string;
+  mark: (size: number) => ReactNode;
+  lines: PickerLine[];
+}
+
+export function lineLab(line: PickerLine) {
+  const [offer] = line.offers;
+  return modelLab(offer.model, offer.tile.harness.id);
+}
+
+/** The section listing `line` among the picker's and Settings' categories: Free for a free model, else its lab's. */
+export function lineSection(line: PickerLine) {
+  return line.offers[0].model.free ? FREE : lineLab(line) ?? OTHER;
+}
+
+/** Where a section goes: the user's order first, then Free, the labs it doesn't name in `LABS` order, and Other models last. */
+function sectionRank(id: string, order: readonly string[]) {
+  const chosen = order.indexOf(id);
+  if (chosen >= 0) return chosen;
+  if (id === FREE) return -1;
+  const lab = LABS.findIndex((entry) => entry.lab === id);
+  return lab >= 0 ? order.length + lab : Infinity;
+}
+
+export function sectionName(id: string) {
+  return id === FREE ? m.model_picker_free() : LABS.find((entry) => entry.lab === id)?.name ?? m.model_picker_other();
+}
+
+export function SectionMark({ id, size }: { id: string; size: number }) {
+  if (id === FREE) return <Gift size={size} aria-hidden="true" className="shrink-0 text-accent-red" />;
+  return <LabMark lab={LABS.find((entry) => entry.lab === id)?.lab} size={size} />;
+}
+
+/** Lines in section order, Claude's biggest tier first, otherwise as grouped. */
+export function bySection(lines: PickerLine[], order: readonly string[]) {
+  const ranks = new Map(lines.map((line, index) => {
+    const words = line.family.split(" ");
+    return [line, [sectionRank(lineSection(line), order), CLAUDE_TIERS.findIndex((tier) => words.includes(tier)), index]];
+  }));
+  return [...lines].sort((a, b) => {
+    const [x, y] = [ranks.get(a)!, ranks.get(b)!];
+    return x[0] - y[0] || x[1] - y[1] || x[2] - y[2];
+  });
+}
+
+/**
+ * Where a click on a model's name runs it: the agent it runs on now, else one of OpenCode's,
+ * else the lab's own agent, else the first that offers it.
+ */
+function autoAgent(line: PickerLine, agents: PickerAgent[], current: PickerAgent | undefined) {
+  const lab = lineLab(line);
+  return (current && agents.includes(current) ? current : undefined)
+    ?? agents.find((agent) => agent.harness.id === "opencode")
+    ?? agents.find((agent) => lab && agentLab(agent.harness.id, agent.harness.logo) === lab)
+    ?? agents[0];
+}
+
+/** The agents offering `line`, in Settings' order. */
+function lineAgents(line: PickerLine, agents: PickerAgent[]) {
+  return agents.filter((agent) => line.offers.some((offer) => offer.tile === agent));
+}
+
+/** The line offering OpenCode's model `id`, as the model feed names models. */
+export function feedLine(lines: PickerLine[], id: string) {
+  return lines.find((line) => line.offers.some((offer) => offer.tile.harness.id === "opencode" && offer.model.id === id));
+}
+
+export function lineName(line: PickerLine) {
+  return tidyModelName(line.label);
+}
+
+/** Whether `line` has every one of the lowercase search `words` in its name, its models' ids or its agents' names. */
+export function matches(line: PickerLine, words: string[]) {
+  const text = [line.label, line.key, ...line.offers.flatMap((offer) => [offer.model.id, offer.tile.name])].join(" ").toLowerCase();
+  return words.every((word) => text.includes(word));
+}
+
+/** Which way Left and Right move along a line of text: 1 toward its end, -1 toward its start. */
+function inlineStep(event: KeyboardEvent<HTMLElement>) {
+  const rtl = getComputedStyle(event.currentTarget).direction === "rtl";
+  return event.key === (rtl ? "ArrowLeft" : "ArrowRight") ? 1 : event.key === (rtl ? "ArrowRight" : "ArrowLeft") ? -1 : 0;
+}
+
+/** The models, one collapsible section per category, beside a rail that jumps between sections; a search lists its matches instead. */
+export function ModelList({
+  lines,
+  agents,
+  filter,
+  onClearFilter,
+  favorites,
+  released,
+  pointedAt,
+  featured,
+  order,
+  collapsed: initiallyCollapsed,
+  onCollapse,
+  selectedLine,
+  selectedAgent,
+  lockedHarness,
+  onPick,
+  onToggleFavorite,
+  children,
+}: {
+  lines: PickerLine[];
+  agents: PickerAgent[];
+  filter: string;
+  onClearFilter: () => void;
+  favorites: ReadonlySet<string>;
+  /** The models released lately, newest first. */
+  released: readonly PickerLine[];
+  /** The key of the model a popup pointed at, listed even where Free folds its rest away. */
+  pointedAt?: string;
+  /** OpenCode model ids the Free section lists first, in this order. */
+  featured: readonly string[];
+  order: readonly string[];
+  collapsed: readonly string[];
+  onCollapse: (collapsed: string[]) => void;
+  selectedLine?: PickerLine;
+  selectedAgent?: PickerAgent;
+  /** The agent the chat can't leave right now, by `harnessKey`: other agents' models open a new chat instead. */
+  lockedHarness?: string;
+  /** `from` is the section the row was in, as telemetry names it. */
+  onPick: (line: PickerLine, agent: PickerAgent, from: PickedFrom) => void;
+  onToggleFavorite: (family: string) => void;
+  /** Rows after the models. */
+  children?: ReactNode;
+}) {
+  const uid = useId();
+  const listRef = useRef<HTMLDivElement>(null);
+  const railRef = useRef<HTMLDivElement>(null);
+  const jumping = useRef(false);
+  const starred = useRef<{ star: HTMLElement; top: number }>(undefined);
+  const [collapsed, setCollapsed] = useState(() => new Set(initiallyCollapsed));
+  const [olderOpen, setOlderOpen] = useState(false);
+  const [freeOpen, setFreeOpen] = useState(false);
+  const [spied, setSpied] = useState<string>();
+  const [stuck, setStuck] = useState<string>();
+
+  const words = filter.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const searching = words.length > 0;
+  const counts = new Map(agents.map((agent) => [agent, lines.filter((line) => line.offers.some((offer) => offer.tile === agent)).length]));
+  const fresh = new Set(released);
+  const featuredLines = [...new Set(featured.flatMap((id) => feedLine(lines, id) ?? []))];
+  const listed = (line: PickerLine) =>
+    line === selectedLine || favorites.has(line.family) || fresh.has(line) || featuredLines.includes(line)
+    || lineAgents(line, agents).some((agent) => counts.get(agent)! <= CATALOG_LINES);
+
+  const ordered = bySection(lines, order);
+  const current = ordered.filter((line) => (!line.older || line === selectedLine) && listed(line));
+  const unlisted = ordered.filter((line) => !listed(line)).length;
+
+  const categories: Section[] = [];
+  for (const line of current) {
+    const id = lineSection(line);
+    const section = categories.find((entry) => entry.id === id);
+    if (section) section.lines.push(line);
+    else categories.push({ id, name: sectionName(id), mark: (size) => <SectionMark id={id} size={size} />, lines: [line] });
+  }
+  const featuredRank = (line: PickerLine) => featuredLines.includes(line) ? featuredLines.indexOf(line) : Infinity;
+  categories.find((section) => section.id === FREE)?.lines.sort((a, b) => featuredRank(a) - featuredRank(b));
+  const older = ordered.filter((line) => line.older && line !== selectedLine && listed(line));
+  const olderVersions = (lines: PickerLine[]): Section => ({ id: OLDER, name: m.model_picker_older_versions(), mark: (size) => <History size={size} aria-hidden="true" />, lines });
+  const sections = [
+    {
+      id: FAVORITES,
+      name: m.model_picker_favorites(),
+      mark: (size: number) => <Star size={size} aria-hidden="true" className="fill-current text-accent-amber" />,
+      lines: current.filter((line) => favorites.has(line.family)),
+    },
+    ...categories,
+    olderVersions(older),
+  ].filter((section) => section.lines.length > 0);
+
+  const found = searching ? ordered.filter((line) => matches(line, words)) : [];
+  const foundOlder = olderVersions(found.filter((line) => line.older));
+  const active = searching ? undefined : sections.some((section) => section.id === spied) ? spied : sections[0]?.id;
+  const isOpen = (id: string) => searching || (id === OLDER ? olderOpen : !collapsed.has(id));
+
+  useEffect(() => {
+    railRef.current?.querySelector(`[data-rail="${active}"]`)?.scrollIntoView({ block: "nearest" });
+  }, [active]);
+
+  /** The section whose header sits at the top of the list, and whether rows scroll under it there. */
+  const spy = () => {
+    const list = listRef.current;
+    if (!list) return;
+    let top: HTMLElement | undefined;
+    for (const element of list.querySelectorAll<HTMLElement>("[data-section]")) {
+      if (element.offsetTop <= list.scrollTop + 1) top = element;
+    }
+    setStuck(top && top.offsetTop < list.scrollTop ? top.dataset.section : undefined);
+    if (!jumping.current && !searching) setSpied(top?.dataset.section ?? sections[0]?.id);
+  };
+
+  /** Scrolls the list to `top` without spying the scroll it causes. */
+  const scrollTo = (top: number) => {
+    const list = listRef.current;
+    if (!list) return;
+    jumping.current = true;
+    list.scrollTop = top;
+    requestAnimationFrame(() => { jumping.current = false; });
+  };
+
+  // A new search starts at the top, and so does the list it leaves.
+  useLayoutEffect(() => {
+    if (listRef.current) listRef.current.scrollTop = 0;
+    spy();
+  }, [filter]);
+
+  // A star adds its row to Favorites above, or takes it away: the row stays under the pointer.
+  useLayoutEffect(() => {
+    const held = starred.current;
+    starred.current = undefined;
+    if (held?.star.isConnected && listRef.current) scrollTo(listRef.current.scrollTop + held.star.getBoundingClientRect().top - held.top);
+  }, [favorites]);
+
+  /** Moves focus from a section or row to its section's button on the rail; a search's results belong to no section. */
+  const toRail = (from: HTMLElement) => {
+    if (searching) return false;
+    const rail = railRef.current;
+    const id = from.closest<HTMLElement>("[data-section]")?.dataset.section;
+    const target = rail?.querySelector<HTMLElement>(`[data-rail="${id}"]`) ?? rail?.querySelector<HTMLElement>("[data-rail]");
+    target?.focus();
+    return Boolean(target);
+  };
+
+  /** Up and Down move along the rail; toward the end of the line enters the section's header, or its first row. */
+  const railKeys = (event: KeyboardEvent<HTMLElement>) => {
+    const buttons = [...event.currentTarget.querySelectorAll<HTMLElement>("[data-rail]")];
+    const index = buttons.indexOf(event.target as HTMLElement);
+    const vertical = event.key === "ArrowDown" ? 1 : event.key === "ArrowUp" ? -1 : 0;
+    if (vertical) buttons[(index + vertical + buttons.length) % buttons.length].focus();
+    else if (inlineStep(event) > 0) {
+      const section = listRef.current?.querySelector(`[data-section="${(event.target as HTMLElement).dataset.rail}"]`);
+      (section ?? listRef.current)?.querySelector<HTMLElement>("[data-nav]")?.focus();
+    } else return;
+    event.preventDefault();
+    event.stopPropagation();
+  };
+
+  const toggle = (id: string, open = !isOpen(id)) => {
+    if (id === OLDER) return setOlderOpen(open);
+    const next = new Set(collapsed);
+    if (open) next.delete(id);
+    else next.add(id);
+    setCollapsed(next);
+    onCollapse([...next]);
+  };
+
+  const jump = (id: string) => {
+    flushSync(() => {
+      if (!isOpen(id)) toggle(id, true);
+      if (searching) onClearFilter();
+    });
+    const target = listRef.current?.querySelector<HTMLElement>(`[data-section="${id}"]`);
+    if (!target) return;
+
+    // The jump's own scroll event lands before the next frame; a short last section never reaches the top to be spied.
+    scrollTo(target.offsetTop);
+    setSpied(id);
+  };
+
+  const star = (family: string, event: MouseEvent<HTMLElement>) => {
+    starred.current = { star: event.currentTarget, top: event.currentTarget.getBoundingClientRect().top };
+    onToggleFavorite(family);
+  };
+
+  // Enter picks the first match while the search has focus.
+  const entry = searching ? (found.find((line) => !line.older) ?? found[0]) : undefined;
+
+  const row = (line: PickerLine, section?: Section) => (
+    <ModelRow
+      key={line.key}
+      line={line}
+      agents={lineAgents(line, agents)}
+      selected={line === selectedLine}
+      entry={line === entry}
+      onLeave={toRail}
+      currentAgent={selectedAgent}
+      selectedAgent={line === selectedLine ? selectedAgent : undefined}
+      lockedHarness={lockedHarness}
+      favorite={favorites.has(line.family)}
+      fresh={fresh.has(line)}
+      freeBadge={section?.id !== FREE}
+      onPick={(line, agent) => onPick(line, agent, searching || !section ? "search" : section.id === FREE || section.id === FAVORITES || section.id === OLDER ? section.id : "lab")}
+      onToggleFavorite={star}
+    />
+  );
+
+  /** Free's first few models, then the rest once expanded; the chat's own model and the one a popup pointed at always show. */
+  const freeRows = (section: Section) => {
+    const hidden = section.lines.filter((line, index) => index >= FREE_SHOWN && line !== selectedLine && line.key !== pointedAt);
+    const shown = freeOpen ? section.lines : section.lines.filter((line) => !hidden.includes(line));
+    return (
+      <>
+        {shown.map((line) => row(line, section))}
+        {hidden.length > 0 && (
+          <button
+            type="button"
+            data-nav
+            aria-expanded={freeOpen}
+            onClick={() => setFreeOpen(!freeOpen)}
+            className="flex h-7 w-full items-center gap-1 rounded-md ps-8 pe-2 text-xs text-muted outline-none hover:bg-hover-muted hover:text-text focus-visible:bg-hover-muted focus-visible:text-text"
+          >
+            {freeOpen ? m.model_picker_fewer_free() : m.model_picker_more_free({ count: fmtNumber(hidden.length) })}
+            <ChevronDown size={12} aria-hidden="true" className={cn("shrink-0 motion-safe:transition-transform", freeOpen && "rotate-180")} />
+          </button>
+        )}
+      </>
+    );
+  };
+
+  const group = (section: Section) => {
+    const header = `${uid}${section.id}`;
+    const open = isOpen(section.id);
+    return (
+      <div key={section.id} role="group" aria-labelledby={header} data-section={section.id}>
+        <div data-stuck={section.id === stuck || undefined} className={BAR}>
+          {searching ? (
+            <div id={header} className={HEADER}>
+              {section.mark(12)}
+              {section.name}
+            </div>
+          ) : (
+            <button
+              id={header}
+              type="button"
+              data-nav
+              aria-expanded={open}
+              onClick={() => toggle(section.id)}
+              onKeyDown={(event) => {
+                if (inlineStep(event) < 0 && toRail(event.currentTarget)) event.preventDefault();
+              }}
+              className={cn(HEADER, "text-start hover:text-text focus-visible:bg-hover-muted focus-visible:text-text")}
+            >
+              {section.mark(12)}
+              <span className="truncate">{section.name}</span>
+              <ChevronRight size={12} aria-hidden="true" className={cn("shrink-0 motion-safe:transition-transform", open ? "rotate-90" : "rtl:rotate-180")} />
+            </button>
+          )}
+        </div>
+        {open && (section.id === FREE ? freeRows(section) : section.lines.map((line) => row(line, section)))}
+      </div>
+    );
+  };
+
+  return (
+    <div className="flex min-h-0 flex-1">
+      {sections.length > 1 && (
+        <div ref={railRef} onKeyDown={railKeys} className="flex w-9 shrink-0 flex-col items-center gap-1 overflow-y-auto border-e border-border-variant py-2 [scrollbar-width:none]">
+          {sections.map((section) => (
+            <Tooltip key={section.id} interactive side="start" content={section.name} className="rounded-md">
+              <button
+                type="button"
+                tabIndex={-1}
+                data-rail={section.id}
+                aria-label={section.name}
+                aria-current={section.id === active || undefined}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => jump(section.id)}
+                className={cn("relative grid size-6 place-items-center rounded-md outline-none hover:bg-hover-muted focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-focus focus-visible:-outline-offset-1", section.id === active && "bg-hover-muted")}
+              >
+                {section.id === active && <span aria-hidden="true" className="absolute -start-1 h-3.5 w-[3px] rounded-e-full bg-text" />}
+                {section.mark(14)}
+              </button>
+            </Tooltip>
+          ))}
+        </div>
+      )}
+      <div ref={listRef} onScroll={spy} className="model-menu-list relative min-h-0 flex-1 scroll-pt-7 overflow-x-hidden overflow-y-auto p-1">
+        {searching ? (
+          <>
+            {found.filter((line) => !line.older).map((line) => row(line))}
+            {foundOlder.lines.length > 0 && group(foundOlder)}
+          </>
+        ) : (
+          sections.map(group)
+        )}
+        {unlisted > 0 && !searching && <div className="px-2 py-1.5 text-sm text-muted">{m.model_picker_more({ count: fmtNumber(unlisted) })}</div>}
+        {searching && found.length === 0 && <div className="px-2 py-1.5 text-sm text-muted">{m.model_picker_no_matches({ query: filter.trim() })}</div>}
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function ModelRow({ line, agents, selected, entry, onLeave, currentAgent, selectedAgent, lockedHarness, favorite, fresh, freeBadge, onPick, onToggleFavorite }: {
+  line: PickerLine;
+  agents: PickerAgent[];
+  selected: boolean;
+  /** The row Enter picks from the search. */
+  entry: boolean;
+  /** Left from the row's first stop: the rail's turn. */
+  onLeave: (from: HTMLElement) => boolean;
+  currentAgent?: PickerAgent;
+  selectedAgent?: PickerAgent;
+  lockedHarness?: string;
+  favorite: boolean;
+  fresh: boolean;
+  /** Free's own rows need no badge saying so. */
+  freeBadge: boolean;
+  onPick: (line: PickerLine, agent: PickerAgent) => void;
+  onToggleFavorite: (family: string, event: MouseEvent<HTMLElement>) => void;
+}) {
+  const free = line.offers[0].model.free;
+  const name = lineName(line);
+  const spoken = free ? `${name}, ${m.model_picker_free()}` : name;
+  const auto = autoAgent(line, agents, currentAgent);
+  const newChat = (agent: PickerAgent) => lockedHarness !== undefined && harnessKey(agent.harness) !== lockedHarness;
+  // Arrow keys along a row move between its agents; Up and Down move between rows.
+  const along = (event: KeyboardEvent<HTMLElement>) => {
+    const step = inlineStep(event);
+    if (!step) return;
+    const stops = [...event.currentTarget.closest("[data-row]")!.querySelectorAll<HTMLElement>("[data-nav], [data-agent]")];
+    const next = stops[stops.indexOf(event.currentTarget) + step];
+    if (!next && !(step < 0 && onLeave(event.currentTarget))) return;
+    event.preventDefault();
+    next?.focus();
+  };
+  return (
+    <div data-row={line.key} className={cn(ROW, selected && "bg-hover-muted", entry && ENTRY)}>
+      <button
+        type="button"
+        data-nav
+        className={MAIN}
+        aria-label={m.model_picker_model_on({ model: spoken, agent: auto.name })}
+        aria-description={newChat(auto) ? m.model_picker_new_chat_with({ agent: auto.name }) : undefined}
+        aria-pressed={selected}
+        onKeyDown={along}
+        onClick={() => onPick(line, auto)}
+      >
+        <ModelMark model={line.offers[0].model} harness={line.offers[0].tile.harness.id} size={16} />
+        <span className="min-w-0 truncate">{name}</span>
+        {free && freeBadge && <FreeBadge />}
+        {fresh && <span className={cn(BADGE, "bg-accent-blue-subtle text-accent-blue-strong")}>{m.model_picker_new()}</span>}
+        {selected && <Check size={14} className="shrink-0 text-accent-blue-strong" aria-hidden="true" />}
+      </button>
+      <span className="flex shrink-0 items-center">
+        {agents.length > 1 && agents.map((agent) => (
+          <Tooltip key={agent.key} interactive content={newChat(agent) ? m.model_picker_new_chat_with({ agent: agent.name }) : agent.name} className="rounded-md">
+            <button
+              type="button"
+              tabIndex={-1}
+              data-agent
+              aria-label={m.model_picker_model_on({ model: spoken, agent: agent.name })}
+              aria-description={newChat(agent) ? m.model_picker_new_chat_with({ agent: agent.name }) : undefined}
+              aria-pressed={agent === selectedAgent}
+              onKeyDown={along}
+              onClick={() => onPick(line, agent)}
+              className={cn(
+                "grid h-7 w-6 place-items-center rounded-md outline-none transition-opacity focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-focus",
+                agent === selectedAgent ? "" : agent === auto ? "opacity-90 hover:opacity-100" : "opacity-50 hover:opacity-100",
+              )}
+            >
+              <span className={cn("rounded-md", agent === selectedAgent && "ring-1 ring-accent-blue-strong")}>
+                <AgentIconTile icon={agent.icon} brand={agent.brand} size="xs" />
+              </span>
+            </button>
+          </Tooltip>
+        ))}
+      </span>
+      <Tooltip interactive content={favorite ? m.model_picker_favorite_remove() : m.model_picker_favorite_add()} className="rounded-md">
+        <button
+          type="button"
+          tabIndex={-1}
+          data-agent
+          aria-label={favorite ? m.model_picker_favorite_remove() : m.model_picker_favorite_add()}
+          aria-pressed={favorite}
+          onKeyDown={along}
+          onClick={(event) => onToggleFavorite(line.family, event)}
+          className="grid h-7 w-6 place-items-center rounded-md text-muted outline-none hover:text-text focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-focus"
+        >
+          <Star size={14} aria-hidden="true" className={cn(favorite && "fill-current text-accent-amber")} />
+        </button>
+      </Tooltip>
+    </div>
+  );
+}
+
+function FreeBadge() {
+  return <span className={cn(BADGE, "bg-accent-green-subtle text-accent-green")}>{m.model_picker_free()}</span>;
+}
+
+export function offerOn(line: PickerLine | undefined, agent: PickerAgent | undefined, model: string | null): PickerOffer | undefined {
+  return line?.offers.find((offer) => offer.tile === agent && offer.model.id === model);
+}

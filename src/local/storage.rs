@@ -13,7 +13,7 @@ use super::git;
 
 pub async fn prepare() -> Result<()> {
     tokio::task::spawn_blocking(|| {
-        let source = normalize(&git::legacy_cache_root())?;
+        let source = normalize(&git::cache_root())?;
         let target = normalize(&crate::store::data_dir())?;
         if source == target {
             return Ok(());
@@ -146,7 +146,7 @@ fn migrate(source: &Path, target: &Path, copy: bool) -> Result<()> {
     Ok(())
 }
 
-fn copy_verified(source: &Path, target: &Path) -> Result<()> {
+pub(super) fn copy_verified(source: &Path, target: &Path) -> Result<()> {
     std::fs::create_dir(target)?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;

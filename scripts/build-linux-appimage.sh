@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Package an `orx` built with `--features desktop` into OpenResearch-<arch>.AppImage,
 # bundling WebKitGTK so the app runs without it installed. Run on the oldest
-# glibc to support (CI uses Ubuntu 22.04) with libwebkit2gtk-4.1-dev and
-# patchelf installed.
+# glibc to support (CI uses Ubuntu 22.04) with libwebkit2gtk-4.1-dev,
+# libgstreamer1.0-dev and patchelf installed.
 #
 #   scripts/build-linux-appimage.sh <orx binary> <output dir>
 set -euo pipefail
@@ -80,6 +80,11 @@ DEPLOY_GTK_VERSION=3 linuxdeploy \
   --icon-file "$ROOT/linux/OpenResearch.png" \
   --custom-apprun "$ROOT/linux/AppRun" \
   --plugin gtk
+
+# linuxdeploy wraps custom entry points with its hooks. AppRun must capture the
+# host environment before running those hooks itself, exactly once.
+install -m755 "$ROOT/linux/AppRun" "$APPDIR/AppRun"
+rm -f "$APPDIR/AppRun.wrapped"
 
 # linuxdeploy leaves files below usr/lib looking beside themselves, so they
 # would load the host's libraries (or none); point them at the bundled usr/lib.

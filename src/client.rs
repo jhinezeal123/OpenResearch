@@ -662,14 +662,22 @@ async fn shared_projects_request(
     })
 }
 
+/// How long a shared-project transfer waits on a connection that stops moving; a whole-request
+/// timeout would cut off a large file.
+fn transfer_stall() -> std::time::Duration {
+    crate::config::paced(std::time::Duration::from_secs(60))
+}
+
 /// Uploads `file`, the `.orx` written with `manifest`, as the link for
 /// `source_project_id`: `POST /shared-projects`, a PUT to the presigned URL,
 /// then `POST /shared-projects/{id}/publish`. Publishing again replaces the file behind the same link.
+/// `on_progress` hears the bytes uploaded so far and the file's size.
 pub async fn publish_project(
     creds: &Credentials,
     source_project_id: &str,
     manifest: &crate::local::share::Manifest,
     file: &std::path::Path,
+    mut on_progress: impl FnMut(u64, u64) + Send + 'static,
 ) -> Result<PublishedProject> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -701,7 +709,11 @@ pub async fn publish_project(
             crate::store::human_bytes(MAX_PUBLISHED_PROJECT_BYTES)
         ));
     }
-    let reserved: Reserved = shared_projects_request(
+    // Runs past the page's request, so these are its only timeouts.
+    let stall = transfer_stall();
+    let stalled =
+        |_| anyhow!("openresearch.sh stopped answering. Check your connection and try again.");
+    let reserved = shared_projects_request(
         creds,
         Method::POST,
         "/shared-projects",
@@ -717,40 +729,66 @@ pub async fn publish_project(
             "byteSize": byte_size,
             "sha256": sha256,
         })),
-    )
-    .await?
-    .json()
-    .await?;
+    );
+    let reserved: Reserved =
+        tokio::time::timeout(stall, async { anyhow::Ok(reserved.await?.json().await?) })
+            .await
+            .map_err(stalled)??;
     let body = tokio::fs::File::open(file).await?;
+    on_progress(0, byte_size);
+    let sent = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = sent.clone();
+    let body = futures::StreamExt::inspect(tokio_util::io::ReaderStream::new(body), move |chunk| {
+        if let Ok(chunk) = chunk {
+            let len = chunk.len() as u64;
+            let sent = counter.fetch_add(len, std::sync::atomic::Ordering::Relaxed) + len;
+            on_progress(sent, byte_size);
+        }
+    });
     // The presigned URL signs the length, and R2 refuses chunked uploads.
     let mut put = http()
         .put(&reserved.upload.url)
         .header(reqwest::header::CONTENT_LENGTH, byte_size)
-        .body(reqwest::Body::wrap_stream(
-            tokio_util::io::ReaderStream::new(body),
-        ));
+        .body(reqwest::Body::wrap_stream(body));
     for (header, value) in &reserved.upload.headers {
         put = put.header(header, value);
     }
-    let response = put
-        .send()
-        .await
-        .map_err(|err| anyhow!("Uploading the project failed: {err}"))?;
+    let upload = put.send();
+    tokio::pin!(upload);
+    let mut seen = 0;
+    let response = loop {
+        tokio::select! {
+            response = &mut upload => {
+                break response.map_err(|err| anyhow!("Uploading the project failed: {err}"))?;
+            }
+            () = tokio::time::sleep(stall) => {
+                let now = sent.load(std::sync::atomic::Ordering::Relaxed);
+                if now == seen {
+                    return Err(anyhow!(
+                        "Uploading the project stalled. Check your connection and try again."
+                    ));
+                }
+                seen = now;
+            }
+        }
+    };
     if !response.status().is_success() {
         return Err(anyhow!(
             "Uploading the project failed ({}).",
             response.status()
         ));
     }
-    let published: Published = shared_projects_request(
+    let publish_path = format!("/shared-projects/{}/publish", reserved.shared_project_id);
+    let published = shared_projects_request(
         creds,
         Method::POST,
-        &format!("/shared-projects/{}/publish", reserved.shared_project_id),
+        &publish_path,
         Some(serde_json::json!({ "uploadId": reserved.upload_id })),
-    )
-    .await?
-    .json()
-    .await?;
+    );
+    let published: Published =
+        tokio::time::timeout(stall, async { anyhow::Ok(published.await?.json().await?) })
+            .await
+            .map_err(stalled)??;
     Ok(published.shared_project)
 }
 
@@ -794,6 +832,25 @@ pub fn published_project_slug(link: &str) -> Option<&str> {
     (slug.len() == 12 && slug.bytes().all(|b| b.is_ascii_alphanumeric())).then_some(slug)
 }
 
+/// The model feed as openresearch.sh serves it, unparsed; no sign-in — `GET /models/feed`.
+pub async fn model_feed(api_url: &str) -> Result<String> {
+    let url = format!("{api_url}/models/feed");
+    let response = http()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|err| anyhow!("Could not reach the API at {api_url}: {err}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(anyhow!("Fetching {url} failed ({status})"));
+    }
+    response
+        .text()
+        .await
+        .map_err(|err| anyhow!("Could not read {url}: {err}"))
+}
+
 /// A public link request's response, or why the link doesn't open.
 async fn public_project_response(api_url: &str, path: &str) -> Result<reqwest::Response> {
     let response = http()
@@ -826,27 +883,32 @@ pub async fn get_public_project(api_url: &str, slug: &str) -> Result<PublicProje
 }
 
 /// Saves a link's `.orx` file to `out`; no sign-in — `GET /shared-projects/by-slug/{slug}/file`.
+/// `on_progress` hears the bytes received so far and the file's size when the response gives it.
 pub async fn download_public_project(
     api_url: &str,
     slug: &str,
     out: &std::path::Path,
+    mut on_progress: impl FnMut(u64, Option<u64>),
 ) -> Result<()> {
     use futures::StreamExt;
     use tokio::io::AsyncWriteExt;
-    // A whole-request timeout would cut off a large file; a stall is what to give up on.
-    const STALL: std::time::Duration = std::time::Duration::from_secs(60);
+    let stall = transfer_stall();
+    let stalled =
+        |_| anyhow!("Downloading the project stalled. Check your connection and try again.");
     let response = tokio::time::timeout(
-        STALL,
+        stall,
         public_project_response(api_url, &format!("/shared-projects/by-slug/{slug}/file")),
     )
     .await
-    .map_err(|_| anyhow!("Downloading the project stalled."))??;
+    .map_err(stalled)??;
     let mut file = tokio::fs::File::create(out).await?;
     let mut received = 0u64;
+    let total = response.content_length();
+    on_progress(0, total);
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = tokio::time::timeout(STALL, stream.next())
+    while let Some(chunk) = tokio::time::timeout(stall, stream.next())
         .await
-        .map_err(|_| anyhow!("Downloading the project stalled."))?
+        .map_err(stalled)?
     {
         let chunk = chunk.map_err(|err| anyhow!("Downloading the project failed: {err}"))?;
         received += chunk.len() as u64;
@@ -857,6 +919,7 @@ pub async fn download_public_project(
             ));
         }
         file.write_all(&chunk).await?;
+        on_progress(received, total);
     }
     file.flush().await?;
     Ok(())
@@ -1091,9 +1154,36 @@ pub struct ResolvedPaper {
     /// Canonical versionless id (`2401.12345`).
     pub paper_id: String,
     pub title: Option<String>,
+    /// Full names in byline order, from the paper's BibTeX.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub authors: Vec<String>,
+    /// First publication, in Unix milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<i64>,
     /// Linked GitHub repo — author repos first, then most stars.
     pub repo_url: Option<String>,
     pub repo_stars: Option<i64>,
+}
+
+/// The names in a BibTeX entry's `author` field, each as "Given Family".
+fn bibtex_authors(bibtex: &str) -> Vec<String> {
+    let Some(start) = bibtex
+        .find("author={")
+        .map(|index| index + "author={".len())
+    else {
+        return Vec::new();
+    };
+    let Some(len) = bibtex[start..].find('}') else {
+        return Vec::new();
+    };
+    bibtex[start..start + len]
+        .split(" and ")
+        .map(|name| match name.split_once(',') {
+            Some((family, given)) => format!("{} {}", given.trim(), family.trim()),
+            None => name.split_whitespace().collect::<Vec<_>>().join(" "),
+        })
+        .filter(|name| !name.is_empty())
+        .collect()
 }
 
 /// Resolve an arXiv or alphaXiv paper id to title + linked GitHub repo. `/papers/v3/{id}` scrapes
@@ -1125,11 +1215,19 @@ pub async fn resolve_paper(paper_id: &str) -> Result<ResolvedPaper> {
         group_id: Option<String>,
         universal_id: Option<String>,
         title: Option<String>,
+        citation_bibtex: Option<String>,
+        first_publication_date: Option<i64>,
     }
     let paper = res.json::<Paper>().await?;
     let mut resolved = ResolvedPaper {
         paper_id: paper.universal_id.unwrap_or_else(|| id.to_string()),
         title: paper.title,
+        authors: paper
+            .citation_bibtex
+            .as_deref()
+            .map(bibtex_authors)
+            .unwrap_or_default(),
+        published_at: paper.first_publication_date,
         repo_url: None,
         repo_stars: None,
     };
@@ -2148,6 +2246,13 @@ mod tests {
         PubmedDiscoveryOptions,
     };
     use serde_json::json;
+
+    #[test]
+    fn bibtex_authors_reads_both_name_orders() {
+        let bibtex = "@misc{eldan2023,\n  title={TinyStories},\n  author={Ronen Eldan and Li, Yuanzhi},\n  year={2023},\n}";
+        assert_eq!(super::bibtex_authors(bibtex), ["Ronen Eldan", "Yuanzhi Li"]);
+        assert!(super::bibtex_authors("@misc{x, title={No byline}}").is_empty());
+    }
 
     #[test]
     fn current_user_decodes_linked_and_legacy_accounts() {
@@ -3222,16 +3327,73 @@ mod tests {
             "project": { "name": "Tiny LM", "baselineBranch": "main" },
         }))
         .unwrap();
-        let published = publish_project(&creds, "project-1", &manifest, &file)
+        let uploaded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = uploaded.clone();
+        let published =
+            publish_project(&creds, "project-1", &manifest, &file, move |sent, total| {
+                record.lock().unwrap().push((sent, total))
+            })
             .await
             .unwrap();
+        let uploaded = uploaded.lock().unwrap().clone();
+        assert_eq!(uploaded.first(), Some(&(0, 5)));
+        assert_eq!(uploaded.last(), Some(&(5, 5)));
         assert_eq!(published.slug, "a1B2c3D4e5F6");
 
         let downloaded = dir.path().join("download.orx");
-        download_public_project(&base, &published.slug, &downloaded)
-            .await
-            .unwrap();
+        let mut progress = Vec::new();
+        download_public_project(&base, &published.slug, &downloaded, |received, total| {
+            progress.push((received, total))
+        })
+        .await
+        .unwrap();
         assert_eq!(std::fs::read(&downloaded).unwrap(), b"hello");
+        assert_eq!(progress.first(), Some(&(0, Some(5))));
+        assert_eq!(progress.last(), Some(&(5, Some(5))));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_upload_that_stops_answering_says_it_stalled() {
+        use axum::routing::{post, put};
+
+        if !crate::config::in_test_child(&["ORX_TEST_SPEEDUP"]) {
+            return;
+        }
+        std::env::set_var("ORX_TEST_SPEEDUP", "100");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let upload_url = format!("{base}/blob");
+        let app = axum::Router::new()
+            .route(
+                "/shared-projects",
+                post(move || async move {
+                    axum::Json(json!({
+                        "sharedProjectId": "link-1",
+                        "uploadId": "upload-1",
+                        "upload": { "url": upload_url, "headers": {} },
+                    }))
+                }),
+            )
+            .route("/blob", put(std::future::pending::<()>));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = crate::local::git::TemporaryDirectory::new("orx-publish-test").unwrap();
+        let file = dir.path().join("project.orx");
+        std::fs::write(&file, b"hello").unwrap();
+        let creds = Credentials {
+            api_url: base,
+            token: "pat".into(),
+        };
+        let manifest = serde_json::from_value(json!({
+            "format": 1,
+            "project": { "name": "Tiny LM", "baselineBranch": "main" },
+        }))
+        .unwrap();
+
+        let error = publish_project(&creds, "project-1", &manifest, &file, |_, _| {})
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("stalled"), "{error}");
         server.abort();
     }
 }

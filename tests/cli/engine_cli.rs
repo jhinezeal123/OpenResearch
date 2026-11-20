@@ -31,12 +31,11 @@ impl Sandbox {
 
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_orx"));
-        command
-            .env("HOME", &self.root)
+        crate::home::isolate_home(&mut command, &self.root)
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("ORX_DATA_DIR", self.data())
             .env("ORX_NO_UPDATE_CHECK", "1")
-            .env("ORX_RUN_ENGINE", "1")
+            .env("PATH", orx_test_support::agentless_path(&self.root))
             .env("ORX_SSH_CONFIG", self.server.config_path())
             .env("ORX_HOST_BIN_DIR", orx_test_support::host_binaries())
             .env("ORX_CHAT_SESSION_ID", "chat")
@@ -48,47 +47,8 @@ impl Sandbox {
         command
     }
 
-    fn connect(&self, engine: &str) {
-        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-        use std::io::Read;
-
-        std::fs::write(
-            self.root.join(".ssh/config"),
-            format!("Include {}\n", self.server.config_path().display()),
-        )
-        .unwrap();
-        let command = self.command();
-        let mut builder = CommandBuilder::new(command.get_program());
-        builder.args(command.get_args());
-        for (key, value) in command.get_envs() {
-            match value {
-                Some(value) => builder.env(key, value),
-                None => builder.env_remove(key),
-            }
-        }
-        builder.env("ORX_RUN_ENGINE", engine);
-        builder.args(["compute", "connect", "ssh", "--host", self.server.alias()]);
-        let pair = native_pty_system().openpty(PtySize::default()).unwrap();
-        let mut child = pair.slave.spawn_command(builder).unwrap();
-        drop(pair.slave);
-        let mut reader = pair.master.try_clone_reader().unwrap();
-        let output = std::thread::spawn(move || {
-            let mut output = String::new();
-            let _ = reader.read_to_string(&mut output);
-            output
-        });
-        if !wait_for(Duration::from_secs(60), || {
-            child.try_wait().unwrap().is_some()
-        }) {
-            child.kill().unwrap();
-        }
-        let status = child.wait().unwrap();
-        assert!(status.success(), "{}", output.join().unwrap());
-    }
-
     fn stop_service(&self) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_orx"))
-            .env("HOME", &self.root)
+        crate::home::isolate_home(&mut Command::new(env!("CARGO_BIN_EXE_orx")), &self.root)
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("ORX_DATA_DIR", self.data())
             .args(["ssh-service", "stop"])
@@ -226,18 +186,6 @@ fn git(repo: &Path, args: &[&str]) {
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");
-}
-
-fn supervise_processes(runs: &[&str]) -> Vec<String> {
-    let output = Command::new("ps")
-        .args(["-ax", "-o", "command="])
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter(|line| line.contains(" supervise ") && runs.iter().any(|run| line.contains(run)))
-        .map(str::to_owned)
-        .collect()
 }
 
 fn stdout(output: &Output) -> String {
@@ -384,7 +332,6 @@ fn ssh_runs_go_through_the_autostarted_engine() {
     assert_eq!(sandbox.terminal_notices(RUN_FREE).len(), 1);
     let kept = sandbox.data().join(format!("run-logs/{RUN_FREE}.log"));
     assert_eq!(std::fs::read_to_string(kept).unwrap(), "legacy output\n");
-    assert!(supervise_processes(&[&run, RUN_FREE, RUN_HELD]).is_empty());
     assert_eq!(sandbox.status(RUN_HELD), "running");
     let watched: i64 = sandbox
         .db()
@@ -581,7 +528,7 @@ async fn cancellation_labels_agree_in_runs_status_and_wait() {
             true,
             false,
             None,
-            "Cancelling…",
+            "Cancellation pending",
         ),
         (
             "cancelled",
@@ -750,58 +697,53 @@ fn session_hover_runs_preserve_their_fields_and_expose_cancellation_proof() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn abandon_warns_that_actual_compute_must_be_shut_down() {
-    use axum::{routing::get, Json, Router};
+async fn abandon_says_the_cancel_stays_pending_only_once_the_server_accepts() {
+    use axum::{http::StatusCode, Json, Router};
     use serde_json::json;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        Arc,
     };
 
     let sandbox = Sandbox::new();
-    let contact = Arc::new(Mutex::new("unreachable"));
-    let calls = Arc::new(AtomicUsize::new(0));
-    let (read_contact, abandoned) = (contact.clone(), calls.clone());
-    let app = Router::new()
-        .route(
-            "/api/v2/runs/run",
-            get(move || {
-                let contact = *read_contact.lock().unwrap();
-                async move { Json(json!({"id":"run", "contact":{"type":contact}})) }
-            }),
-        )
-        .route(
-            "/api/v2/runs/run/abandon",
-            axum::routing::post(move || {
-                abandoned.fetch_add(1, Ordering::SeqCst);
-                async { Json(json!({"ok":true})) }
-            }),
-        );
+    let refuse = Arc::new(AtomicBool::new(true));
+    let refusing = refuse.clone();
+    let app = Router::new().route(
+        "/api/v2/runs/run/abandon",
+        axum::routing::post(move || {
+            let refused = refusing.load(Ordering::SeqCst);
+            async move {
+                if refused {
+                    Err((
+                        StatusCode::CONFLICT,
+                        Json(json!({"error":"Run run already ended (done), so there is nothing to abandon."})),
+                    ))
+                } else {
+                    Ok(Json(json!({"ok":true})))
+                }
+            }
+        }),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    for (index, kind) in ["unreachable", "needs_auth", "unreconciled"]
-        .into_iter()
-        .enumerate()
-    {
-        *contact.lock().unwrap() = kind;
-        let output = sandbox
+    let abandon = || {
+        sandbox
             .command()
             .env("ORX_UP_PORT", port.to_string())
             .env("ORX_UP_AUTH_TOKEN", "test-only")
             .args(["exp", "abandon", "run"])
             .output()
-            .unwrap();
-        assert!(output.status.success(), "{}", diagnostics(&output));
-        let warning = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(
-            warning.contains("The machine is unreachable."),
-            kind == "unreachable"
-        );
-        assert!(warning.contains("OpenResearch will stop tracking this run. Double-check that the actual compute is shut down."), "{warning}");
-        assert!(stdout(&output).contains("cancel stays pending"));
-        assert_eq!(calls.load(Ordering::SeqCst), index + 1);
-    }
+            .unwrap()
+    };
+    let refused = abandon();
+    assert!(!refused.status.success());
+    assert!(diagnostics(&refused).contains("nothing to abandon"));
+    assert!(!stdout(&refused).contains("cancel stays pending"));
+    refuse.store(false, Ordering::SeqCst);
+    let accepted = abandon();
+    assert!(accepted.status.success(), "{}", diagnostics(&accepted));
+    assert!(stdout(&accepted).contains("cancel stays pending"));
     server.abort();
 }
 
@@ -857,230 +799,109 @@ fn an_engine_run_finishing_while_up_is_down_keeps_the_receipt_finish_time() {
     assert!(started_at <= ended_at);
 }
 
+/// An agent whose config dir is not orx up's, as in a sandbox with its own home, launches
+/// unless that dir sets compute settings orx up would not use.
 #[test]
-fn engine_setting_flips_preserve_in_flight_runs_across_restart() {
-    use serde_json::{json, Value};
-
+fn a_caller_with_its_own_config_dir_launches_only_with_the_settings_orx_up_uses() {
     let sandbox = Sandbox::new();
-    let release = sandbox.root.join("release");
-    std::fs::create_dir(&release).unwrap();
-    sandbox.project(&format!(
-        "echo run-$ORX_RUN_ID\nwhile [ ! -f '{}/'$ORX_RUN_ID ]; do sleep 0.2; done\necho finished\n",
-        release.display(),
-    ));
-    let launched = sandbox
-        .command()
-        .env_remove("ORX_RUN_ENGINE")
-        .args(["exp", "run", "exp", "--force", "--backend", "local"])
-        .output()
-        .unwrap();
-    assert!(launched.status.success(), "{}", diagnostics(&launched));
-    let supervised = stdout(&launched)
-        .split_whitespace()
-        .find(|word| word.len() == 36 && word.matches('-').count() == 4)
-        .unwrap()
-        .to_owned();
-    let backend = |id: &str| -> Value {
-        let raw: String = sandbox
-            .db()
-            .query_row("SELECT backend_json FROM runs WHERE id = ?1", [id], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        serde_json::from_str(&raw).unwrap()
-    };
-    assert_eq!(backend(&supervised)["kind"], "local_job");
-    let request = |path: &str, body: Option<Value>| -> Value {
-        let port = sandbox.descriptor().unwrap()["port"].as_u64().unwrap();
-        let mut command = Command::new("curl");
-        command.args(["-sf", "--noproxy", "*", "--max-time", "60"]);
-        if let Some(body) = body {
-            command.args([
-                "-H",
-                "Content-Type: application/json",
-                "-d",
-                &body.to_string(),
-            ]);
-        }
-        let output = command
-            .arg(format!("http://127.0.0.1:{port}{path}"))
+    sandbox.project("echo done\n");
+    let started = sandbox.run(&["exp", "run", "exp", "--force", "--backend", "local"]);
+    assert!(started.status.success(), "{}", diagnostics(&started));
+    let agent_config = sandbox.root.join("agent-config");
+    let slurm = |partition: &str| format!(r#"{{"partition":"{partition}"}}"#);
+    let launch_with = |flags: &[&str]| {
+        let output = sandbox
+            .command()
+            .env("XDG_CONFIG_HOME", &agent_config)
+            .args(["exp", "run", "exp", "--force", "--backend", "slurm"])
+            .args(["--host", sandbox.server.alias()])
+            .args(flags)
             .output()
             .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            diagnostics(&output),
-            sandbox.server_log()
-        );
-        serde_json::from_slice(&output.stdout).unwrap()
+        String::from_utf8_lossy(&output.stderr).into_owned()
     };
-    assert_eq!(
-        request("/api/settings/run-engine", None),
-        json!({"enabled": false, "forcedBy": null})
+    let launch = || launch_with(&[]);
+    let refused = |stderr: &str| stderr.contains(agent_config.to_str().unwrap());
+
+    let empty = launch();
+    assert!(!refused(&empty), "{empty}");
+
+    std::fs::create_dir_all(agent_config.join("openresearch")).unwrap();
+    std::fs::write(agent_config.join("openresearch/slurm.json"), slurm("gpu")).unwrap();
+    let different = launch();
+    assert!(refused(&different), "{different}");
+    assert!(different.contains("partition"), "{different}");
+    assert!(
+        different.contains(sandbox.root.join("config").to_str().unwrap()),
+        "{different}"
     );
-    assert_eq!(
-        request("/api/settings/run-engine", Some(json!({"enabled":true})))["enabled"],
-        true
-    );
-    let launched = request(
-        "/api/runs",
-        Some(json!({
-            "experimentId":"exp", "backend":"local", "force":true, "chatSessionId":"chat",
-        })),
-    );
-    let engine = launched["run"]["id"].as_str().unwrap();
-    assert_eq!(backend(engine)["kind"], "engine");
-    assert!(wait_for(Duration::from_secs(30), || sandbox
-        .status(&supervised)
-        == "running"
-        && sandbox.status(engine) == "running"));
-    assert_eq!(
-        request("/api/settings/run-engine", Some(json!({"enabled":false})))["enabled"],
-        false
-    );
-    orx_test_support::stop_server(&sandbox.data());
-    let restarted = sandbox
-        .command()
-        .env_remove("ORX_RUN_ENGINE")
-        .args(["runs", "project"])
-        .output()
+
+    std::fs::create_dir_all(sandbox.root.join("config/openresearch")).unwrap();
+    std::fs::write(
+        sandbox.root.join("config/openresearch/slurm.json"),
+        slurm("gpu"),
+    )
+    .unwrap();
+    let equal = launch();
+    assert!(!refused(&equal), "{equal}");
+
+    let limits = |mem: &str| format!(r#"{{"partition":"gpu","mem":"{mem}"}}"#);
+    std::fs::write(agent_config.join("openresearch/slurm.json"), limits("32G")).unwrap();
+    std::fs::write(
+        sandbox.root.join("config/openresearch/slurm.json"),
+        limits("64G"),
+    )
+    .unwrap();
+    let saved_limit = launch();
+    assert!(refused(&saved_limit), "{saved_limit}");
+    assert!(saved_limit.contains("mem"), "{saved_limit}");
+    let flagged = launch_with(&["--mem", "16G"]);
+    assert!(!refused(&flagged), "{flagged}");
+
+    let save = |caller: &str, own: &str| {
+        let saved = |field: &str| format!(r#"{{"partition":"gpu",{field}}}"#);
+        std::fs::write(agent_config.join("openresearch/slurm.json"), saved(caller)).unwrap();
+        std::fs::write(
+            sandbox.root.join("config/openresearch/slurm.json"),
+            saved(own),
+        )
         .unwrap();
-    assert!(restarted.status.success(), "{}", diagnostics(&restarted));
-    assert_eq!(request("/api/settings/run-engine", None)["enabled"], false);
-    assert_eq!(backend(&supervised)["kind"], "local_job");
-    assert_eq!(backend(engine)["kind"], "engine");
-    let stopped = sandbox.run(&["exp", "cancel", "--run", engine]);
-    assert!(stopped.status.success(), "{}", diagnostics(&stopped));
-    std::fs::write(release.join(&supervised), "").unwrap();
-    assert!(
-        wait_for(Duration::from_secs(45), || sandbox.status(engine)
-            == "cancelled"
-            && sandbox.status(&supervised) == "done"),
-        "{}",
-        sandbox.server_log()
-    );
-    assert!(
-        wait_for(Duration::from_secs(15), || sandbox
-            .terminal_notices(engine)
-            .len()
-            == 1
-            && sandbox.terminal_notices(&supervised).len() == 1),
-        "{}",
-        sandbox.server_log()
-    );
-    assert_eq!(
-        request(&format!("/api/runs/{supervised}"), None)["run"]["exitCode"],
-        0
-    );
-    for run in [&supervised, engine] {
-        let logs = sandbox.run(&["logs", run]);
-        assert!(logs.status.success(), "{}", diagnostics(&logs));
+    };
+    for (name, caller, own) in [
+        ("qos", r#""qos":"acc_debug""#, r#""qos":"acc_ehpc""#),
+        (
+            "sbatchArgs",
+            r#""sbatchArgs":["--rsc g=1"]"#,
+            r#""sbatchArgs":[]"#,
+        ),
+        (
+            "requestOneTask",
+            r#""requestOneTask":false"#,
+            r#""requestOneTask":true"#,
+        ),
+    ] {
+        save(caller, own);
+        let stderr = launch();
         assert!(
-            stdout(&logs).contains(&format!("run-{run}")),
-            "{}",
-            stdout(&logs)
+            refused(&stderr) && stderr.contains(name),
+            "{name}: {stderr}"
         );
     }
-}
+    save(r#""qos":"acc_debug""#, r#""qos":"acc_ehpc""#);
+    let qos_flag = launch_with(&["--qos", "acc_debug"]);
+    assert!(!refused(&qos_flag), "{qos_flag}");
 
-#[test]
-fn environment_off_restores_ssh_supervision_over_the_shared_transport() {
-    let sandbox = Sandbox::new();
-    sandbox.project("echo supervisor-says-hi\nsleep 2\necho finished\n");
-    let config = sandbox.root.join("config/openresearch");
-    std::fs::create_dir_all(&config).unwrap();
-    std::fs::write(config.join("settings.json"), r#"{"runEngine":true}"#).unwrap();
-    sandbox.connect("0");
-    let launched = sandbox.run(&[
-        "exp",
-        "run",
-        "exp",
-        "--backend",
-        "ssh",
-        "--host",
-        sandbox.server.alias(),
-    ]);
-    assert!(
-        launched.status.success(),
-        "{}\n{}",
-        diagnostics(&launched),
-        sandbox.server_log()
-    );
-    let run = stdout(&launched)
-        .split_whitespace()
-        .find(|word| word.len() == 36 && word.matches('-').count() == 4)
-        .unwrap()
-        .to_owned();
-    let backend: String = sandbox
-        .db()
-        .query_row("SELECT backend_json FROM runs WHERE id=?1", [&run], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    let backend: serde_json::Value = serde_json::from_str(&backend).unwrap();
-    assert_eq!(backend["kind"], "ssh_job");
-    let waited = sandbox.run(&["exp", "wait", "exp", "--timeout", "120"]);
-    assert!(
-        waited.status.success(),
-        "{}\n{}",
-        diagnostics(&waited),
-        sandbox.server_log()
-    );
-    assert_eq!(sandbox.status(&run), "done");
-    let log = sandbox.run(&["logs", &run]);
-    assert!(log.status.success(), "{}", diagnostics(&log));
-    assert!(
-        stdout(&log).contains("supervisor-says-hi"),
-        "{}",
-        diagnostics(&log)
-    );
-    assert!(sandbox
-        .data()
-        .join(format!("run-logs/{run}.supervisor.log"))
-        .exists());
-    assert!(wait_for(Duration::from_secs(15), || sandbox
-        .terminal_notices(&run)
-        .len()
-        == 1));
-    let service = std::fs::read_dir(sandbox.data())
-        .unwrap()
-        .flatten()
-        .find(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("ssh-service-")
-        })
-        .unwrap();
-    let db = rusqlite::Connection::open(service.path().join("state.sqlite3")).unwrap();
-    let resolved: String = db
-        .query_row("SELECT resolved FROM connections LIMIT 1", [], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    let resolved: serde_json::Value = serde_json::from_str(&resolved).unwrap();
-    let socket = PathBuf::from(resolved["socket"].as_str().unwrap());
-    let stopped = sandbox.stop_service();
-    assert!(stopped.status.success(), "{}", diagnostics(&stopped));
-    std::fs::remove_file(&socket).unwrap();
-    drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
-    sandbox.connect("0");
-    assert!(
-        std::fs::read_link(&socket).is_ok(),
-        "{}",
-        sandbox.server_log()
-    );
-    let relaunched = sandbox.run(&[
-        "exp",
-        "run",
-        "exp",
-        "--backend",
-        "ssh",
-        "--host",
-        sandbox.server.alias(),
-    ]);
-    assert!(relaunched.status.success(), "{}", diagnostics(&relaunched));
-    let waited = sandbox.run(&["exp", "wait", "exp", "--timeout", "120"]);
-    assert!(waited.status.success(), "{}", diagnostics(&waited));
-    std::fs::remove_file(socket).unwrap();
+    // Without the setting, orx writes --ntasks=1 just as `true` asks.
+    std::fs::write(
+        agent_config.join("openresearch/slurm.json"),
+        r#"{"partition":"gpu","requestOneTask":true}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        sandbox.root.join("config/openresearch/slurm.json"),
+        r#"{"partition":"gpu"}"#,
+    )
+    .unwrap();
+    let one_task = launch();
+    assert!(!refused(&one_task), "{one_task}");
 }

@@ -1,10 +1,14 @@
+import { useMutate } from "@clo/react-mutation";
 import { useWorkspace } from "../workspace";
-import { ChevronRight, CircleStop, FlaskConical, Plug, ScrollText } from "lucide-react";
+import { mutCancelRun } from "../queries/projects";
+import { ChevronRight, CircleStop, FlaskConical, Hourglass, ScrollText } from "lucide-react";
 import { useEffect, useState } from "react";
-import { fmtDuration, type ChatActiveRun } from "../api";
+import { fmtDuration, fmtNumber, type ChatActiveRun, type ChatSession } from "../api";
+import { autoDir } from "../i18n";
 import { m } from "../paraglide/messages.js";
-import { runConnectHost, runDisplay } from "../runDisplay";
+import { runDisplay, runNotice, runStoppable } from "../runDisplay";
 import { tabOpenGestureHandlers, type TabOpenIntent } from "../tabPreview";
+import { RunContactNotice } from "./RunContactNotice";
 import { statusLabel } from "./StatusBadge";
 import { Button } from "./ui";
 
@@ -12,35 +16,23 @@ type OpenTarget = (id: string, intent: TabOpenIntent) => void;
 const BANNER_CLASS = "mb-2.5 rounded-lg border border-border bg-accent-green-subtle px-3 py-2 text-sm text-text";
 
 function RunRow({ item, onOpenRun, onOpenExperiment }: { item: ChatActiveRun; onOpenRun?: OpenTarget; onOpenExperiment?: OpenTarget }) {
-  const { cancelRun } = useWorkspace().api;
-  const { requestHostConnect } = useWorkspace().events;
+  const workspace = useWorkspace();
+  const cancel = useMutate(mutCancelRun);
 
   const { run, experimentName } = item;
   const [now, setNow] = useState(Date.now);
-  const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const display = runDisplay(pending ? { ...run, cancelling: true } : run);
-  const cancelling = pending || run.cancelling;
-  const label = display.stale || cancelling || display.status === "queued"
+  const display = runDisplay(run);
+  const error = cancel.error === undefined ? null : cancel.error instanceof Error ? cancel.error.message : String(cancel.error);
+  const label = display.stale || run.cancelling || display.status === "queued"
     ? statusLabel(display.status, display.stopping)
     : run.status === "running" ? m.chat_experiment_running() : m.chat_experiment_starting();
-  const connectHost = runConnectHost(run);
+  const noticeKind = runNotice(run)?.kind;
+  const showNotice = noticeKind !== undefined && noticeKind !== "monitoring" && noticeKind !== "cancelling" && noticeKind !== "queued";
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, []);
-
-  async function stop() {
-    setPending(true);
-    setError(null);
-    try {
-      await cancelRun(run.id);
-    } catch (err) {
-      setPending(false);
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  }
 
   return (
     <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -55,16 +47,16 @@ function RunRow({ item, onOpenRun, onOpenExperiment }: { item: ChatActiveRun; on
       <div className="ms-auto flex shrink-0 items-center gap-1">
         <span className="me-2 tabular-nums text-subtext">{fmtDuration(now - run.createdAt)}</span>
         {onOpenRun && <Button size="small" variant="ghost" {...tabOpenGestureHandlers<HTMLButtonElement>((intent) => onOpenRun(run.id, intent))}><ScrollText size={14} />{m.experiment_overview_logs()}</Button>}
-        {connectHost ? (
-          <Button size="small" variant="ghost" onClick={() => requestHostConnect(connectHost)}><Plug size={14} />{m.settings_connect()}</Button>
-        ) : (
-          <Button size="small" variant="ghost" disabled={cancelling} onClick={() => void stop()}>
-            <CircleStop size={14} />{!cancelling ? m.common_stop() : statusLabel(display.status, display.stopping)}
+        {runStoppable(run) && (
+          <Button size="small" variant="ghost" onClick={() => cancel.run(workspace, run)}>
+            <CircleStop size={14} />{m.common_stop()}
           </Button>
         )}
       </div>
       {display.status === "queued" && run.queueDetail && <span className="w-full wrap-anywhere text-subtext" role="status">{run.queueDetail}</span>}
+      {display.waiting && <span className="w-full min-w-0 truncate ps-6 text-subtext" title={display.waiting}>{autoDir(display.waiting)}</span>}
       {error && <span className="w-full text-accent-red" role="alert">{error}</span>}
+      {showNotice && <RunContactNotice run={run} className="w-full" />}
     </div>
   );
 }
@@ -83,5 +75,27 @@ export function ExperimentRunBanner({ runs, onOpenRun, onOpenExperiment }: { run
         {runs.map((item) => <RunRow key={item.run.id} item={item} onOpenRun={onOpenRun} onOpenExperiment={onOpenExperiment} />)}
       </div>
     </details>
+  );
+}
+
+/** Tasks the agent left running when its turn ended; it picks the chat back up when they finish. */
+export function BackgroundTaskBanner({ background }: { background: ChatSession["background"] }) {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  if (!background) return null;
+  return (
+    <div className="mb-2.5 flex min-w-0 items-center gap-2 rounded-lg border border-border bg-accent-blue-subtle px-3 py-2 text-sm text-text">
+      <Hourglass size={16} className="shrink-0 text-accent-blue" aria-hidden="true" />
+      <span role="status" className="shrink-0 font-medium">
+        {background.count > 1 ? m.chat_status_background_tasks({ count: fmtNumber(background.count) }) : m.chat_status_background_task()}
+      </span>
+      <span aria-hidden="true">·</span>
+      <span className="min-w-0 truncate text-subtext">{m.chat_background_resumes()}</span>
+      <span className="ms-auto shrink-0 tabular-nums text-subtext">{fmtDuration(now - background.since)}</span>
+    </div>
   );
 }

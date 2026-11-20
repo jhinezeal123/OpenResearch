@@ -3,34 +3,16 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use base64::Engine;
-use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 use crate::error::{anyhow, Result};
 use crate::local::native_store::opencode_database::DatabaseLease;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum Protocol {
-    V1,
-    V2,
-}
-
-impl Protocol {
-    pub fn major(self) -> u64 {
-        match self {
-            Self::V1 => 1,
-            Self::V2 => 2,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedBinary {
     pub path: PathBuf,
     pub version: String,
-    pub protocol: Protocol,
     modified: std::time::SystemTime,
     size: u64,
 }
@@ -82,11 +64,29 @@ impl ProbeEnvironment {
     }
 }
 
-/// First opencode that resolves, in discovery order — picking the highest
-/// version instead would move a pinned 1.x install onto the 2.x protocol.
-/// The `--version` probes run in parallel (a cold node start can take
-/// seconds); only the pick stays discovery-ordered.
+/// The user's opencode, unless orx's own copy is newer. Only OpenCode 2 resolves,
+/// so a user's 1.x is stood in for by orx's copy.
 pub(crate) async fn resolve_binary() -> Result<ResolvedBinary> {
+    let user = user_binary().await;
+    let Some((path, version)) = crate::local::harness::managed::installed("opencode") else {
+        return user;
+    };
+    let current = user.as_ref().is_ok_and(|binary| {
+        crate::local::harness::managed::parse(&binary.version).is_some_and(|own| own >= version)
+    });
+    if current {
+        return user;
+    }
+    match resolve_binary_at(path).await {
+        Ok(binary) => Ok(binary),
+        Err(error) => user.or(Err(error)),
+    }
+}
+
+/// First opencode that resolves, in discovery order. The `--version` probes run
+/// in parallel (a cold node start can take seconds); only the pick stays
+/// discovery-ordered.
+pub(crate) async fn user_binary() -> Result<ResolvedBinary> {
     let candidates = super::opencode_candidates();
     let results = futures::future::join_all(candidates.into_iter().map(resolve_binary_at)).await;
     let mut first_error = None;
@@ -126,11 +126,10 @@ pub(crate) async fn resolve_binary_at(path: PathBuf) -> Result<ResolvedBinary> {
         ));
     }
     let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let protocol = protocol_for_version(&version)?;
+    ensure_supported(&version)?;
     let binary = ResolvedBinary {
         path,
         version,
-        protocol,
         modified: metadata.modified()?,
         size: metadata.len(),
     };
@@ -174,49 +173,38 @@ fn resolve_binary_from_pin(path: &Path) -> Option<ResolvedBinary> {
         .or_else(|| deps["opencode-ai"].as_str())?
         .trim_start_matches(['^', '~', 'v'])
         .to_string();
-    let protocol = protocol_for_version(&version).ok()?;
+    ensure_supported(&version).ok()?;
     Some(ResolvedBinary {
         path: path.to_path_buf(),
         version,
-        protocol,
         modified: metadata.modified().ok()?,
         size: metadata.len(),
     })
 }
 
-fn protocol_for_version(version: &str) -> Result<Protocol> {
+fn ensure_supported(version: &str) -> Result<()> {
     let semver = version
         .split_whitespace()
         .find_map(|part| semver::Version::parse(part.trim_start_matches('v')).ok())
         .ok_or_else(|| anyhow!("Unrecognized OpenCode version: {version}"))?;
-    match semver.major {
-        1 => Ok(Protocol::V1),
-        2 => Ok(Protocol::V2),
-        _ => Err(anyhow!(
-            "OpenCode {version} is unsupported. Install a V1 or V2 release."
-        )),
+    if semver.major != 2 {
+        return Err(anyhow!(
+            "OpenCode {version} is unsupported. Use Update on OpenCode in Settings to install OpenCode 2."
+        ));
     }
+    Ok(())
 }
 
 #[derive(Clone)]
 pub(crate) struct AgentEndpoint {
     pub base_url: String,
     pub client: reqwest::Client,
-    pub protocol: Protocol,
     pub legacy_v2_api: bool,
 }
 
 impl AgentEndpoint {
     async fn check_health(&mut self) -> Result<bool> {
-        if self.protocol == Protocol::V1 {
-            return Ok(self
-                .get("/global/health")
-                .send()
-                .await?
-                .status()
-                .is_success());
-        }
-        // V2's readiness route moved: /api/health (<=2.0.3) -> /api/status
+        // The readiness route moved: /api/health (<=2.0.3) -> /api/status
         // (2.0.4-2.0.5) -> /api/info (2.0.6+). Unknown routes can serve SPA
         // HTML with a 200, so require JSON `version`; /api/health answering
         // marks the pre-2.0.4 layout (export/generate off /api/experimental).
@@ -237,6 +225,23 @@ impl AgentEndpoint {
             }
         }
         Ok(false)
+    }
+
+    /// Whether OpenCode's plugins have activated. Until then its integration list lacks the sign-ins plugins add,
+    /// such as GitHub Copilot's, and shows generic API keys instead. A version with no plugin list counts as active.
+    pub async fn plugins_active(&self) -> Result<bool> {
+        let response = self.get("/api/plugin").send().await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(true);
+        }
+        if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            return Ok(false);
+        }
+        let body: serde_json::Value = response.error_for_status()?.json().await?;
+        Ok(body["data"]
+            .as_array()
+            .is_some_and(|plugins| !plugins.is_empty()))
     }
 
     fn get(&self, path: &str) -> reqwest::RequestBuilder {
@@ -269,10 +274,74 @@ impl AgentEndpoint {
     }
 }
 
+const TERMINATION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Owns a spawned `opencode serve` process and its process group. Stopping or
+/// dropping it kills the process group and any MCP/tool children it started.
+pub(crate) struct ServerChild {
+    child: Child,
+    id: Option<u32>,
+}
+
+impl ServerChild {
+    pub(crate) fn new(child: Child) -> Self {
+        let id = child.id();
+        Self { child, id }
+    }
+
+    pub(crate) fn id(&self) -> Option<u32> {
+        self.id
+    }
+
+    /// Polls the server. Once its exit is observed, the surviving process group
+    /// is killed immediately and the saved PID is forgotten: after reaping, the
+    /// kernel may hand that PID to an unrelated process, so it must never be
+    /// signalled later.
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            crate::local::chat::kill_shell_group(self.id.take());
+        }
+        Ok(status)
+    }
+
+    pub(crate) async fn kill(&mut self) -> std::io::Result<()> {
+        if self.try_wait()?.is_none() {
+            // Not yet reaped, so the PID still belongs to our server.
+            crate::local::chat::kill_agent_tree(self.id.take()).await;
+            if let Err(error) = self.child.start_kill() {
+                if self.child.try_wait()?.is_none() {
+                    return Err(error);
+                }
+            }
+            match tokio::time::timeout(TERMINATION_TIMEOUT, self.child.wait()).await {
+                Ok(result) => {
+                    result?;
+                }
+                Err(_) => {
+                    let error = std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "timed out reaping OpenCode server",
+                    );
+                    eprintln!("orx up: {error}");
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ServerChild {
+    fn drop(&mut self) {
+        crate::local::chat::kill_shell_group(self.id.take());
+    }
+}
+
 pub(crate) async fn start_server(
     binary: &ResolvedBinary,
     mut cmd: Command,
-) -> Result<(Child, AgentEndpoint)> {
+) -> Result<(ServerChild, AgentEndpoint)> {
     if let Some(parent) = super::agent_log_path().parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -280,74 +349,69 @@ pub(crate) async fn start_server(
         .create(true)
         .append(true)
         .open(super::agent_log_path())?;
+    let password = uuid::Uuid::new_v4().to_string();
+    let auth = base64::engine::general_purpose::STANDARD.encode(format!("opencode:{password}"));
+    let mut value = reqwest::header::HeaderValue::from_str(&format!("Basic {auth}"))?;
+    value.set_sensitive(true);
     let mut headers = reqwest::header::HeaderMap::new();
-    let v1_port = if binary.protocol == Protocol::V1 {
-        Some(super::free_port()?)
-    } else {
-        None
-    };
+    headers.insert(reqwest::header::AUTHORIZATION, value);
     cmd.env("OPENCODE_DISABLE_AUTOUPDATE", "1")
         .arg("serve")
+        .args(["--stdio", "--port", "0"])
+        .env("OPENCODE_PASSWORD", password)
         .kill_on_drop(true)
-        .stderr(Stdio::from(log.try_clone()?));
-    if let Some(port) = v1_port {
-        cmd.args([
-            "--port",
-            &port.to_string(),
-            "--hostname",
-            "127.0.0.1",
-            "--print-logs",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log));
-    } else {
-        let password = uuid::Uuid::new_v4().to_string();
-        let auth = base64::engine::general_purpose::STANDARD.encode(format!("opencode:{password}"));
-        let mut value = reqwest::header::HeaderValue::from_str(&format!("Basic {auth}"))?;
-        value.set_sensitive(true);
-        headers.insert(reqwest::header::AUTHORIZATION, value);
-        cmd.args(["--stdio", "--port", "0"])
-            .env("OPENCODE_PASSWORD", password)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped());
-    }
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(log));
     #[cfg(unix)]
     cmd.process_group(0);
+    #[cfg(target_os = "linux")]
+    {
+        let parent_pid = unsafe { libc::getpid() };
+        // SAFETY: async-signal-safe syscalls after fork; terminates the server if orx dies abruptly.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent_pid {
+                    libc::raise(libc::SIGTERM);
+                }
+                Ok(())
+            });
+        }
+    }
     binary.check_unchanged()?;
-    let mut child = crate::local::harness::spawn_retrying_busy(|| cmd.spawn())?;
+    let mut child = ServerChild::new(crate::local::harness::spawn_retrying_busy(|| cmd.spawn())?);
     let client = crate::net::loopback_client()
         .default_headers(headers)
         .build()?;
     let ready = async {
-        let base_url = if let Some(port) = v1_port {
-            format!("http://127.0.0.1:{port}")
-        } else {
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| anyhow!("OpenCode readiness pipe missing"))?;
-            let mut lines = BufReader::new(stdout).lines();
-            let first = tokio::time::timeout(super::HEALTH_TIMEOUT, lines.next_line())
-                .await??
-                .ok_or_else(|| anyhow!("OpenCode exited before reporting readiness"))?;
-            let ready: serde_json::Value = serde_json::from_str(&first)?;
-            let url = ready["url"]
-                .as_str()
-                .ok_or_else(|| anyhow!("Invalid OpenCode readiness response"))?
-                .to_string();
-            let parsed = reqwest::Url::parse(&url)?;
-            if parsed.scheme() != "http"
-                || !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
-            {
-                return Err(anyhow!("OpenCode returned a non-loopback server URL"));
-            }
-            tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
-            url.trim_end_matches('/').to_string()
-        };
+        let stdout = child
+            .child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("OpenCode readiness pipe missing"))?;
+        let mut lines = BufReader::new(stdout).lines();
+        let first = tokio::time::timeout(super::HEALTH_TIMEOUT, lines.next_line())
+            .await??
+            .ok_or_else(|| anyhow!("OpenCode exited before reporting readiness"))?;
+        let ready: serde_json::Value = serde_json::from_str(&first)?;
+        let url = ready["url"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Invalid OpenCode readiness response"))?
+            .to_string();
+        let parsed = reqwest::Url::parse(&url)?;
+        if parsed.scheme() != "http"
+            || !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+        {
+            return Err(anyhow!("OpenCode returned a non-loopback server URL"));
+        }
+        tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+        let base_url = url.trim_end_matches('/').to_string();
         let mut endpoint = AgentEndpoint {
             base_url,
             client,
-            protocol: binary.protocol,
             legacy_v2_api: false,
         };
         let deadline = tokio::time::Instant::now() + super::HEALTH_TIMEOUT;
@@ -371,7 +435,9 @@ pub(crate) async fn start_server(
     match ready {
         Ok(endpoint) => Ok((child, endpoint)),
         Err(error) => {
-            let _ = child.kill().await;
+            if let Err(kill_error) = child.kill().await {
+                eprintln!("orx up: failed to stop OpenCode after startup error: {kill_error}");
+            }
             Err(error)
         }
     }
@@ -395,11 +461,10 @@ async fn prepare_database_waiting(
     busy_timeout: Duration,
     mut progress: impl FnMut(&str) + Send,
 ) -> Result<DatabaseLease> {
-    let major = binary.protocol.major();
     let deadline = tokio::time::Instant::now() + busy_timeout;
     let lease = loop {
         let path = db.to_path_buf();
-        match tokio::task::spawn_blocking(move || DatabaseLease::acquire(&path, major)).await? {
+        match tokio::task::spawn_blocking(move || DatabaseLease::acquire(&path, 2)).await? {
             Ok(lease) => break lease,
             Err(error)
                 if error
@@ -462,7 +527,7 @@ async fn prepare_database_waiting(
 }
 
 async fn wait_migration(
-    child: &mut Child,
+    child: &mut ServerChild,
     endpoint: &AgentEndpoint,
     progress: &mut (impl FnMut(&str) + Send),
 ) -> Result<()> {
@@ -537,41 +602,18 @@ mod tests {
         // The web UI's SPA fallback serves HTML with a 200 on unknown routes.
         let spa = || async { axum::response::Html("<!doctype html><title>OpenCode</title>") };
 
-        for (protocol, app, ready, legacy) in [
-            // V1 keeps its single route.
-            (
-                Protocol::V1,
-                Router::new().route("/global/health", get(|| async { StatusCode::OK })),
-                true,
-                false,
-            ),
+        for (app, ready, legacy) in [
             // 2.0.6+: /api/info only.
-            (
-                Protocol::V2,
-                Router::new().route("/api/info", get(info)),
-                true,
-                false,
-            ),
+            (Router::new().route("/api/info", get(info)), true, false),
             // 2.0.4-2.0.5: /api/status only.
-            (
-                Protocol::V2,
-                Router::new().route("/api/status", get(status)),
-                true,
-                false,
-            ),
+            (Router::new().route("/api/status", get(status)), true, false),
             // 2.0.0-2.0.3: /api/health only, the legacy route layout.
-            (
-                Protocol::V2,
-                Router::new().route("/api/health", get(health)),
-                true,
-                true,
-            ),
+            (Router::new().route("/api/health", get(health)), true, true),
             // A 200 carrying the SPA's HTML is not a health answer.
-            (Protocol::V2, Router::new().fallback(spa), false, false),
+            (Router::new().fallback(spa), false, false),
             // The issue-341 shape: SPA HTML 200s on the newer routes with a
             // real health route still answering underneath.
             (
-                Protocol::V2,
                 Router::new()
                     .route("/api/status", get(status))
                     .fallback(spa),
@@ -579,7 +621,6 @@ mod tests {
                 false,
             ),
             (
-                Protocol::V2,
                 Router::new()
                     .route("/api/health", get(health))
                     .fallback(spa),
@@ -588,7 +629,6 @@ mod tests {
             ),
             // Server errors are not masked by falling through to another route.
             (
-                Protocol::V2,
                 Router::new()
                     .route("/api/info", get(|| async { StatusCode::UNAUTHORIZED }))
                     .route("/api/health", get(health)),
@@ -596,7 +636,6 @@ mod tests {
                 false,
             ),
             (
-                Protocol::V2,
                 Router::new()
                     .route(
                         "/api/info",
@@ -607,13 +646,12 @@ mod tests {
                 false,
             ),
             // Nothing answering at all.
-            (Protocol::V2, Router::new(), false, false),
+            (Router::new(), false, false),
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let mut endpoint = AgentEndpoint {
                 base_url: format!("http://{}", listener.local_addr().unwrap()),
                 client: crate::net::loopback_client().build().unwrap(),
-                protocol,
                 legacy_v2_api: false,
             };
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -637,7 +675,6 @@ mod tests {
         let binary = ResolvedBinary {
             path: fixture.0.path().join("must-not-launch"),
             version: "2.0.1".into(),
-            protocol: Protocol::V2,
             modified: std::time::SystemTime::UNIX_EPOCH,
             size: 0,
         };
@@ -651,18 +688,37 @@ mod tests {
             .is_some());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orxs_opencode_2_copy_stands_in_for_the_users_1() {
+        if !crate::config::in_test_child(&[]) {
+            return;
+        }
+        let fake = |path: &Path, version: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("#!/bin/sh\necho {version}\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let home = crate::config::home_dir().unwrap();
+        fake(&home.join(".opencode/bin/opencode"), "1.18.18");
+        assert!(resolve_binary().await.is_err());
+
+        let copies = crate::local::git::cache_root().join("managed-agents/opencode");
+        fake(&copies.join("1.19.5/opencode"), "1.19.5");
+        fake(&copies.join("2.3.0/opencode"), "2.3.0");
+        assert_eq!(resolve_binary().await.unwrap().version, "2.3.0");
+    }
+
     #[test]
     fn supported_versions_and_isolated_probes() {
-        assert_eq!(protocol_for_version("1.18.31").unwrap(), Protocol::V1);
-        assert_eq!(
-            protocol_for_version("opencode v2.0.1").unwrap(),
-            Protocol::V2
-        );
-        assert_eq!(protocol_for_version("2.0.0-beta.1").unwrap(), Protocol::V2);
-        assert!(protocol_for_version("0.0.0-next-unknown").is_err());
-        assert!(protocol_for_version("3.0.0").is_err());
+        assert!(ensure_supported("1.18.31").is_err());
+        assert!(ensure_supported("opencode v2.0.1").is_ok());
+        assert!(ensure_supported("2.0.0-beta.1").is_ok());
+        assert!(ensure_supported("0.0.0-next-unknown").is_err());
+        assert!(ensure_supported("3.0.0").is_err());
         let probe = ProbeEnvironment::new().unwrap();
-        let mut cmd = crate::process::tokio_command("opencode");
+        let mut cmd = crate::process::tokio_command(std::env::temp_dir().join("opencode"));
         cmd.env("OPENCODE_DB", "/do-not-open/user.db");
         probe.configure(&mut cmd);
         let env: std::collections::HashMap<_, _> = cmd.as_std().get_envs().collect();

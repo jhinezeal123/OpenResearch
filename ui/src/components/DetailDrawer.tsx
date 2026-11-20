@@ -1,4 +1,6 @@
+import { useMutate } from "@clo/react-mutation";
 import { useWorkspace } from "../workspace";
+import { mutCancelRun } from "../queries/projects";
 import { m } from "../paraglide/messages.js";
 import { ChartLine, ChevronDown, CircleStop, ExternalLink, ScrollText } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
@@ -12,12 +14,12 @@ import { ExperimentOverview } from "./ExperimentOverview";
 import type { CodeView } from "./CodeTab";
 import { LogTerminal } from "./LogTerminal";
 import { RunContactNotice } from "./RunContactNotice";
-import { statusLabel, StatusBadge } from "./StatusBadge";
+import { StatusBadge } from "./StatusBadge";
 import { tabOpenGestureHandlers, type TabOpenIntent } from "../tabPreview";
 import { useResolvedTheme } from "../theme";
 import { Button, ButtonLink, MenuItem } from "./ui";
 import { buildHistoryNodes } from "./experimentLineageModel";
-import { runActive, runDisplay } from "../runDisplay";
+import { runActive, runDisplay, runStoppable } from "../runDisplay";
 
 export type ExperimentView = "overview" | "terminal" | "trackio";
 
@@ -104,10 +106,9 @@ function TerminalView({
   onOpenView: (view: ExperimentView, runId: string | undefined, intent: TabOpenIntent) => void;
 }) {
   const { useTrackioRuns } = useWorkspace().queries;
-  const { trackioRunUrl, cancelRun } = useWorkspace().api;
-
-  const [error, setError] = useState<string | null>(null);
-  const [pendingRunId, setPendingRunId] = useState<string | null>(null);
+  const workspace = useWorkspace();
+  const { trackioRunUrl } = workspace.api;
+  const cancel = useMutate(mutCancelRun);
   const [historyOpen, setHistoryOpen] = useState(false);
   const historyRef = useRef<HTMLDivElement>(null);
 
@@ -122,8 +123,8 @@ function TerminalView({
   const trackioEmbedUrl = view === "trackio" && selectedRun
     ? trackioRunUrl(trackio, selectedRun.id, { theme })
     : null;
-  const display = selectedRun && runDisplay(pendingRunId === selectedRun.id ? { ...selectedRun, cancelling: true } : selectedRun);
-  const cancelling = live && Boolean(selectedRun?.cancelling || pendingRunId === selectedRun?.id);
+  const display = selectedRun && runDisplay(selectedRun);
+  const error = cancel.error === undefined ? null : cancel.error instanceof Error ? cancel.error.message : String(cancel.error);
   // expRuns is newest-first, so the oldest run is #1. Number a run by its
   // position from the end of the list.
   const runNumber = (id: string) => {
@@ -141,16 +142,8 @@ function TerminalView({
     return () => document.removeEventListener("mousedown", onDown);
   }, [historyOpen]);
 
-  async function stop() {
-    if (!selectedRun) return;
-    setError(null);
-    setPendingRunId(selectedRun.id);
-    try {
-      await cancelRun(selectedRun.id);
-    } catch (err) {
-      setPendingRunId(null);
-      setError(err instanceof Error ? err.message : String(err));
-    }
+  function stop() {
+    if (selectedRun) cancel.run(workspace, selectedRun);
   }
 
   return (
@@ -200,10 +193,10 @@ function TerminalView({
             {m.experiment_overview_visualize()}
           </Button>
         )}
-        {live && display && (
-          <Button size="small" variant="ghost" disabled={cancelling} onClick={() => void stop()}>
+        {selectedRun && runStoppable(selectedRun) && (
+          <Button size="small" variant="ghost" onClick={stop}>
             <CircleStop size={14} />
-            {!cancelling ? m.common_stop() : statusLabel(display.status, display.stopping)}
+            {m.common_stop()}
           </Button>
         )}
         {expRuns.length > 0 && selectedRun && display && (

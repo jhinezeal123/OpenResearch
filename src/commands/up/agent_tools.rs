@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use super::{harnesses_payload, reject_if_moving, ApiError, ApiResult, AppState, HarnessQuery};
 use crate::error::{anyhow, bail, Result};
 use crate::local::chat::{
-    delegation, news, OrxDisplay, OrxKind, OrxSource, PromptAnswer, TurnOverrides,
+    delegation, env_request, news, OrxDisplay, OrxKind, OrxSource, PromptAnswer, TurnOverrides,
     ORX_MESSAGE_PREFIX,
 };
 use crate::local::model_routes;
@@ -41,7 +41,7 @@ pub(super) async fn agent_tools(
         .get_chat_session(&request.session_id)?
         .ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "unknown agent token".into()))?;
     match request.method.as_str() {
-        "tools/list" => Ok(Json(json!({ "tools": tools() }))),
+        "tools/list" => Ok(Json(json!({ "tools": tools(&caller.harness) }))),
         "tools/call" => {
             let name = request
                 .params
@@ -70,7 +70,12 @@ pub(super) async fn agent_tools(
     }
 }
 
-fn tools() -> Value {
+fn tools(harness: &str) -> Value {
+    let longest = longest_wait(harness);
+    let wait_timeout = format!(
+        "Default {}, at most {longest}. Chats still working when it expires keep working.",
+        WAIT_DEFAULT_SECONDS.min(longest)
+    );
     let chat_id = json!({ "type": "string", "description": "A chat's id, such as `chat_…`." });
     let chat_ids = json!({ "type": "array", "items": { "type": "string" }, "description": "Chat ids, such as `chat_…`." });
     let request_id = json!({ "type": "string", "description": "Optional key you keep across retries of this call: a retry with the same key returns what the first call did instead of doing it again." });
@@ -91,8 +96,8 @@ fn tools() -> Value {
                     "route": { "type": "string", "description": "Optional route from `models`, such as `openrouter`. Omit to use orx's order." },
                     "effort": { "type": "string", "description": "Optional effort level from `models`. Omit for the route's default." },
                     "title": { "type": "string", "description": "Optional short name for the delegate's chat." },
-                    "worktree": { "type": "string", "enum": ["shared", "own"], "description": "`shared` (the default) works in this chat's worktree. `own` gets a fresh worktree from the project's baseline and appears in the sidebar; commit first and name the commit in `task` if it should start from your work." },
-                    "notify": { "type": "boolean", "description": "Default true. False starts a chat that is not your delegate: a side chat of yours, or with `worktree: own` a chat of its own, which you do not hear from unless you `subscribe`." },
+                    "worktree": { "type": "string", "enum": ["shared", "own"], "description": "`shared` (the default) works in this chat's worktree. `own` gets a fresh worktree from the project's baseline and stays your delegate; commit first and name the commit in `task` if it should start from your work." },
+                    "notify": { "type": "boolean", "description": "Default true. False starts a chat that is not your delegate, which you do not hear from unless you `subscribe`: a side chat of yours, or with `worktree: own` a top-level chat in the user's sidebar. Start a top-level chat only when the user asks for one." },
                     "canDelegate": { "type": "boolean", "description": "Whether the delegate may start delegates of its own. Omit to use the user's setting, which is off unless they turned it on; set it only when the task needs nested delegates." },
                     "clientRequestId": request_id,
                 },
@@ -117,7 +122,7 @@ fn tools() -> Value {
                 "properties": {
                     "chatIds": chat_ids,
                     "until": { "type": "string", "enum": ["any", "all"], "description": "`any` (the default) returns at the first news; `all` waits for an answer from every chat. A question returns at once either way." },
-                    "timeoutSeconds": { "type": "integer", "description": "Default 600, at most 1800. Chats still working when it expires keep working." },
+                    "timeoutSeconds": { "type": "integer", "description": wait_timeout },
                 },
             },
         },
@@ -163,6 +168,32 @@ fn tools() -> Value {
             },
         },
         {
+            "name": "request_env",
+            "description": format!("Ask the user to set environment variables, such as an API key or a setting your code reads. The user types the values on a card in this chat and chooses where to save them for your shell, your runs and later chats. The tool result omits secret values. Waits until the user answers, at most {} minutes. Use this instead of asking for a key in chat or reading one from a file.", longest / 60),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "reason": { "type": "string", "description": "Why you need them, in a sentence the user reads on the card." },
+                    "variables": {
+                        "type": "array",
+                        "maxItems": env_request::MAX_VARIABLES,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string", "description": "The variable's name, such as `WANDB_API_KEY`." },
+                                "description": { "type": "string", "description": "What it is and where the user finds it, such as \"From wandb.ai/authorize\". Saved with the variable." },
+                                "secret": { "type": "boolean", "description": "Default true. False for a setting that is not sensitive, such as a project name: the user sees it as typed and you are told its value." },
+                                "pattern": { "type": "string", "description": "Optional regex the value should match, such as `^[0-9a-f]{40}$`. A value that does not match only gets a warning." },
+                                "example": { "type": "string", "description": "Optional placeholder showing the value's form, never a real value." },
+                            },
+                            "required": ["name"],
+                        },
+                    },
+                },
+                "required": ["variables"],
+            },
+        },
+        {
             "name": "cancel",
             "description": "Stop a chat you delegated to, and every chat it delegated to in turn. Their queued messages stay queued.",
             "inputSchema": { "type": "object", "properties": { "chatId": chat_id }, "required": ["chatId"] },
@@ -173,6 +204,16 @@ fn tools() -> Value {
 /// How long `wait` blocks unless told otherwise.
 const WAIT_DEFAULT_SECONDS: u64 = 600;
 
+/// The longest `wait` under `harness`. Antigravity ends every MCP call after three minutes and
+/// takes no longer timeout.
+fn longest_wait(harness: &str) -> u64 {
+    if harness == "antigravity" {
+        170
+    } else {
+        delegation::WAIT_MAX_SECONDS
+    }
+}
+
 async fn call(
     state: &AppState,
     caller: &StoredChatSession,
@@ -181,7 +222,7 @@ async fn call(
 ) -> Result<String> {
     match name {
         "models" => {
-            let models = model_routes::models(&catalog(state).await);
+            let models = models(state, None).await?;
             if models.is_empty() {
                 bail!("No agent is ready to run a delegate. The user can sign in to one in OpenResearch.");
             }
@@ -311,8 +352,13 @@ async fn call(
             let pending = delegation::pending_prompt(&store, &target.id)?
                 .filter(|pending| pending.id == prompt_id)
                 .ok_or_else(|| anyhow!("Chat `{}` has no open question `{prompt_id}`; call `status` for its current one.", target.id))?;
-            if pending.kind() != "question" {
-                bail!("Only the user can approve a step; `answer` answers questions.");
+            match pending.kind() {
+                "question" => {}
+                "env" => bail!(
+                    "Only the user can set the variables chat `{}` asks for.",
+                    target.id
+                ),
+                _ => bail!("Only the user can approve a step; `answer` answers questions."),
             }
             let choices: Vec<String> = args
                 .get("choices")
@@ -346,9 +392,28 @@ async fn call(
                     note,
                     annotations: Vec::new(),
                     from: Some(caller.id.clone()),
+                    env: Vec::new(),
                 })
                 .await?;
             Ok(format!("Answered chat `{}`; it continues.", target.id))
+        }
+        "request_env" => {
+            let variables = env_request::parse_variables(args)?;
+            if let Some(error) = variables
+                .iter()
+                .find_map(|var| super::env_key_error(&var.name))
+            {
+                bail!("{error}");
+            }
+            state
+                .chat
+                .request_env(
+                    &caller.id,
+                    optional_text(args, "reason").map(str::to_string),
+                    variables,
+                    std::time::Duration::from_secs(longest_wait(&caller.harness)),
+                )
+                .await
         }
         "cancel" => {
             let store = Store::open()?;
@@ -413,7 +478,7 @@ async fn delegate(state: &AppState, caller: &StoredChatSession, args: &Value) ->
         &caller.id,
         notify.then_some((delegation.depth + 1, may_delegate)),
     );
-    let models = model_routes::models(&catalog(state).await);
+    let models = models(state, optional_text(args, "route")).await?;
     let route = model_routes::resolve(&models, text(args, "model")?, optional_text(args, "route"))
         .map_err(|e| anyhow!(e))?;
     let effort = optional_text(args, "effort");
@@ -520,7 +585,7 @@ async fn wait(state: &AppState, caller: &StoredChatSession, args: &Value) -> Res
         .get("timeoutSeconds")
         .and_then(Value::as_u64)
         .unwrap_or(WAIT_DEFAULT_SECONDS)
-        .clamp(1, delegation::WAIT_MAX_SECONDS);
+        .clamp(1, longest_wait(&caller.harness));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
     let named = args
         .get("chatIds")
@@ -644,13 +709,17 @@ async fn wait(state: &AppState, caller: &StoredChatSession, args: &Value) -> Res
     }
 }
 
-async fn catalog(state: &AppState) -> Value {
+async fn models(state: &AppState, requested: Option<&str>) -> Result<Vec<model_routes::Model>> {
+    let preferences = Store::open()?.ui_state()?;
     let query = HarnessQuery {
         refresh: None,
         retry: None,
         harness: None,
     };
-    harnesses_payload(state, &query).await
+    let mut catalog = harnesses_payload(state, &query).await;
+    model_routes::filter_agents(&mut catalog, &preferences.hidden_agents, requested)
+        .map_err(|error| anyhow!(error))?;
+    Ok(model_routes::models(&catalog, &preferences.hidden_models))
 }
 
 fn optional_text<'a>(args: &'a Value, key: &str) -> Option<&'a str> {

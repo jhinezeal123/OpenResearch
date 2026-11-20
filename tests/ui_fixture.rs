@@ -2,13 +2,16 @@
 #![allow(clippy::disallowed_methods)]
 #![cfg(unix)]
 
+#[path = "common/home.rs"]
+mod home;
+
 use anyhow::{bail, ensure, Context, Result};
 use orx_test_support::{Faults, Process, Sshd, SshdBuilder};
 use serde_json::{json, Value};
 use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::num::NonZeroU64;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,13 +60,11 @@ impl Fixture {
     fn command(&self) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_orx"));
         let root = self.root.as_path();
-        cmd.env_remove("CLAUDE_CONFIG_DIR")
-            .env_remove("CODEX_HOME")
+        home::isolate_home(&mut cmd, root)
             .env_remove("ORX_LOCAL_SESSION")
             .env_remove("ORX_UP_AUTH_TOKEN")
             .env_remove("ORX_UP_PORT")
             .env_remove("SSH_AUTH_SOCK")
-            .env("HOME", root)
             .env("XDG_CONFIG_HOME", root.join("config"))
             .env("XDG_DATA_HOME", root.join("xdg-data"))
             .env("XDG_CACHE_HOME", root.join("cache"))
@@ -556,8 +557,7 @@ fn fixture_cleanup_does_not_abort_during_unwind() {
     let fixture = empty_fixture();
     let bin = fixture.root.join("bin");
     fs::create_dir(&bin).unwrap();
-    fs::write(bin.join("pgrep"), "#!/bin/sh\nexit 0\n").unwrap();
-    fs::set_permissions(bin.join("pgrep"), fs::Permissions::from_mode(0o700)).unwrap();
+    orx_test_support::write_executable(bin.join("pgrep"), "#!/bin/sh\nexit 0\n", 0o700).unwrap();
     let output = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",

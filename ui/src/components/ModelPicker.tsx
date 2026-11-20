@@ -6,46 +6,53 @@ import {
   useRef,
   useState,
   type ButtonHTMLAttributes,
+  type CSSProperties,
   type ReactNode,
   type RefObject,
 } from "react";
 import { WorkspaceDomContext } from "../WorkspaceDom";
 import { useWorkspace } from "../workspace";
+import { mutUpdateUiState } from "../queries/settings";
 import { EscapeScope } from "./EscapeScope";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { Menu } from "@base-ui/react/menu";
 import { Popover } from "@base-ui/react/popover";
 import { DirectionProvider } from "@base-ui/react/direction-provider";
 
 import { m } from "../paraglide/messages.js";
-import { ltr } from "../i18n";
-import { Bot, CircleAlert, Check, ChevronDown, ChevronRight, Handshake, ListChecks, Lock, LockOpen, Pencil, Plus, Settings, ShieldCheck, Workflow, Zap, type LucideIcon } from "lucide-react";
+import { getLocale } from "../paraglide/runtime.js";
+import { Bot, Brain, Check, ChevronDown, ChevronRight, Handshake, ListChecks, Lock, LockOpen, Minus, Pencil, Plus, Rocket, Ruler, Settings, ShieldCheck, Turtle, Workflow, Zap, type LucideIcon } from "lucide-react";
 import {
-  fmtNumber,
-  harnessModelLabel,
   modelLabel,
   reasoningFor,
   reconcileReasoning,
   reconcileServiceTier,
   REASONING_DEFAULT_ID,
+  SERVICE_TIER_DEFAULT_ID,
   serviceTiersFor,
   type Harness,
   type HarnessId,
+  type LocalModelConnection,
+  type ModelNudge,
+  type ModelVariant,
+  type OpenCodeProvider,
   type OptionChoice,
   type AgentSelection,
   type Autonomy,
   DEFAULT_AUTONOMY,
 } from "../api";
-import { renderNote } from "./agentNote";
 import type { NativeOption } from "../acp";
-import { HarnessLogo } from "./HarnessLogo";
+import { HarnessLogo, LABS, ModelGlyph, ModelMark } from "./HarnessLogo";
 
-import { IconButton, MenuItem, SwitchIndicator, Tooltip } from "./ui";
+import { Button, IconButton, MENU_LABEL, MENU_POPUP, MENU_SEPARATOR, MenuItem, SwitchIndicator, Tooltip } from "./ui";
 import { cn } from "./ui/cn";
 
-import { LocalModelDialog } from "./LocalModelSetup";
-
-import { formatCodexModel, groupModels, resolveHarnessDefaultModel } from "../modelSelection";
+import { harnessDisplayName, harnessKey, selectionHarness } from "../modelSelection";
+import { defaultOffer, localDay, newLines, VARIANT_EFFORTS, variantOffer } from "../modelLines";
+import { AgentIconTile } from "./AgentIcon";
+import { feedLine, lineLab, lineName, lineSection, ModelList, offerOn, type PickedFrom, type PickerLine } from "./ModelList";
+import { harnessMark, listedSignedOut, pickerLines, type PickerAgent } from "./pickerAgents";
+import { useAgentSignIn } from "./HarnessSetupDialog";
 
 const MODEL_GROUP_CLASS_NAME = [
   "model-group flex items-center justify-between gap-2",
@@ -61,9 +68,9 @@ const MODEL_MORE_CLASS_NAME = [
 
 export type ModelSelection = AgentSelection;
 
-export const HARNESS_LABELS: Record<HarnessId, string> = {
+const HARNESS_LABELS: Record<HarnessId, string> = {
   "claude-code": "Claude Code",
-  codex: "Codex",
+  codex: "OpenAI Codex",
   opencode: "OpenCode",
   cursor: "Cursor",
   antigravity: "Google Antigravity",
@@ -73,14 +80,15 @@ export function harnessLabel(id: HarnessId, name?: string | null): string {
   return name || HARNESS_LABELS[id] || (id.startsWith("acp:") ? "ACP" : id);
 }
 
-/** First harness that can actually run — the fallback when nothing is picked.
- * Seeds mode/reasoning from that harness's advertised defaults. */
+/** The first agent with a model to start on, the fallback when nothing is picked.
+ * Seeds mode/reasoning from that agent's advertised defaults. */
 export function defaultSelection(harnesses: Harness[]): ModelSelection | null {
-  const ready = harnesses.find((h) => h.agentReady);
-  if (!ready) return null;
-  const model = resolveHarnessDefaultModel(ready);
+  const ready = harnesses.find((h) => h.defaultModel);
+  const model = ready?.defaultModel;
+  if (!ready || !model) return null;
   return {
     harness: ready.id,
+    profile: ready.profile?.id ?? null,
     model,
     serviceTier: reconcileServiceTier(ready, model, null),
     permissionMode: ready.options?.defaultPermissionMode ?? null,
@@ -108,10 +116,6 @@ export function usePopover(triggerRef?: RefObject<HTMLButtonElement | null>) {
 
 const PILL =
   "composer-pill inline-flex h-7 min-w-0 shrink-0 items-center gap-1.5 rounded-md px-2 text-sm text-subtext whitespace-nowrap transition-[background,color] duration-150 ease-standard hover:bg-hover-muted hover:text-text data-[popup-open]:bg-hover-muted data-[popup-open]:text-text";
-
-const MENU_POPUP = "overflow-y-auto rounded-lg border border-border bg-background p-1 shadow-dropdown outline-none";
-
-const MENU_LABEL = "px-2 pt-1.5 pb-1 text-sm text-muted";
 
 /** Effort tiers fill more of a 3×3 grid; ids the grid does not know stay empty. */
 const EFFORT_DOTS: Record<string, { dots: number[]; tone: string }> = {
@@ -158,7 +162,7 @@ const PERMISSION_ICONS: Record<string, { icon: LucideIcon; tone: string }> = {
   plan: { icon: ListChecks, tone: "text-accent-teal" },
   auto: { icon: ShieldCheck, tone: "text-accent-blue" },
   "approve-for-me": { icon: ShieldCheck, tone: "text-accent-blue" },
-  "auto-approve": { icon: ShieldCheck, tone: "text-accent-blue" },
+  "auto-approve": { icon: LockOpen, tone: "text-accent-red" },
   bypass: { icon: LockOpen, tone: "text-accent-red" },
   bypassPermissions: { icon: LockOpen, tone: "text-accent-red" },
   "full-access": { icon: LockOpen, tone: "text-accent-red" },
@@ -190,8 +194,28 @@ function DescribedRadioItem({ choice, icon, isDefault }: { choice: OptionChoice;
   );
 }
 
+/** Speed tiers slowest first, as the Speed control offers them; null is the standard tier. */
+const SPEEDS = ["flex", null, "fast", "ultrafast"] as const;
+const SPEED_ICONS: Record<string, LucideIcon> = { flex: Turtle, fast: Zap, ultrafast: Rocket };
+
+function speedName(speed: string | null) {
+  return speed === "fast" ? m.model_picker_speed_fast()
+    : speed === "ultrafast" ? m.model_picker_speed_ultrafast()
+      : speed === "flex" ? m.model_picker_speed_flex()
+        : speed ?? m.service_tier_standard();
+}
+
+function SpeedIcon({ speed }: { speed: string | null }) {
+  const Icon = speed ? SPEED_ICONS[speed] ?? Zap : Minus;
+  return <Icon size={14} aria-hidden="true" className={cn("shrink-0", speed && "text-accent-amber")} />;
+}
+
+const SPEED_SEGMENT =
+  "inline-flex h-6 w-7 cursor-default items-center justify-center rounded-sm text-subtext outline-none transition-[background,color] duration-120 ease-standard data-[highlighted]:text-text data-[checked]:bg-background data-[checked]:text-text data-[checked]:shadow-segment focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-focus";
+
 const SETTINGS_ROW =
-  "flex min-h-8 w-full items-center justify-between gap-2 rounded-sm px-2 py-1.5 text-start text-sm text-text outline-none transition-[background,color] duration-120 ease-standard data-[highlighted]:bg-surface data-[popup-open]:bg-surface focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-focus focus-visible:outline-offset-2";
+  // Inset, so a scrolling menu never clips the focus ring.
+  "flex min-h-8 w-full items-center justify-between gap-2 rounded-sm px-2 py-1.5 text-start text-sm text-text outline-none transition-[background,color] duration-120 ease-standard data-[highlighted]:bg-surface data-[popup-open]:bg-surface focus-visible:outline-2 focus-visible:outline-solid focus-visible:outline-focus focus-visible:-outline-offset-2";
 
 function SettingsSubmenu({
   label,
@@ -291,6 +315,7 @@ export function ModelPicker({
   nativeOptions = [],
   onSelectNativeOption,
   onStartHarness,
+  canNudge = false,
 }: {
   value: ModelSelection | null;
   onSelect: (value: ModelSelection) => void;
@@ -310,25 +335,44 @@ export function ModelPicker({
   sessionHarness?: Harness;
   nativeOptions?: NativeOption[];
   onSelectNativeOption?: (optionId: string, value: string) => void;
-  onStartHarness?: (harness: Harness) => void;
+  onStartHarness?: (harness: Harness, model: string) => void;
+  /** Whether this composer shows the model feed's nudge: the open chat's does. */
+  canNudge?: boolean;
 }) {
   const { portalContainer } = useContext(WorkspaceDomContext);
 
-  const { showCustomDialog } = useWorkspace().dialogs;
+  const workspace = useWorkspace();
+  const { getHarnessesQuery, getOpenCodeProvidersQuery, getLocalModelsQuery, getUiStateQuery, getModelFeedQuery } = workspace.queries;
 
-  const { getHarnessesQuery } = useWorkspace().queries;
-
-  const { data: catalog = EMPTY_HARNESSES } = useQuery(getHarnessesQuery());
-  const harnesses = useMemo(
-    () => (sessionHarness ? [sessionHarness, ...catalog.filter((h) => h.id !== sessionHarness.id)] : catalog),
-    [catalog, sessionHarness],
+  const { data: catalog = EMPTY_HARNESSES, isPending: catalogLoading } = useQuery(getHarnessesQuery());
+  const { data: providers = EMPTY_PROVIDERS } = useQuery(getOpenCodeProvidersQuery());
+  const { data: endpoints = EMPTY_ENDPOINTS } = useQuery(getLocalModelsQuery());
+  const { data: uiState } = useQuery(getUiStateQuery());
+  const { data: feed } = useQuery(getModelFeedQuery());
+  const pickedHarness = value?.harness;
+  const pickedProfile = value?.profile;
+  const pickedModel = value?.model;
+  const { harnesses, agents, selectedHarness, selectedModel, selectedAgent, lines, selectedLine } = useMemo(
+    () => pickerLines(
+      { catalog, providers, endpoints, hiddenModels: uiState?.hiddenModels ?? EMPTY_IDS },
+      pickedHarness ? { harness: pickedHarness, profile: pickedProfile, model: pickedModel ?? null } : null,
+      sessionHarness,
+    ),
+    [catalog, providers, endpoints, uiState?.hiddenModels, pickedHarness, pickedProfile, pickedModel, sessionHarness],
   );
-  const queryClient = useQueryClient();
-  const localModelConnected = useRef<(model: string) => void>(() => {});
-  useEffect(() => () => { localModelConnected.current = () => {}; }, []);
+  const favorites = useMemo(() => new Set(uiState?.favoriteModels ?? []), [uiState]);
+  const releases = feed?.releases ?? NO_RELEASES;
+  // Not memoized: a model stops being new as time passes, with nothing else changing.
+  const released = newLines(lines, releases, Date.now());
   const [menu, setMenu] = useState<"model" | "effort" | "permissions" | null>(null);
-  const [legacyMenu, setLegacyMenu] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
+  const signIn = useAgentSignIn();
+  // An agent signed out of research it ran keeps a row here, so signing in again is one click away.
+  const signedOut = catalog.filter((h) => listedSignedOut(h) && !h.off).flatMap((h) => {
+    const name = h.profile?.name ?? harnessDisplayName(h);
+    const open = signIn(h);
+    return open && name.toLowerCase().includes(filter.trim().toLowerCase()) ? [{ h, name, open }] : [];
+  });
   const modelTriggerRef = useRef<HTMLButtonElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const handledOpenRequest = useRef(openRequest);
@@ -336,54 +380,98 @@ export function ModelPicker({
   const close = () => {
     setMenu(null);
     setFilter("");
+    setPointAt(undefined);
     modelTriggerRef.current?.focus();
+  };
+
+  // The open chat's model button points at one model at a time, once each: the newest release an agent offers, then
+  // the feed's nudge toward a free model while free models are on. After one is dismissed, the next waits for a reload.
+  const nudge = feed?.nudge;
+  const nudgeLine = nudge && uiState?.opencodeFreeModels ? feedLine(lines, nudge.model) : undefined;
+  const nudgeText = nudge && nudgeLine && nudgeMessage(nudge);
+  const release = released.find((line) => !line.offers[0].model.free && FRONTIER_LABS.includes(lineLab(line) as never));
+  const callouts: Callout[] = [
+    ...(release ? [{
+      kind: "release" as const,
+      id: `release:${release.key}`.slice(0, 64),
+      line: release,
+      text: releaseText(release, releases[release.key]),
+      colors: releaseColors(release),
+      mark: <ModelMark model={release.offers[0].model} harness={release.offers[0].tile.harness.id} size={24} />,
+    }] : []),
+    ...(nudge && nudgeLine && nudgeText ? [{
+      kind: "free" as const,
+      id: nudge.id,
+      line: nudgeLine,
+      text: nudgeText,
+      colors: nudge.colors,
+      mark: <span className="contents" style={{ color: nudge.colors.icon }}><ModelGlyph model={nudgeLine.offers[0].model} size={24} /></span>,
+    }] : []),
+  ];
+  const seenNudges = uiState?.seenNudges;
+  const callout = canNudge && !disabled && seenNudges && !calledOut.has(workspace) ? callouts.find(({ id, line }) => !seenNudges.includes(id) && line !== selectedLine) : undefined;
+  const leaving = useRef<number>(undefined);
+  useEffect(() => () => clearTimeout(leaving.current), []);
+
+  /** Records the callout as seen, keeping the newest ids since only a recent one returns; `expand` also opens the picker section it points into. */
+  const dismissCallout = (expand = false) => {
+    clearTimeout(leaving.current);
+    if (!callout || !seenNudges) return;
+    calledOut.add(workspace);
+    reportCallout(callout, expand ? "opened" : "dismissed");
+    const collapsed = uiState?.collapsedModelSections ?? EMPTY_IDS;
+    const section = lineSection(callout.line);
+    mutUpdateUiState.run(workspace, {
+      seenNudges: [...seenNudges, callout.id].slice(-20),
+      ...(expand && collapsed.includes(section) && { collapsedModelSections: collapsed.filter((id) => id !== section) }),
+    });
+  };
+  const reportCallout = ({ kind, line }: Callout, action: "shown" | "opened" | "dismissed") => {
+    const [offer] = line.offers;
+    workspace.api.captureUiEvent({ name: "model_callout", kind, action, model: offer.model.id, harness: offer.tile.harness.id });
+  };
+  const showing = callout && menu === null ? callout : undefined;
+  useEffect(() => {
+    if (!showing || shownCallouts.has(showing.id)) return;
+    shownCallouts.add(showing.id);
+    reportCallout(showing, "shown");
+  }, [showing?.id]);
+
+  // Moving from the button to the callout crosses a gap, so leaving either waits before dismissing.
+  const calloutHover = { onMouseEnter: () => clearTimeout(leaving.current), onMouseLeave: () => { leaving.current = window.setTimeout(dismissCallout, 200); } };
+
+  const openModels = () => {
+    setFilter("");
+    setMenu("model");
+    searchRef.current?.focus();
+  };
+
+  // The picker opens on the model a callout pointed at, else on the newest release; typing still searches.
+  const [pointAt, setPointAt] = useState<string>();
+  const landOn = () => {
+    const key = pointAt ?? released[0]?.key;
+    const row = key && searchRef.current?.closest(".model-menu")?.querySelector<HTMLElement>(`[data-row="${CSS.escape(key)}"] [data-nav]`);
+    return row || searchRef.current;
   };
 
   useEffect(() => {
     if (openRequest === handledOpenRequest.current) return;
     handledOpenRequest.current = openRequest;
     if (disabled) return;
-    setFilter("");
-    setMenu("model");
-    searchRef.current?.focus();
+    dismissCallout();
+    openModels();
   }, [openRequest, disabled]);
 
-  const groups = useMemo(() => {
-    const q = filter.trim().toLowerCase();
-    const current = harnesses.find((harness) => harness.id === value?.harness);
-    const shown =
-      lockHarness && value
-        ? current
-          ? [current]
-          : []
-        : current
-          ? [current, ...harnesses.filter((harness) => harness.id !== current.id)]
-          : harnesses;
-    return shown.map((harness) => {
-      let models = harness.models.filter((model) => harness.id !== "codex" || model.id !== "default");
-      if (q)
-        models = models.filter((model) =>
-          `${model.id} ${harnessModelLabel(model)}`.toLowerCase().includes(q),
-        );
-      else if (
-        harness.id === "opencode" ||
-        harness.id === "cursor" ||
-        harness.id === "antigravity" ||
-        harness.id.startsWith("acp:")
-      )
-        models = models.slice(0, 5);
-      const count = harness.models.filter((model) => harness.id !== "codex" || model.id !== "default").length;
-      const grouped = q ? { current: models, legacy: [] } : groupModels(harness.id, models);
-      return { harness, models: grouped.current, legacy: grouped.legacy, hidden: q ? 0 : count - models.length };
-    });
-  }, [harnesses, filter, lockHarness, value]);
+  const selectedOffer = offerOn(selectedLine, selectedAgent, selectedModel);
+  const lockedHarness = lockHarness && value ? value.profile ?? value.harness : undefined;
 
-  const pick = (harness: Harness, model: string | null) => {
+  const pick = (harness: Harness, model: string) => {
     if (disabled) return;
-    const previous = value?.harness === harness.id ? value : null;
+    const previous = selectionHarness([harness], value) ? value : null;
 
     onSelect({
       harness: harness.id,
+      profile: harness.profile?.id ?? null,
       model,
       serviceTier: reconcileServiceTier(harness, model, previous?.serviceTier),
       permissionMode: previous ? previous.permissionMode : (harness.options?.defaultPermissionMode ?? null),
@@ -397,24 +485,60 @@ export function ModelPicker({
     close();
   };
 
-  localModelConnected.current = (model) => {
-    const harness = queryClient.getQueryData(getHarnessesQuery().queryKey)?.find((entry) => entry.id === "opencode");
-    if (harness && (!lockHarness || value?.harness === "opencode")) pick(harness, model);
+  /** While the chat can't change agents, a model on another agent opens a new chat with it. */
+  const run = (agent: PickerAgent, model: string) => {
+    if (lockedHarness && harnessKey(agent.harness) !== lockedHarness) {
+      close();
+      onStartHarness?.(agent.harness, model);
+    } else pick(agent.harness, model);
   };
 
-  const selectedHarness = harnesses.find((harness) => harness.id === value?.harness);
-  const selected = selectedHarness?.models.find((model) => model.id === value?.model);
-  const displayModel = (harness: Harness, model: Harness["models"][number]) => harness.id === "codex" ? formatCodexModel(harnessModelLabel(model)) : harnessModelLabel(model);
-  const defaultModel = selectedHarness?.models.find((model) => model.id === resolveHarnessDefaultModel(selectedHarness));
-  const label = value
-    ? value.model
-      ? selected
-        ? displayModel(selectedHarness!, selected)
-        : value.harness.startsWith("acp:") && value.model === "default"
-          ? m.model_picker_default_model()
-          : `${value.harness === "codex" ? formatCodexModel(value.model) : modelLabel(value.model)} · ${m.model_picker_unverified()}`
-      : defaultModel && selectedHarness ? displayModel(selectedHarness, defaultModel) : m.model_picker_default_model()
-    : m.model_picker_model();
+  const pickLine = (line: PickerLine, agent: PickerAgent, from: PickedFrom) => {
+    const offer = (line === selectedLine && agent === selectedAgent && selectedOffer) || defaultOffer(line.offers.filter((offer) => offer.tile === agent));
+    if (!offer) return;
+    workspace.api.captureUiEvent({
+      name: "model_picked",
+      section: from,
+      model: offer.model.id,
+      harness: agent.harness.id,
+      new: released.includes(line),
+      free: Boolean(offer.model.free),
+    });
+    run(agent, offer.model.id);
+  };
+
+  const toggleFavorite = (family: string) =>
+    mutUpdateUiState.run(workspace, { favoriteModels: favorites.has(family) ? [...favorites].filter((item) => item !== family) : [...favorites, family] });
+
+  // A saved model keeps its name while its agent's models load; once they have, only a listed one does.
+  const loading = catalogLoading || Boolean(selectedHarness?.catalogPending);
+  const label = selectedLine
+    ? lineName(selectedLine)
+    : loading
+      ? value?.model ? modelLabel(value.model) : m.model_picker_model()
+      : m.model_picker_choose_model();
+  // A model only one agent offers names no agent.
+  const agentShown = selectedAgent && new Set(selectedLine?.offers.map((offer) => offer.tile)).size > 1 ? selectedAgent : undefined;
+  const hint = agentShown ? `${label} — ${agentShown.name}` : label;
+
+  // Catalogs list speed and thinking tiers as models, Cursor and Antigravity each effort too, and Claude
+  // Code its long context: the Effort menu moves between the siblings of the picked one.
+  const siblings = selectedLine?.offers.filter((offer) => offer.tile === selectedAgent) ?? [];
+  const variant = selectedOffer?.model.parsed.variant;
+  const varies = (field: keyof ModelVariant) => new Set(siblings.map((offer) => offer.model.parsed.variant[field])).size > 1;
+  const variantEfforts = varies("effort")
+    ? [...new Set(siblings.map((offer) => offer.model.parsed.variant.effort))].sort((a, b) => VARIANT_EFFORTS.indexOf(a as never) - VARIANT_EFFORTS.indexOf(b as never))
+    : [];
+  const variantContext = varies("context") ? siblings.find((offer) => offer.model.parsed.variant.context)?.model.parsed.variant.context : undefined;
+  const pickVariant = (change: Partial<ModelVariant>) => {
+    const offer = variant && variantOffer(siblings, variant, change);
+    if (!offer || !value || !selectedHarness) return;
+    onSelect({ ...value, model: offer.model.id, reasoningLevel: reconcileReasoning(selectedHarness, offer.model.id, value.reasoningLevel) });
+  };
+  const variantSpeeds = varies("speed") ? SPEEDS.filter((speed) => siblings.some((offer) => offer.model.parsed.variant.speed === speed)) : [];
+  const variantSwitches = Boolean(variant && (variantSpeeds.length || varies("thinking") || variantContext));
+  const hasVariants = Boolean(variant && (variantEfforts.length || variantSwitches));
+
   const effectiveReasoningId = value?.reasoningLevel ?? defaultReasoningId ?? reasoningChoices[0]?.id;
   const reasoningLabel = reasoningChoices.find((choice) => choice.id === effectiveReasoningId)?.label;
   const ultracodeChoice = reasoningChoices.find((choice) => choice.id === ULTRACODE);
@@ -424,6 +548,17 @@ export function ModelPicker({
   const permissionLabel = permissionChoices.find((choice) => choice.id === effectivePermissionId)?.label;
   const effectiveServiceTier = reconcileServiceTier(selectedHarness, value?.model, value?.serviceTier);
   const fastChoice = serviceTiersFor(selectedHarness, value?.model).find((choice) => choice.id === "priority");
+  const effortLabel = variant && variantEfforts.length ? effortName(variant.effort) : reasoningLabel;
+  // Codex's Fast is a service tier of the same model; elsewhere each speed is a sibling model.
+  const speeds: (string | null)[] = variantSpeeds.length ? variantSpeeds : fastChoice ? [null, "fast"] : [];
+  const speed = variant?.speed ?? (fastChoice && effectiveServiceTier === fastChoice.id ? "fast" : null);
+  const pickSpeed = (next: string | null) => {
+    if (variantSpeeds.length) pickVariant({ speed: next });
+    else if (value && fastChoice) onSelect({ ...value, serviceTier: next ? fastChoice.id : SERVICE_TIER_DEFAULT_ID });
+  };
+  // One tier beside the standard one is a switch; more are a choice.
+  const switchTier = speeds.length === 2 && speeds.includes(null) ? speeds.find((tier) => tier !== null) : undefined;
+  const speedLabel = (tier: string) => (tier === "fast" ? m.model_picker_fast_mode() : speedName(tier));
   const autonomyChoices: (OptionChoice & { id: Autonomy; icon: ReactNode })[] = [
     {
       id: "agentic",
@@ -439,22 +574,38 @@ export function ModelPicker({
     },
   ];
   const autonomyLabel = autonomyChoices.find((choice) => choice.id === autonomy)?.label;
+  const permissionSummary = [
+    permissionLabel && `${m.model_picker_permissions()}: ${permissionLabel}`,
+    autonomyLabel && `${m.model_picker_autonomy()}: ${autonomyLabel}`,
+  ].filter(Boolean).join(" · ") || m.model_picker_permissions();
   const moveFocus = (event: React.KeyboardEvent<HTMLDivElement>) => {
     if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+
+    // Typing anywhere in the picker continues the search.
+    const typed = event.key.length === 1 && event.key !== " " ? filter + event.key : event.key === "Backspace" ? filter.slice(0, -1) : undefined;
+    if (typed !== undefined && event.target !== searchRef.current && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      event.preventDefault();
+      setFilter(typed);
+      searchRef.current?.focus();
+      return;
+    }
+
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
     const items = Array.from(
-      event.currentTarget.querySelectorAll<HTMLElement>("input, .model-menu-list button:not([disabled])"),
+      event.currentTarget.querySelectorAll<HTMLElement>("input, .model-menu-list [data-nav]:not([disabled])"),
     );
     if (!items.length) return;
 
     event.preventDefault();
-    const index = items.findIndex((item) => item === document.activeElement);
-    items[(index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length]?.focus();
+    // From one of a row's agents, Up and Down still move by row.
+    const active = document.activeElement?.closest("[data-row]")?.querySelector("[data-nav]") ?? document.activeElement;
+    const index = items.findIndex((item) => item === active);
+    // Down from the search enters the list where it's scrolled to, below the sticky section header.
+    const list = event.currentTarget.querySelector(".model-menu-list");
+    const top = list ? list.getBoundingClientRect().top + parseFloat(getComputedStyle(list).scrollPaddingTop) : 0;
+    const shown = active === searchRef.current && event.key === "ArrowDown" ? items.find((item) => item !== active && item.getBoundingClientRect().top >= top) : undefined;
+    (shown ?? items[(index + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length])?.focus();
   };
-
-  useEffect(() => {
-    if (menu !== "model") setLegacyMenu(null);
-  }, [menu]);
 
   return (
     <DirectionProvider direction={document.documentElement.dir === "rtl" ? "rtl" : "ltr"}>
@@ -467,27 +618,33 @@ export function ModelPicker({
           onOpenChange={(open) => {
             setFilter("");
             setMenu((current) => (open ? "model" : current === "model" ? null : current));
+            if (!open) setPointAt(undefined);
+            if (open) dismissCallout();
           }}
         >
-          <Tooltip interactive content={label} className="min-w-0 max-w-full rounded-md">
+          <Tooltip interactive disabled={Boolean(callout)} content={hint} className="min-w-0 max-w-full rounded-md">
             <Popover.Trigger
               ref={modelTriggerRef}
               type="button"
               disabled={disabled}
               className={cn(PILL, "max-w-full", className)}
-              aria-label={m.a11y_chat_model({ label })}
+              aria-label={m.a11y_chat_model({ label: hint })}
+              aria-description={callout ? `${lineName(callout.line)}, ${callout.text}` : undefined}
+              {...(callout && calloutHover)}
               onKeyDown={(event) => {
                 if (event.key === "ArrowDown") {
                   event.preventDefault();
-                  setFilter("");
-                  setMenu("model");
-                  searchRef.current?.focus();
+                  dismissCallout();
+                  openModels();
                 }
               }}
             >
-              {value?.harness ? (
+              {agentShown ? (
+                <AgentIconTile icon={agentShown.icon} brand={agentShown.brand} size="xs" />
+              ) : selectedAgent ? null : value?.harness ? (
                 <HarnessLogo harness={value.harness} logo={selectedHarness?.logo} size={14} />
               ) : null}
+              {selectedOffer && <ModelMark model={selectedOffer.model} harness={selectedOffer.tile.harness.id} size={14} />}
               <span className="model-picker-label min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">
                 {label}
               </span>
@@ -505,23 +662,28 @@ export function ModelPicker({
               positionMethod="fixed"
             >
               <Popover.Popup
-                initialFocus={searchRef}
+                initialFocus={landOn}
                 onKeyDown={moveFocus}
                 aria-label={m.model_picker_model()}
-                className="model-menu flex flex-col overflow-hidden rounded-lg border border-border bg-background shadow-dropdown outline-none"
+                className="model-menu group/picker flex flex-col overflow-hidden rounded-lg border border-border bg-background shadow-dropdown outline-none"
                 style={{
-                  width: "min(288px, calc(100vw - 16px))",
-                  maxHeight: "min(400px, var(--available-height))",
+                  width: "min(440px, calc(100vw - 16px))",
+                  maxHeight: "min(340px, var(--available-height))",
                 }}
               >
-                <div className="flex shrink-0 items-center border-b border-border-variant">
+                <div className="flex shrink-0 items-center border-b border-border-variant pe-1.5">
                   <input
                     ref={searchRef}
                     type="text"
-                    aria-label={m.model_picker_search_or_enter_id()}
-                    placeholder={m.model_picker_search_or_enter_id()}
+                    aria-label={m.model_picker_search_models()}
+                    placeholder={m.model_picker_search_models()}
                     value={filter}
                     onChange={(event) => setFilter(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Enter" || event.nativeEvent.isComposing || event.keyCode === 229 || !filter.trim()) return;
+                      event.preventDefault();
+                      event.currentTarget.closest(".model-menu")?.querySelector<HTMLElement>("[data-row] [data-nav]")?.click();
+                    }}
                     className="min-w-0 flex-1 border-0 bg-transparent px-3 py-2 text-sm outline-none"
                   />
                   <IconButton
@@ -536,205 +698,120 @@ export function ModelPicker({
                     <Settings size={16} aria-hidden="true" />
                   </IconButton>
                 </div>
-                <div className="model-menu-list min-h-0 overflow-x-hidden overflow-y-auto p-1.5 [&_button]:min-w-0 [&_button]:[overflow-wrap:anywhere] [&_button>span]:min-w-0">
-                  {groups.map(({ harness, models, legacy, hidden }) => (
-                    <div key={harness.id}>
-                      {harness.agentReady ? (
-                        <div className={MODEL_GROUP_CLASS_NAME}>
-                          <span className="inline-flex items-center gap-1.5">
-                            <HarnessLogo harness={harness.id} logo={harness.logo} size={14} />
-                            {harness.name}
-                          </span>
-                        </div>
-                      ) : harness.catalogPending ? (
-                        <div className={MODEL_GROUP_CLASS_NAME}>
-                          <span className="inline-flex items-center gap-1.5">
-                            <HarnessLogo harness={harness.id} logo={harness.logo} size={14} />
-                            {harness.name}
-                          </span>
-                          <span className="font-normal text-muted">{m.onboarding_checking()}</span>
-                        </div>
-                      ) : (
-                        <MenuItem type="button" className="font-medium" onClick={() => { close(); onOpenSettings(); }}>
-                          <span className="inline-flex min-w-0 items-center gap-1.5">
-                            <HarnessLogo harness={harness.id} logo={harness.logo} size={14} />
-                            {harness.name}
-                          </span>
-                          <span className="inline-flex items-center gap-1 font-normal text-accent-amber">
-                            <CircleAlert size={14} aria-hidden="true" className="shrink-0" />
-                            {!harness.installed ? m.settings_page_not_installed()
-                              : harness.installBroken ? m.settings_page_install_broken()
-                              : harness.needsConfigRepair || harness.authCheckFailed ? m.settings_page_unable_to_verify()
-                              : harness.authState === "needsLogin" ? m.model_picker_needs_login()
-                              : harness.authState === "unsupported" ? m.settings_page_update_required()
-                              : m.settings_page_unable_to_verify()}
-                          </span>
-                        </MenuItem>
-                      )}
-                      {harness.agentReady && (
-                        <>
-                          {!filter.trim() && harness.id !== "codex" && !(harness.id === "claude-code" && harness.models.length > 0) && !harness.id.startsWith("acp:") && (
-                            <MenuItem
-                              type="button"
-                              className="ps-6"
-                              aria-pressed={value?.harness === harness.id && value.model === null}
-                              onClick={() => pick(harness, null)}
-                            >
-                              <span>{m.model_picker_default_model()}</span>
-                              {value?.harness === harness.id && value.model === null && <Check size={14} />}
-                            </MenuItem>
-                          )}
-                          {harness.models.length === 0 && harness.agentNote && (
-                            <div className={MODEL_MORE_CLASS_NAME}>{renderNote(harness.agentNote)}</div>
-                          )}
-                          {models.map((model) => (
-                            <Tooltip key={model.id} interactive content={model.id} className="w-full rounded-sm">
-                              <MenuItem
-                                type="button"
-                                className="ps-6"
-                                aria-description={model.id}
-                                aria-pressed={value?.harness === harness.id && (value.model === model.id || (value.model === null && model.id === resolveHarnessDefaultModel(harness)))}
-                                onClick={() => pick(harness, model.id)}
-                              >
-                                <span>{displayModel(harness, model)}</span>
-                                {value?.harness === harness.id && (value.model === model.id || (value.model === null && model.id === resolveHarnessDefaultModel(harness))) && (
-                                  <Check size={14} />
-                                )}
-                              </MenuItem>
-                            </Tooltip>
-                          ))}
-                          {legacy.length > 0 && (
-                            <Menu.Root open={legacyMenu === harness.id} onOpenChange={(open) => setLegacyMenu(open ? harness.id : null)}>
-                              <Menu.Trigger openOnHover delay={200} closeDelay={300} className={cn(SETTINGS_ROW, "ps-6")}>
-                                <span>{m.model_picker_legacy()}</span>
-                                <ChevronRight size={14} aria-hidden="true" className="text-muted rtl:rotate-180" />
-                              </Menu.Trigger>
-                              <Menu.Portal container={portalContainer}>
-                                <Menu.Positioner side="right" align="start" sideOffset={4} collisionPadding={8} className="z-50">
-                                  <Menu.Popup onKeyDown={(event) => { if (event.key !== "Escape") event.stopPropagation(); }} aria-label={m.model_picker_legacy()} className="max-h-80 overflow-y-auto rounded-lg border border-border bg-background p-1.5 shadow-dropdown outline-none">
-                                    {legacy.map((model) => (
-                                      <Menu.Item key={model.id} className={SETTINGS_ROW} onClick={() => pick(harness, model.id)}>
-                                        <span>{displayModel(harness, model)}</span>
-                                        {value?.harness === harness.id && (value.model === model.id || (value.model === null && model.id === resolveHarnessDefaultModel(harness))) && <Check size={14} aria-hidden="true" />}
-                                      </Menu.Item>
-                                    ))}
-                                  </Menu.Popup>
-                                </Menu.Positioner>
-                              </Menu.Portal>
-                            </Menu.Root>
-                          )}
-                          {filter.trim().length > 0 &&
-                            !harness.id.startsWith("acp:") &&
-                            !harness.models.some((model) => model.id === filter.trim()) && (
-                              <MenuItem
-                                type="button"
-                                className="ps-6"
-                                onClick={() => pick(harness, filter.trim())}
-                              >
-                                <span>
-                                  {m.model_picker_use_id({ id: ltr(filter.trim()) })} ·{" "}
-                                  {m.model_picker_unverified()}
-                                </span>
-                              </MenuItem>
-                            )}
-                        </>
-                      )}
-                      {harness.agentReady && harness.id === "opencode" && (
-                        <MenuItem
-                          type="button"
-                          className="font-medium"
-                          aria-haspopup="dialog"
-                          onClick={() => {
-                            close();
-                            showCustomDialog({
-                              component: LocalModelDialog,
-                              props: { onConnected: (model) => localModelConnected.current(model) },
-                              onConfirm: (connect) => connect(),
-                              onCancel: "close",
-                            });
-                          }}
-                        >
-                          <span className="inline-flex items-center gap-1.5">
-                            {m.model_picker_add_local_model()}
-                            <Plus size={14} aria-hidden="true" />
-                          </span>
-                        </MenuItem>
-                      )}
-                      {harness.agentReady && hidden > 0 && (
-                        <div className={MODEL_MORE_CLASS_NAME}>
-                          {m.model_picker_more({ count: fmtNumber(hidden) })}
-                        </div>
-                      )}
-                    </div>
-                  ))}
+                <ModelList
+                  lines={lines}
+                  agents={agents}
+                  filter={filter}
+                  onClearFilter={() => setFilter("")}
+                  favorites={favorites}
+                  released={released}
+                  pointedAt={pointAt}
+                  featured={feed?.featured.map(({ model }) => model) ?? EMPTY_IDS}
+                  order={uiState?.modelSectionOrder ?? EMPTY_IDS}
+                  collapsed={uiState?.collapsedModelSections ?? EMPTY_IDS}
+                  onCollapse={(collapsedModelSections) => mutUpdateUiState.run(workspace, { collapsedModelSections })}
+                  selectedLine={selectedLine}
+                  selectedAgent={selectedAgent}
+                  lockedHarness={lockedHarness}
+                  onPick={pickLine}
+                  onToggleFavorite={toggleFavorite}
+                >
                   {harnesses.length === 0 && (
                     <div className={MODEL_MORE_CLASS_NAME}>{m.model_picker_detecting_harnesses()}</div>
                   )}
-                  {lockHarness &&
-                    onStartHarness &&
-                    harnesses.some((harness) => harness.id !== value?.harness && harness.agentReady) && (
-                      <>
-                        <div role="separator" className="m-1 h-px bg-border-variant" />
-                        {harnesses
-                          .filter((harness) => harness.id !== value?.harness && harness.agentReady)
-                          .map((harness) => (
-                            <Tooltip
-                              key={harness.id}
-                              interactive
-                              content={m.model_picker_new_chat_harness()}
-                              className="w-full rounded-sm"
-                            >
-                              <MenuItem
-                                type="button"
-                                aria-description={m.model_picker_new_chat_harness()}
-                                onClick={() => {
-                                  close();
-                                  onStartHarness(harness);
-                                }}
-                              >
-                                <span className="inline-flex items-center gap-1.5">
-                                  <HarnessLogo harness={harness.id} logo={harness.logo} size={14} />
-                                  {harness.name}
-                                </span>
-                                <ChevronRight size={14} className="text-muted" />
-                              </MenuItem>
-                            </Tooltip>
-                          ))}
-                      </>
-                    )}
-                </div>
+                  {signedOut.map(({ h, name, open }) => {
+                    const mark = harnessMark(h);
+                    return (
+                      <div key={harnessKey(h)} className="flex items-center gap-2 px-2 py-1.5 text-sm">
+                        <AgentIconTile icon={mark.icon} brand={mark.brand} size="xs" />
+                        <span className="min-w-0 flex-1 truncate">
+                          {name}
+                          <span className="text-muted"> · {m.settings_page_not_signed_in()}</span>
+                        </span>
+                        <Button type="button" size="small" data-nav onClick={() => { close(); open(); }}>
+                          {m.harness_setup_login()}
+                        </Button>
+                      </div>
+                    );
+                  })}
+                </ModelList>
               </Popover.Popup>
             </Popover.Positioner>
           </Popover.Portal>
         </Popover.Root>
-        {(reasoningChoices.length > 0 || nativeOptions.length > 0 || fastChoice) && (
+        <Popover.Root
+          open={Boolean(callout) && menu === null}
+          onOpenChange={(open, { reason }) => {
+            if (!open && reason === "escape-key") dismissCallout();
+          }}
+        >
+          <Popover.Portal container={portalContainer}>
+            <Popover.Positioner
+              className="z-50"
+              anchor={modelTriggerRef}
+              side="top"
+              sideOffset={10}
+              collisionPadding={8}
+              collisionAvoidance={{ side: "none" }}
+              positionMethod="fixed"
+            >
+              <Popover.Popup
+                initialFocus={false}
+                finalFocus={false}
+                {...calloutHover}
+                className="outline-none motion-safe:transition-opacity motion-safe:duration-150 motion-safe:ease-standard data-ending-style:opacity-0 data-starting-style:opacity-0"
+                style={callout && ({ "--nudge-from": callout.colors.from, "--nudge-to": callout.colors.to } as CSSProperties)}
+              >
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (callout) setPointAt(callout.line.key);
+                    dismissCallout(true);
+                    openModels();
+                  }}
+                  className="flex w-max max-w-72 items-center gap-2.5 rounded-lg border border-nudge-edge bg-linear-165 from-nudge-start via-nudge-middle via-50% to-background to-88% py-2 ps-3 pe-3.5 text-start shadow-nudge outline-none focus-visible:outline-2 focus-visible:outline-focus"
+                >
+                  {callout?.mark}
+                  <span className="min-w-0">
+                    <span className="block text-sm leading-5 font-semibold">{callout && lineName(callout.line)}</span>
+                    <span key={callout?.id} ref={fitBalanced} className="block text-xs leading-4 text-balance text-subtext">{callout?.text}</span>
+                  </span>
+                </button>
+                <Popover.Arrow className="-bottom-[5px] size-2 rotate-45 border-r border-b border-nudge-edge bg-background" />
+              </Popover.Popup>
+            </Popover.Positioner>
+          </Popover.Portal>
+        </Popover.Root>
+        {(reasoningChoices.length > 0 || nativeOptions.length > 0 || fastChoice || hasVariants) && (
           <Menu.Root
             open={!disabled && menu === "effort"}
             modal={false}
             onOpenChange={(open) => setMenu((current) => (open ? "effort" : current === "effort" ? null : current))}
           >
-            <Menu.Trigger
-              disabled={disabled}
-              className={PILL}
-              aria-label={[
-                reasoningLabel ? `${m.model_picker_effort()}: ${reasoningLabel}` : m.model_picker_effort(),
-                effectiveServiceTier === "priority" ? m.model_picker_fast_mode() : null,
-              ].filter(Boolean).join(" · ")}
-            >
-              {effectiveServiceTier === "priority" && <Zap size={14} fill="currentColor" aria-hidden="true" className="shrink-0 text-accent-amber" />}
-              {reasoningLabel ? (
-                <>
-                  <EffortIcon id={effectiveReasoningId} />
-                  <span>{reasoningLabel}</span>
-                </>
-              ) : (
-                <Settings size={14} aria-hidden="true" />
-              )}
-              <ChevronDown size={14} className="shrink-0 text-muted" />
-            </Menu.Trigger>
+            <Tooltip interactive content={m.model_picker_effort_options()} className="rounded-md">
+              <Menu.Trigger
+                disabled={disabled}
+                className={PILL}
+                aria-label={[
+                  effortLabel ? `${m.model_picker_effort()}: ${effortLabel}` : m.model_picker_effort(),
+                  speed ? speedLabel(speed) : null,
+                ].filter(Boolean).join(" · ")}
+              >
+                {speed && <SpeedIcon speed={speed} />}
+                {effortLabel ? (
+                  <>
+                    <EffortIcon id={variantEfforts.length ? variant?.effort : effectiveReasoningId} />
+                    <span>{effortLabel}</span>
+                  </>
+                ) : (
+                  <Settings size={14} aria-hidden="true" />
+                )}
+                <ChevronDown size={14} className="shrink-0 text-muted" />
+              </Menu.Trigger>
+            </Tooltip>
             <Menu.Portal container={portalContainer}>
               <Menu.Positioner className="z-50" side="top" align="end" sideOffset={8} collisionPadding={8} positionMethod="fixed">
-                <Menu.Popup aria-label={m.model_picker_effort()} className={MENU_POPUP} style={{ width: "min(240px, calc(100vw - 16px))", maxHeight: "min(400px, var(--available-height))" }}>
+                <Menu.Popup aria-label={m.model_picker_effort_options()} className={MENU_POPUP} style={{ width: "min(240px, calc(100vw - 16px))", maxHeight: "min(400px, var(--available-height))" }}>
                   {effortChoices.length > 0 && (
                     <Menu.Group>
                       <Menu.GroupLabel className={MENU_LABEL}>{m.model_picker_effort()}</Menu.GroupLabel>
@@ -759,6 +836,29 @@ export function ModelPicker({
                       </Menu.RadioGroup>
                     </Menu.Group>
                   )}
+                  {variant && variantEfforts.length > 0 && (
+                    <Menu.Group>
+                      <Menu.GroupLabel className={MENU_LABEL}>{m.model_picker_effort()}</Menu.GroupLabel>
+                      <Menu.RadioGroup
+                        value={variant.effort ?? ""}
+                        onValueChange={(id) => {
+                          if (typeof id === "string") pickVariant({ effort: id || null });
+                        }}
+                      >
+                        {variantEfforts.map((effort) => (
+                          <Menu.RadioItem key={effort ?? ""} value={effort ?? ""} closeOnClick label={effortName(effort)} className={SETTINGS_ROW}>
+                            <span className="inline-flex items-center gap-2">
+                              <EffortIcon id={effort} />
+                              {effortName(effort)}
+                            </span>
+                            <Menu.RadioItemIndicator>
+                              <Check size={14} />
+                            </Menu.RadioItemIndicator>
+                          </Menu.RadioItem>
+                        ))}
+                      </Menu.RadioGroup>
+                    </Menu.Group>
+                  )}
                   {nativeOptions.map((option) => (
                     <SettingsSubmenu
                       key={option.id}
@@ -769,8 +869,8 @@ export function ModelPicker({
                       onSelect={(id) => onSelectNativeOption?.(option.id, id)}
                     />
                   ))}
-                  {(ultracodeChoice || fastChoice) && (effortChoices.length > 0 || nativeOptions.length > 0) && (
-                    <Menu.Separator className="m-1 h-px bg-border-variant" />
+                  {(ultracodeChoice || speeds.length > 0 || variantSwitches) && (effortChoices.length > 0 || variantEfforts.length > 0 || nativeOptions.length > 0) && (
+                    <Menu.Separator className={MENU_SEPARATOR} />
                   )}
                   {ultracodeChoice && (
                     <Tooltip interactive side="start" content={m.model_picker_ultracode_description()} className="flex w-full rounded-sm">
@@ -787,19 +887,52 @@ export function ModelPicker({
                       </Menu.CheckboxItem>
                     </Tooltip>
                   )}
-                  {fastChoice && (
-                    <Menu.CheckboxItem
-                      className={SETTINGS_ROW}
-                      checked={effectiveServiceTier === fastChoice.id}
-                      onCheckedChange={(checked) => {
-                        if (value) onSelect({ ...value, serviceTier: checked ? fastChoice.id : "default" });
-                      }}
-                    >
+                  {switchTier && (
+                    <Menu.CheckboxItem className={SETTINGS_ROW} checked={speed === switchTier} onCheckedChange={(checked) => pickSpeed(checked ? switchTier : null)}>
                       <span className="inline-flex items-center gap-2">
-                        <Zap size={14} aria-hidden="true" className="text-accent-amber" />
-                        {m.model_picker_fast_mode()}
+                        <SpeedIcon speed={switchTier} />
+                        {speedLabel(switchTier)}
                       </span>
-                      <SwitchIndicator checked={effectiveServiceTier === fastChoice.id} aria-hidden="true" />
+                      <SwitchIndicator checked={speed === switchTier} aria-hidden="true" />
+                    </Menu.CheckboxItem>
+                  )}
+                  {speeds.length > 1 && !switchTier && (
+                    <Menu.Group className="flex min-h-8 items-center justify-between gap-3 px-2 py-1">
+                      <Menu.GroupLabel className="inline-flex min-w-0 items-baseline gap-2 text-sm text-text">
+                        {m.model_picker_speed()}
+                        <span className="truncate text-muted">{speedName(speed)}</span>
+                      </Menu.GroupLabel>
+                      <Menu.RadioGroup
+                        value={speed ?? ""}
+                        onValueChange={(next) => { if (typeof next === "string") pickSpeed(next || null); }}
+                        className="inline-flex shrink-0 items-center gap-0.5 rounded-md bg-hover-subtle p-0.5"
+                      >
+                        {speeds.map((tier) => (
+                          <Tooltip key={tier ?? ""} interactive content={speedName(tier)} className="flex rounded-sm">
+                            <Menu.RadioItem value={tier ?? ""} closeOnClick={false} label={speedName(tier)} aria-label={speedName(tier)} className={SPEED_SEGMENT}>
+                              <SpeedIcon speed={tier} />
+                            </Menu.RadioItem>
+                          </Tooltip>
+                        ))}
+                      </Menu.RadioGroup>
+                    </Menu.Group>
+                  )}
+                  {variant && varies("thinking") && (
+                    <Menu.CheckboxItem className={SETTINGS_ROW} checked={variant.thinking} onCheckedChange={(checked) => pickVariant({ thinking: checked })}>
+                      <span className="inline-flex items-center gap-2">
+                        <Brain size={14} aria-hidden="true" className="text-accent-purple" />
+                        {m.model_picker_thinking()}
+                      </span>
+                      <SwitchIndicator checked={variant.thinking} aria-hidden="true" />
+                    </Menu.CheckboxItem>
+                  )}
+                  {variant && variantContext && (
+                    <Menu.CheckboxItem className={SETTINGS_ROW} checked={variant.context !== null} onCheckedChange={(checked) => pickVariant({ context: checked ? variantContext : null })}>
+                      <span className="inline-flex items-center gap-2">
+                        <Ruler size={14} aria-hidden="true" className="text-accent-teal" />
+                        {m.model_picker_context_size({ size: variantContext.toUpperCase() })}
+                      </span>
+                      <SwitchIndicator checked={variant.context !== null} aria-hidden="true" />
                     </Menu.CheckboxItem>
                   )}
                 </Menu.Popup>
@@ -813,12 +946,8 @@ export function ModelPicker({
             modal={false}
             onOpenChange={(open) => setMenu((current) => (open ? "permissions" : current === "permissions" ? null : current))}
           >
-            <Tooltip interactive content={[permissionLabel, autonomyLabel].filter(Boolean).join(" · ")} className="rounded-md">
-              <Menu.Trigger
-                disabled={disabled}
-                className={PILL}
-                aria-label={`${m.model_picker_permissions()}: ${[permissionLabel, autonomyLabel].filter(Boolean).join(", ")}`}
-              >
+            <Tooltip interactive content={permissionSummary} className="rounded-md">
+              <Menu.Trigger disabled={disabled} className={PILL} aria-label={permissionSummary}>
                 <PermissionIcon id={effectivePermissionId} />
                 <ChevronDown size={14} className="shrink-0 text-muted" />
               </Menu.Trigger>
@@ -845,7 +974,7 @@ export function ModelPicker({
                       </Menu.RadioGroup>
                     </Menu.Group>
                   )}
-                  {permissionChoices.length > 0 && onSelectAutonomy && <Menu.Separator className="m-1 h-px bg-border-variant" />}
+                  {permissionChoices.length > 0 && onSelectAutonomy && <Menu.Separator className={MENU_SEPARATOR} />}
                   {onSelectAutonomy && (
                     <Menu.Group>
                       <Menu.GroupLabel className={MENU_LABEL}>{m.model_picker_autonomy()}</Menu.GroupLabel>
@@ -869,7 +998,6 @@ export function ModelPicker({
         )}
       </div>
       <EscapeScope enabled={menu !== null} onEscape={close} />
-      <EscapeScope enabled={menu === "model" && legacyMenu !== null} onEscape={() => setLegacyMenu(null)} />
     </DirectionProvider>
   );
 }
@@ -1138,3 +1266,93 @@ export function OptionPicker({
 }
 
 const EMPTY_HARNESSES: Harness[] = [];
+const EMPTY_PROVIDERS: OpenCodeProvider[] = [];
+const EMPTY_ENDPOINTS: LocalModelConnection[] = [];
+const EMPTY_IDS: string[] = [];
+
+/** What the model button points at: a model, the line under its name, and its look. */
+interface Callout {
+  kind: "release" | "free";
+  /** What dismissing it records. */
+  id: string;
+  line: PickerLine;
+  text: string;
+  /** CSS colors its gradient runs between. */
+  colors: { from: string; to: string };
+  mark: ReactNode;
+}
+
+/** The labs whose releases the model button points at. */
+const FRONTIER_LABS = ["claude", "openai", "gemini"] as const;
+
+/**
+ * Each lab's colors: Claude's orange, Gemini's blue to violet. OpenAI's tiers are named for the sky, so each takes
+ * its own: Sol the sun, Luna the moon, Terra the earth, Astra the stars; any other is neutral.
+ */
+function releaseColors(line: PickerLine) {
+  const lab = lineLab(line);
+  const words = line.family.split(" ");
+  const pair = (from: string, to: string) => ({ from: `var(--accent-${from})`, to: `var(--accent-${to})` });
+  if (lab === "claude") return pair("orange", "amber");
+  if (lab === "gemini") return pair("blue", "purple");
+  if (words.includes("sol")) return pair("amber", "orange");
+  if (words.includes("luna")) return pair("indigo", "blue");
+  if (words.includes("terra")) return pair("green", "teal");
+  if (words.includes("astra")) return pair("purple", "indigo");
+  return { from: "var(--muted)", to: "var(--border)" };
+}
+
+/** Narrows balanced text to its widest line, which `text-wrap: balance` leaves at the width it had unbalanced. */
+function fitBalanced(text: HTMLElement | null) {
+  if (!text) return;
+  text.style.width = "";
+  const range = document.createRange();
+  range.selectNodeContents(text);
+  const lines = [...range.getClientRects()];
+  if (lines.length > 1) text.style.width = `${Math.ceil(Math.max(...lines.map((line) => line.width)))}px`;
+}
+
+/** The workspaces whose model button dismissed a callout since the app loaded. */
+const calledOut = new WeakSet<object>();
+/** The callouts reported shown since the app loaded. */
+const shownCallouts = new Set<string>();
+
+const NO_RELEASES: Record<string, string> = {};
+
+const shortDay = (day: Date) => new Intl.DateTimeFormat(getLocale(), { month: "short", day: "numeric" }).format(day);
+
+/** What the nudge says under its model's name; nothing once its free days are over, or for a kind this version doesn't know. */
+function nudgeMessage({ kind, until, message }: ModelNudge) {
+  if (kind !== "new" && kind !== "trial") return undefined;
+  const last = until ? localDay(until) : undefined;
+  if (last && Date.now() >= new Date(last.getFullYear(), last.getMonth(), last.getDate() + 1).getTime()) return undefined;
+  if (message) return message;
+  if (kind === "new") return m.model_picker_nudge_new();
+  if (!last) return m.model_picker_nudge_trial();
+  return m.model_picker_nudge_trial_until({ date: shortDay(last) });
+}
+
+/** What the release callout says under its model's name: who made it and when, within the week it's new. */
+function releaseText(line: PickerLine, day: string) {
+  const lab = LABS.find((entry) => entry.lab === lineLab(line))!.name;
+  const today = new Date();
+  const days = Math.round((new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime() - localDay(day).getTime()) / 86_400_000);
+  if (days === 0) return m.model_picker_released_today({ lab });
+  if (days === 1) return m.model_picker_released_yesterday({ lab });
+  return m.model_picker_released_this_week({ lab });
+}
+
+const EFFORT_NAMES: Record<string, () => string> = {
+  none: m.model_picker_effort_none,
+  minimal: m.model_picker_effort_minimal,
+  low: m.model_picker_effort_low,
+  medium: m.model_picker_effort_medium,
+  high: m.model_picker_effort_high,
+  xhigh: m.model_picker_effort_xhigh,
+  max: m.model_picker_effort_max,
+};
+
+/** A variant's effort; Cursor's plain variant has none of its own. */
+function effortName(effort: string | null) {
+  return effort ? (EFFORT_NAMES[effort]?.() ?? effort) : m.model_picker_effort_default();
+}

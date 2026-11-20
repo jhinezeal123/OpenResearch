@@ -19,11 +19,9 @@
 //! failure). `sacct` may be disabled cluster-wide, so it's a best-effort
 //! fallback, not a dependency.
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
-use super::ssh::{sh_quote, shell_path, ssh_run, SshTarget};
+use super::ssh::{sh_quote, ssh_run, SshTarget};
 use crate::error::{anyhow, Result};
 
 // --- settings ---------------------------------------------------------------
@@ -44,6 +42,9 @@ pub struct SlurmSettings {
     /// `#SBATCH --account=…` default (billing/allocation account).
     #[serde(default)]
     pub account: Option<String>,
+    /// `#SBATCH --qos=…` default; the `--qos` default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qos: Option<String>,
     /// `#SBATCH --time=…` default, in orx's duration syntax ("4h", "30m").
     #[serde(default)]
     pub time_limit: Option<String>,
@@ -60,6 +61,13 @@ pub struct SlurmSettings {
     /// Keep every finished run's remote dir, not just each project's newest few.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keep_remote_runs: bool,
+    /// `#SBATCH` arguments written after orx's own on every run, before each run's `--sbatch-arg`s.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sbatch_args: Vec<String>,
+    /// `Some(false)` leaves out `#SBATCH --ntasks=1`, which some clusters' submit filters refuse;
+    /// absent writes it, as some other clusters refuse a job without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_one_task: Option<bool>,
     /// Fields from a newer orx, kept across this version's saves.
     #[serde(flatten)]
     pub unknown: serde_json::Map<String, serde_json::Value>,
@@ -96,133 +104,6 @@ pub fn save_settings(settings: &SlurmSettings) -> Result<()> {
     Ok(())
 }
 
-pub struct SlurmJobSpec {
-    /// ssh config host alias of the cluster's login node.
-    pub host: String,
-    /// Names the remote run dir `<root>/runs/<run_id>`.
-    pub run_id: String,
-    /// Configured storage root; `None` is `~/.orx`.
-    pub remote_root: Option<String>,
-    pub setup_script: String,
-    /// The experiment's run command; the body of the batch job (runs in
-    /// `repo/` on the compute node).
-    pub command: String,
-    /// Exported in both the setup script and job.sbatch (tokens, synced env).
-    pub env: HashMap<String, String>,
-    /// `#SBATCH --gres=…`, from `--flavor` (see `resolve_gres`).
-    pub gres: Option<String>,
-    pub partition: Option<String>,
-    pub account: Option<String>,
-    /// `#SBATCH --time=…` in seconds, from `--timeout` or settings.
-    pub time_limit_secs: Option<u64>,
-    /// `#SBATCH --cpus-per-task=…`, from `--cpus` or settings. Unset leaves
-    /// the partition default, which on many clusters is a single core.
-    pub cpus_per_task: Option<u32>,
-    /// `#SBATCH --mem=…`, from `--mem` or settings, already validated by
-    /// `parse_mem`. Unset leaves the partition default, which is usually
-    /// `DefMemPerCPU × cpus-per-task` — i.e. memory tracks the CPU request.
-    pub mem: Option<String>,
-}
-
-fn render_sbatch(spec: &SlurmJobSpec) -> String {
-    let mut directives = vec![
-        format!(
-            "#SBATCH --job-name=orx-{}",
-            &spec.run_id[..spec.run_id.len().min(8)]
-        ),
-        "#SBATCH --output=log".to_string(),
-        "#SBATCH --error=log".to_string(),
-        "#SBATCH --open-mode=append".to_string(),
-        // One task, stated rather than left to Slurm's default of one: some
-        // clusters' job-submit plugins refuse a job that names no task count
-        // ("You must specify a number of tasks"). Cores come from
-        // --cpus-per-task, so this changes nothing where the default applied.
-        "#SBATCH --ntasks=1".to_string(),
-    ];
-    if let Some(secs) = spec.time_limit_secs {
-        directives.push(format!("#SBATCH --time={}", slurm_time(secs)));
-    }
-    if let Some(p) = spec.partition.as_deref().filter(|p| !p.trim().is_empty()) {
-        directives.push(format!("#SBATCH --partition={p}"));
-    }
-    if let Some(a) = spec.account.as_deref().filter(|a| !a.trim().is_empty()) {
-        directives.push(format!("#SBATCH --account={a}"));
-    }
-    if let Some(g) = spec.gres.as_deref() {
-        directives.push(format!("#SBATCH --gres={g}"));
-    }
-    // Cores and host memory. Left out entirely when unset, so a cluster whose
-    // partition defaults are already right keeps behaving as before; asked for
-    // explicitly otherwise, because the common default is one core and
-    // `DefMemPerCPU` bytes with it — far too little to feed a GPU.
-    if let Some(c) = spec.cpus_per_task.filter(|c| *c > 0) {
-        directives.push(format!("#SBATCH --cpus-per-task={c}"));
-    }
-    if let Some(m) = spec.mem.as_deref().filter(|m| !m.trim().is_empty()) {
-        directives.push(format!("#SBATCH --mem={m}"));
-    }
-    // Slurm's verdict must match the payload while its exit_code is NFS-lagged.
-    format!(
-        "#!/usr/bin/env bash\n{directives}\n{exports}\n{tensorboard}\n(\ncd repo || exit 97\n{command}\n)\ncode=$?\necho \"$code\" > exit_code\nexit \"$code\"\n",
-        directives = directives.join("\n"),
-        exports = render_exports(&super::default_python_env(&spec.env)),
-        tensorboard = crate::compute::TENSORBOARD_LOGDIR_EXPORT,
-        command = spec.command,
-    )
-}
-
-fn render_exports(env: &HashMap<String, String>) -> String {
-    let mut pairs: Vec<_> = env.iter().collect();
-    pairs.sort(); // deterministic script for tests & debugging
-    pairs
-        .iter()
-        .map(|(k, v)| format!("export {}={}", k, sh_quote(v)))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn parse_job_id(out: &str) -> Result<String> {
-    let id = out.trim().split(';').next().unwrap_or("").trim();
-    if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit()) {
-        return Err(anyhow!("Unexpected sbatch output: {:?}", out.trim()));
-    }
-    Ok(id.to_string())
-}
-
-pub async fn run_job(spec: &SlurmJobSpec) -> Result<String> {
-    let dir = shell_path(&run_dir(spec.remote_root.as_deref(), &spec.run_id));
-
-    // Tokens travel over stdin rather than argv.
-    let setup = format!(
-        "{exports}\ncd {dir} || exit 97\n{script}\n",
-        exports = render_exports(&spec.env),
-        script = spec.setup_script,
-    );
-    ssh_run(
-        &SshTarget::alias(&spec.host).for_run(&spec.run_id),
-        &format!("mkdir -p {dir} && chmod 700 {dir} && bash -s"),
-        Some(&setup),
-    )
-    .await
-    .map_err(|e| anyhow!("Setup on the login node failed: {e}"))?;
-
-    // Write the batch script (owner-only: it embeds tokens) and submit.
-    ssh_run(
-        &SshTarget::alias(&spec.host).for_run(&spec.run_id),
-        &format!("umask 077 && cat > {dir}/job.sbatch"),
-        Some(&render_sbatch(spec)),
-    )
-    .await?;
-    let out = ssh_run(
-        &SshTarget::alias(&spec.host).for_run(&spec.run_id),
-        &format!("cd {dir} && sbatch --parsable job.sbatch"),
-        None,
-    )
-    .await
-    .map_err(|e| anyhow!("sbatch failed: {e}"))?;
-    parse_job_id(&out)
-}
-
 /// Validate a Slurm memory request: a positive integer with an optional
 /// `K`/`M`/`G`/`T` suffix ("64G", "65536", "4000M"). Bare numbers are
 /// megabytes, as Slurm itself documents. Strict on purpose — the value is
@@ -246,6 +127,155 @@ pub fn parse_mem(mem: &str) -> Result<String> {
     Ok(format!("{digits}{suffix}"))
 }
 
+/// A single-token directive value, named by its flag or its field (`--qos`, `QoS`, `--nodelist`):
+/// whitespace or a control character would split or end its `#SBATCH` line.
+pub fn parse_value(name: &str, value: &str) -> Result<String> {
+    if value.is_empty() || value.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(anyhow!(
+            "{name} takes one Slurm value without spaces, such as {}.",
+            match name {
+                "--qos" | "QoS" => "acc_ehpc",
+                "--nodelist" | "--exclude" => "node[01-04],gpu7",
+                _ => "a100&ib",
+            }
+        ));
+    }
+    Ok(value.to_string())
+}
+
+/// The long name an `#SBATCH` argument sets: `-p gpu` is `partition`, `--qos=x` is `qos`;
+/// empty for a short option orx never writes. Long names may be abbreviated, as sbatch's
+/// option parser accepts any unambiguous prefix.
+pub fn sbatch_option(arg: &str) -> &str {
+    if let Some(long) = arg.strip_prefix("--") {
+        return long.split(['=', ' ', '\t']).next().unwrap_or_default();
+    }
+    match arg.strip_prefix('-').and_then(|short| short.chars().next()) {
+        Some('o') => "output",
+        Some('e') => "error",
+        Some('J') => "job-name",
+        Some('a') => "array",
+        Some('W') => "wait",
+        Some('p') => "partition",
+        Some('A') => "account",
+        Some('q') => "qos",
+        Some('t') => "time",
+        Some('c') => "cpus-per-task",
+        Some('n') => "ntasks",
+        Some('w') => "nodelist",
+        Some('C') => "constraint",
+        Some('x') => "exclude",
+        _ => "",
+    }
+}
+
+/// Options orx-host passes to `sbatch` itself, or that would stop it tracking the job.
+const HOST_OWNED: [&str; 8] = [
+    "output",
+    "error",
+    "job-name",
+    "requeue",
+    "no-requeue",
+    "array",
+    "wait",
+    "wrap",
+];
+
+/// Validate one extra `#SBATCH` option (`--rsc g=1`), as written after `#SBATCH` or with it.
+/// Whether it repeats a line orx writes depends on the settings and the run; callers check that.
+pub fn parse_sbatch_arg(arg: &str) -> Result<String> {
+    let arg = arg.trim();
+    let arg = arg
+        .strip_prefix("#SBATCH")
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+        .map_or(arg, str::trim_start);
+    if arg.chars().any(char::is_control) {
+        return Err(anyhow!(
+            "{} spans more than one line. Give each sbatch option separately.",
+            arg.lines().next().unwrap_or_default()
+        ));
+    }
+    // sbatch unquotes and unescapes a line and ends it at `#` before parsing it, so an
+    // escaped, quoted or cut-off name could hide an option from the checks below.
+    let option = arg.split(['=', ' ', '\t']).next().unwrap_or_default();
+    if arg.contains(['\\', '#']) || option.contains(['"', '\'']) {
+        return Err(anyhow!(
+            "{arg} has a backslash, a # or a quoted option name. Write the option plainly, \
+             such as --rsc p=1:g=1."
+        ));
+    }
+    let name = sbatch_option(arg);
+    if !arg.starts_with('-') || (name.is_empty() && (arg == "-" || arg.starts_with("--"))) {
+        return Err(anyhow!(
+            "{arg} isn't an sbatch option. Write it as you would after #SBATCH, such as \
+             --rsc p=1:g=1."
+        ));
+    }
+    if !single_option(arg) {
+        return Err(anyhow!(
+            "{arg} holds more than one sbatch option. Put each on its own line."
+        ));
+    }
+    let owned = HOST_OWNED
+        .iter()
+        .find(|owned| !name.is_empty() && owned.starts_with(name));
+    if let Some(owned) = owned {
+        return Err(anyhow!(
+            "{arg} sets --{owned}, which OpenResearch sets itself to log and track the job. \
+             Remove that line."
+        ));
+    }
+    Ok(arg.to_string())
+}
+
+/// Whether `arg` is one option and at most one value, as sbatch splits an `#SBATCH` line:
+/// a second option, or a bundle of short flags such as `-vn4`, would escape the checks above.
+fn single_option(arg: &str) -> bool {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    for c in arg.chars() {
+        match (quote, c) {
+            (Some(open), c) if c == open => quote = None,
+            (None, '"' | '\'') => quote = Some(c),
+            (None, c) if c.is_whitespace() => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            (_, c) => word.push(c),
+        }
+    }
+    words.push(word);
+
+    // sbatch's short options that take no value; any other takes the rest of its word.
+    const FLAGS: &str = "hHIOQsuvVW";
+    let option = &words[0];
+    let attached_value = match option
+        .strip_prefix('-')
+        .filter(|_| !option.starts_with("--"))
+    {
+        Some(short) if short.starts_with(|c| FLAGS.contains(c)) => {
+            return short.len() == 1 && words.len() == 1
+        }
+        Some(short) => short.len() > 1,
+        None => option.contains('='),
+    };
+    match &words[1..] {
+        [] => true,
+        [value] => !attached_value && !value.starts_with('-'),
+        _ => false,
+    }
+}
+
+/// The line among `written` that `arg` would set a second time, if any.
+pub fn repeated_line<'a>(arg: &str, written: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let name = sbatch_option(arg);
+    written
+        .into_iter()
+        .find(|line| !name.is_empty() && line.starts_with(name))
+}
+
 pub fn resolve_time_limit(explicit: Option<&str>, saved: Option<&str>) -> Result<Option<u64>> {
     explicit
         .or(saved)
@@ -253,17 +283,17 @@ pub fn resolve_time_limit(explicit: Option<&str>, saved: Option<&str>) -> Result
         .transpose()
 }
 
-/// Map a `--flavor` string onto a `--gres` request. A flavor names GPUs —
-/// CPU-only runs just omit it (unlike HF/Modal there is no machine shape to
-/// pick). Cores and memory are asked for separately, with `--cpus`/`--mem`;
-/// omitting those leaves the partition defaults.
+/// Map a `--flavor` string onto a `--gres` request. A flavor names GPUs; `cpu`
+/// asks for none, as on Modal, so it can override a GPU default flavor. Cores
+/// and memory are asked for separately, with `--cpus`/`--mem`.
+///   "cpu"      -> no GRES
 ///   "gpu"      -> gpu:1
 ///   "gpu:…"    -> passed through verbatim (already a GRES spec)
 ///   "h100:2"   -> gpu:h100:2
 ///   "h100"     -> gpu:h100
 pub fn resolve_gres(flavor: &str) -> Option<String> {
     let f = flavor.trim();
-    if f.is_empty() {
+    if f.is_empty() || f.eq_ignore_ascii_case("cpu") {
         return None;
     }
     if f == "gpu" {
@@ -291,127 +321,6 @@ pub(crate) fn slurm_time(secs: u64) -> String {
 pub fn run_dir(root: Option<&str>, run_id: &str) -> String {
     super::ssh::remote_run_dir(root, run_id)
 }
-
-/// Job state in the shared stage vocabulary (see `jobs::stage_to_run_status`).
-#[derive(Debug, Clone)]
-pub struct JobState {
-    pub stage: String,
-    pub message: Option<String>,
-}
-
-// A job-specific query can fail after Slurm forgets a completed job.
-fn queue_probe(job_id: &str) -> String {
-    format!(
-        "if st=$(squeue --all --states=all -h --jobs={job_id} -o %T 2>/dev/null); then :; \
-         elif all=$(squeue --all --states=all --user=\"$(id -un)\" -h -o '%i %T' 2>/dev/null); then \
-         st=$(printf '%s\\n' \"$all\" | while read -r id state; do \
-         if [ \"$id\" = {job_id} ]; then printf '%s\\n' \"$state\"; fi; done); \
-         else exit 1; fi; \
-         if [ -n \"$st\" ]; then echo \"SQ $st\"; else echo GONE; fi",
-        job_id = sh_quote(job_id),
-    )
-}
-
-/// One combined remote probe emitting a single token — exit_code first
-/// (ground truth), then live queue state, then accounting for jobs that left
-/// the queue without one. POSIX-sh only: the command runs under the remote
-/// user's login shell. `sacct -P` (parsable) because the default fixed-width
-/// State column truncates ("CANCELLED by 1234" prints as "CANCELLED+").
-///
-/// `GONE` means monitoring is unavailable, not that the job terminated.
-/// Accounting can be disabled or unavailable while a job still runs.
-pub async fn inspect_job(host: &str, run_id: &str, dir: &str, job_id: &str) -> Result<JobState> {
-    let value = super::ssh::service::request(
-        &SshTarget::alias(host).for_run(run_id),
-        serde_json::json!({"op":"slurm", "run":run_id, "job":job_id, "dir":dir}),
-    )
-    .await?;
-    let token = value["token"]
-        .as_str()
-        .ok_or_else(|| anyhow!("Missing Slurm status response"))?;
-    Ok(map_inspect_token(token.trim()))
-}
-
-/// Pure token → stage mapping (unit-tested; Slurm state names are stable).
-/// Emits the internal `GONE` stage for a job the scheduler no longer knows —
-/// missing scheduler evidence never proves the job has terminated.
-fn map_inspect_token(out: &str) -> JobState {
-    let state = |stage: &str, message: Option<String>| JobState {
-        stage: stage.to_string(),
-        message,
-    };
-    if let Some(code) = out.strip_prefix("EXIT ") {
-        // An empty file is the window between open(O_TRUNC) and the write —
-        // not a verdict; poll again.
-        if code.trim().is_empty() {
-            return state("RUNNING", None);
-        }
-        let code: i32 = code.trim().parse().unwrap_or(-1);
-        return if code == 0 {
-            state("COMPLETED", None)
-        } else {
-            state("ERROR", Some(format!("exited with code {code}")))
-        };
-    }
-    // `squeue %T` / `sacct -P State` values. sacct suffixes cancellations
-    // ("CANCELLED by 1234"), so match on the first word; the trailing-`+`
-    // trim is belt-and-braces against fixed-width truncation.
-    let (source, raw) = match (out.strip_prefix("SQ "), out.strip_prefix("SA ")) {
-        (Some(s), _) => ("squeue", s),
-        (_, Some(s)) => ("sacct", s),
-        _ if matches!(out, "GONE" | "UNAVAILABLE") => return state(out, None),
-        _ => return state("RUNNING", Some(format!("unexpected inspect output: {out}"))),
-    };
-    let word = raw
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .trim_end_matches('+');
-    match word {
-        "PENDING" | "CONFIGURING" | "REQUEUED" | "RESV_DEL_HOLD" => state("SCHEDULING", None),
-        "RUNNING" | "COMPLETING" | "SUSPENDED" | "STAGE_OUT" | "SIGNALING" => {
-            state("RUNNING", None)
-        }
-        // The batch script exits with the payload code, so either scheduler verdict is authoritative.
-        "COMPLETED" => state("COMPLETED", None),
-        // Transient from squeue: default JobRequeue=1 (and
-        // PreemptMode=REQUEUE) re-queues these under the same job id — a poll
-        // landing in the window must not finalize a run that's about to
-        // re-run. If the job is NOT requeued it leaves the queue and the
-        // sacct path delivers the terminal verdict.
-        "NODE_FAIL" | "PREEMPTED" if source == "squeue" => state("RUNNING", None),
-        "CANCELLED" | "REVOKED" => state("CANCELED", None),
-        "TIMEOUT" | "DEADLINE" => state("ERROR", Some("job hit its time limit".into())),
-        "FAILED" | "NODE_FAIL" | "BOOT_FAIL" | "OUT_OF_MEMORY" | "PREEMPTED" => state(
-            "ERROR",
-            Some(format!("slurm reported {}", word.to_ascii_lowercase())),
-        ),
-        other => state(
-            "RUNNING",
-            Some(format!("unrecognized slurm state: {other}")),
-        ),
-    }
-}
-
-/// Cancellation succeeds when accepted or the controller confirms the job is absent.
-pub async fn cancel_job(host: &str, run_id: &str, job_id: &str) -> Result<()> {
-    let queue = queue_probe(job_id);
-    super::ssh::ssh_control(
-        &SshTarget::alias(host).for_run(run_id),
-        &format!(
-            "if error=$(scancel {} 2>&1); then exit 0; \
-             elif [ \"$({queue})\" = GONE ]; then exit 0; \
-             else printf '%s\\n' \"$error\" >&2; exit 1; fi",
-            sh_quote(job_id)
-        ),
-        None,
-    )
-    .await?;
-    Ok(())
-}
-
-// Log streaming reuses `ssh::stream_logs` directly — the run-dir/`log` layout
-// is identical, and Slurm appends to the same file via `--output`.
 
 // --- preflight ----------------------------------------------------------------
 
@@ -490,179 +399,6 @@ pub async fn diagnostics(host: &str, job_id: &str) -> Result<serde_json::Value> 
 
 #[cfg(test)]
 mod tests {
-    fn spec() -> SlurmJobSpec {
-        SlurmJobSpec {
-            host: "cluster".into(),
-            run_id: "0123456789abcdef".into(),
-            remote_root: None,
-            setup_script: "test -d repo".into(),
-            command: "python train.py".into(),
-            env: HashMap::new(),
-            gres: None,
-            partition: None,
-            account: None,
-            time_limit_secs: None,
-            cpus_per_task: None,
-            mem: None,
-        }
-    }
-
-    #[test]
-    fn saved_day_limit_and_launch_override_reach_batch_script() {
-        let mut job = spec();
-        job.time_limit_secs = resolve_time_limit(None, Some("24h")).unwrap();
-        assert_eq!(job.time_limit_secs, Some(86400));
-        assert!(render_sbatch(&job).contains("#SBATCH --time=1-00:00:00\n"));
-        job.time_limit_secs = resolve_time_limit(Some("2h"), Some("24h")).unwrap();
-        assert!(render_sbatch(&job).contains("#SBATCH --time=02:00:00\n"));
-        job.time_limit_secs = resolve_time_limit(None, None).unwrap();
-        assert!(!render_sbatch(&job).contains("#SBATCH --time="));
-    }
-
-    #[test]
-    fn sbatch_minimal_has_only_fixed_directives() {
-        let script = render_sbatch(&spec());
-        assert!(script.starts_with("#!/usr/bin/env bash\n"));
-        assert!(script.contains("#SBATCH --job-name=orx-01234567\n"));
-        assert!(script.contains("#SBATCH --output=log\n"));
-        // Always explicit: clusters may reject a job with no task count.
-        assert!(script.contains("#SBATCH --ntasks=1\n"));
-        assert!(!script.contains("--partition"));
-        assert!(!script.contains("--account"));
-        assert!(!script.contains("--gres"));
-        assert!(!script.contains("--time"));
-        // Unset cores/memory must emit nothing, so clusters whose partition
-        // defaults already suit the job are unaffected by this feature.
-        assert!(!script.contains("--cpus-per-task"));
-        assert!(!script.contains("--mem"));
-        // Python is defaulted to unbuffered even with no author env, so Slurm's
-        // --output redirect streams the job's prints live.
-        assert!(script.contains("export PYTHONUNBUFFERED='1'\n"));
-        // Payload in a subshell; its code is recorded AND becomes the script's
-        // exit status (Slurm's COMPLETED/FAILED must mirror the payload).
-        assert!(script.ends_with(
-            "(\ncd repo || exit 97\npython train.py\n)\ncode=$?\necho \"$code\" > exit_code\nexit \"$code\"\n"
-        ));
-    }
-
-    #[test]
-    fn sbatch_emits_optional_directives_and_quoted_env() {
-        let mut s = spec();
-        s.gres = Some("gpu:h100:2".into());
-        s.partition = Some("gpu".into());
-        s.account = Some("lab-a".into());
-        s.time_limit_secs = Some(4 * 3600);
-        s.cpus_per_task = Some(8);
-        s.mem = Some("64G".into());
-        s.env.insert("TOKEN".into(), "it's; rm -rf /".into());
-        let script = render_sbatch(&s);
-        assert!(script.contains("#SBATCH --gres=gpu:h100:2\n"));
-        assert!(script.contains("#SBATCH --partition=gpu\n"));
-        assert!(script.contains("#SBATCH --account=lab-a\n"));
-        assert!(script.contains("#SBATCH --time=04:00:00\n"));
-        assert!(script.contains("#SBATCH --cpus-per-task=8\n"));
-        assert!(script.contains("#SBATCH --mem=64G\n"));
-        assert!(script.contains("export TOKEN='it'\\''s; rm -rf /'\n"));
-    }
-
-    #[test]
-    fn zero_cpus_and_blank_mem_emit_nothing() {
-        let mut s = spec();
-        s.cpus_per_task = Some(0);
-        s.mem = Some("  ".into());
-        let script = render_sbatch(&s);
-        assert!(!script.contains("--cpus-per-task"));
-        assert!(!script.contains("--mem"));
-    }
-
-    #[tokio::test]
-    #[ignore = "needs a live slurm cluster; set ORX_SLURM_TEST_HOST"]
-    async fn e2e_lifecycle_against_live_cluster() {
-        let Ok(host) = std::env::var("ORX_SLURM_TEST_HOST") else {
-            panic!("set ORX_SLURM_TEST_HOST to an ~/.ssh/config alias of a slurm login node");
-        };
-        let mk = |run_id: &str, command: &str| SlurmJobSpec {
-            host: host.clone(),
-            run_id: run_id.into(),
-            remote_root: None,
-            setup_script: "mkdir -p repo".into(),
-            command: command.into(),
-            env: HashMap::from([("ORX_E2E".into(), "1".into())]),
-            gres: None,
-            partition: None,
-            account: None,
-            time_limit_secs: Some(300),
-            cpus_per_task: None,
-            mem: None,
-        };
-        // 150 × 2s: a busy cluster can hold a job PENDING for a few minutes.
-        let poll = |run_id: String, job_id: String, until: &'static [&'static str]| {
-            let host = host.clone();
-            async move {
-                for _ in 0..150 {
-                    let s = inspect_job(&host, &run_id, &run_dir(None, &run_id), &job_id)
-                        .await
-                        .unwrap();
-                    if until.contains(&s.stage.as_str()) {
-                        return s;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-                panic!("job {job_id} never reached {until:?}");
-            }
-        };
-
-        // Fresh ids per invocation: a recycled run dir would satisfy
-        // inspect_job from its stale exit_code before the job even runs.
-        let run_a = format!("e2e-a-{}", uuid::Uuid::new_v4());
-        let run_b = format!("e2e-b-{}", uuid::Uuid::new_v4());
-        let cleanup = format!(
-            "rm -rf {} {}",
-            shell_path(&run_dir(None, &run_a)),
-            shell_path(&run_dir(None, &run_b))
-        );
-
-        // Happy path: runs, completes, logs arrive.
-        let job_a = run_job(&mk(&run_a, "echo hello-from-slurm; echo \"env=$ORX_E2E\""))
-            .await
-            .unwrap();
-        let done = poll(run_a.clone(), job_a, &["COMPLETED", "ERROR"]).await;
-        assert_eq!(done.stage, "COMPLETED", "message: {:?}", done.message);
-        let mut lines = Vec::new();
-        crate::jobs::ssh::stream_logs(
-            &SshTarget::alias(&host),
-            &run_dir(None, &run_a),
-            0,
-            std::time::Duration::from_secs(5),
-            true,
-            &mut |l: &str| lines.push(l.to_string()),
-        )
-        .await
-        .unwrap();
-        assert!(lines.iter().any(|l| l == "hello-from-slurm"), "{lines:?}");
-        assert!(lines.iter().any(|l| l == "env=1"), "{lines:?}");
-
-        // Cancel path: scancel'd job leaves the queue without an exit code.
-        let job_b = run_job(&mk(&run_b, "sleep 300")).await.unwrap();
-        poll(run_b.clone(), job_b.clone(), &["RUNNING", "SCHEDULING"]).await;
-        cancel_job(&host, &run_b, &job_b).await.unwrap();
-        let after = poll(run_b, job_b, &["CANCELED", "GONE", "ERROR"]).await;
-        // Best-effort teardown before asserting — don't litter the cluster.
-        let _ = ssh_run(&SshTarget::alias(&host), &cleanup, None).await;
-        assert!(
-            after.stage == "CANCELED" || after.stage == "GONE",
-            "unexpected post-cancel stage: {after:?}"
-        );
-    }
-
-    #[test]
-    fn job_id_parsing() {
-        assert_eq!(parse_job_id("123\n").unwrap(), "123");
-        assert_eq!(parse_job_id("123;cluster2\n").unwrap(), "123");
-        assert!(parse_job_id("sbatch: error").is_err());
-        assert!(parse_job_id("").is_err());
-    }
-
     use super::*;
 
     #[test]
@@ -684,6 +420,32 @@ mod tests {
         }
     }
 
+    /// Settings files as shipped versions wrote them read back unchanged, with none of the
+    /// launch options added since.
+    #[test]
+    fn shipped_settings_read_and_rewrite_unchanged() {
+        let shipped: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../../tests/contracts/slurm-settings.json"))
+                .unwrap();
+        for file in shipped {
+            let settings: SlurmSettings = serde_json::from_value(file.clone()).unwrap();
+            assert_eq!(settings.qos, None);
+            assert!(settings.sbatch_args.is_empty() && settings.request_one_task.is_none());
+            assert_eq!(serde_json::to_value(&settings).unwrap(), file);
+        }
+        let added = SlurmSettings {
+            qos: Some("acc_ehpc".into()),
+            sbatch_args: vec!["--rsc g=1".into()],
+            request_one_task: Some(false),
+            ..Default::default()
+        };
+        let read: SlurmSettings =
+            serde_json::from_value(serde_json::to_value(&added).unwrap()).unwrap();
+        assert_eq!(read.qos, added.qos);
+        assert_eq!(read.sbatch_args, added.sbatch_args);
+        assert_eq!(read.request_one_task, Some(false));
+    }
+
     #[test]
     fn slurm_time_formats() {
         assert_eq!(slurm_time(90), "00:01:30");
@@ -694,39 +456,11 @@ mod tests {
     #[test]
     fn gres_from_flavor() {
         assert_eq!(resolve_gres(""), None);
+        assert_eq!(resolve_gres("cpu"), None);
+        assert_eq!(resolve_gres(" CPU "), None);
         assert_eq!(resolve_gres("gpu").as_deref(), Some("gpu:1"));
         assert_eq!(resolve_gres("gpu:a100:4").as_deref(), Some("gpu:a100:4"));
         assert_eq!(resolve_gres("h100:2").as_deref(), Some("gpu:h100:2"));
         assert_eq!(resolve_gres("h100").as_deref(), Some("gpu:h100"));
-    }
-
-    #[test]
-    fn inspect_token_mapping() {
-        assert_eq!(map_inspect_token("EXIT 0").stage, "COMPLETED");
-        let failed = map_inspect_token("EXIT 137");
-        assert_eq!(failed.stage, "ERROR");
-        assert!(failed.message.unwrap().contains("137"));
-        // Empty exit_code = caught mid-write; not a verdict.
-        assert_eq!(map_inspect_token("EXIT ").stage, "RUNNING");
-        assert_eq!(map_inspect_token("SQ PENDING").stage, "SCHEDULING");
-        assert_eq!(map_inspect_token("SQ RUNNING").stage, "RUNNING");
-        assert_eq!(map_inspect_token("SQ COMPLETING").stage, "RUNNING");
-        // Both scheduler sources confirm the script (= payload) exited successfully.
-        assert_eq!(map_inspect_token("SQ COMPLETED").stage, "COMPLETED");
-        assert_eq!(map_inspect_token("SA COMPLETED").stage, "COMPLETED");
-        assert_eq!(map_inspect_token("SA CANCELLED by 1234").stage, "CANCELED");
-        // Fixed-width sacct truncates with a trailing '+'; -P avoids it, but
-        // the parser must survive it anyway.
-        assert_eq!(map_inspect_token("SA CANCELLED+").stage, "CANCELED");
-        assert_eq!(map_inspect_token("SA TIMEOUT").stage, "ERROR");
-        assert_eq!(map_inspect_token("SA NODE_FAIL").stage, "ERROR");
-        // From squeue these are requeue-transient (JobRequeue=1); terminal
-        // only once sacct confirms the job really left.
-        assert_eq!(map_inspect_token("SQ NODE_FAIL").stage, "RUNNING");
-        assert_eq!(map_inspect_token("SQ PREEMPTED").stage, "RUNNING");
-        // GONE is not terminal: absent accounting is not evidence of termination.
-        assert_eq!(map_inspect_token("GONE").stage, "GONE");
-        // Unknown states never wedge the supervisor into a terminal state.
-        assert_eq!(map_inspect_token("SQ SOMETHING_NEW").stage, "RUNNING");
     }
 }

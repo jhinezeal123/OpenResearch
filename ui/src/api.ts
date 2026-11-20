@@ -1,7 +1,7 @@
 import { LogPageUnavailable } from "./logWindow";
 // Typed client for the orx up local HTTP API (/api/*). All wire JSON is camelCase.
 
-import type { WorkspaceClient } from "./queries/client";
+import { ConnectionLostError, type WorkspaceClient } from "./queries/client";
 import type { WorkspaceInvalidation } from "./queries/invalidation";
 
 import type { GlobalWorkspace, ProjectWorkspace } from "./workspaceState";
@@ -61,6 +61,8 @@ export interface Project {
   path: string;
   githubEnabled: boolean;
   githubUrl?: string | null;
+  /** A chat without a project yet: orx keeps its code until the user makes it a project. */
+  scratch?: boolean;
   /** Absolute path of the project's artifacts directory, non-canonical to
    *  match paths agents inline into chat. */
   artifactsDir: string;
@@ -69,6 +71,8 @@ export interface Project {
   runCommand?: string | null;
   /** arXiv or alphaXiv paper id the project starts from (versionless). */
   paperId?: string | null;
+  /** The user's mark for the project; without one it shows its initials. */
+  icon?: ProjectIcon;
   createdAt: number;
   updatedAt: number;
 }
@@ -124,6 +128,10 @@ export interface Run {
   cancelling: boolean;
   queueDetail?: string | null;
   cancelUnconfirmed?: number[] | null;
+  /** The backend's own word on why a submitting or starting run hasn't started. */
+  waitingReason?: string | null;
+  /** Why the stop of a cancelling run keeps failing to reach its backend, which retries it. */
+  cancelError?: string | null;
   lostReason: string | null;
   /** The SSH alias or Slurm login node the run's job lives on. */
   host: string | null;
@@ -135,6 +143,20 @@ export interface Run {
 }
 
 export class RejectedResponseError extends Error {}
+
+/** Why a model server listed no models: nothing answered, it wants an API key, or it has no models. */
+export class UnlistedError extends RejectedResponseError {
+  constructor(message: string, readonly code: "unreachable" | "needsKey" | "noModels") {
+    super(message);
+  }
+}
+
+/** A rejected save whose messages each belong to one form field, keyed as in the request body. */
+export class FieldErrors extends RejectedResponseError {
+  constructor(message: string, readonly fields: Record<string, string[]>) {
+    super(message);
+  }
+}
 
 export interface ProjectActivity {
   projectId: string;
@@ -149,6 +171,8 @@ export interface ProjectActivity {
 
 export interface OnboardingSelection {
   harness: HarnessId;
+  /** An account OpenResearch keeps for the agent; absent for the user's own sign-in. */
+  profile?: string | null;
   model: string | null;
   serviceTier?: string | null;
   permissionMode: string | null;
@@ -165,6 +189,43 @@ export interface UiState {
   preferredAutonomy: Autonomy | null;
   /** Whether sub-agents may start their own unless a delegation says otherwise. */
   nestedDelegation: boolean;
+  /** Whether OpenCode's free models are offered beside the user's own. */
+  opencodeFreeModels: boolean;
+  /** The `provider/model` that reviews OpenCode's Auto requests; null is the chat's own. */
+  opencodeReviewModel: string | null;
+  /** The model families the picker lists first. */
+  favoriteModels: string[];
+  /** Models turned off in Settings, by {@link ModelName.key}: the picker hides them and agents can't delegate to them. */
+  hiddenModels: string[];
+  /** Agents found on this computer that are turned off, by harness id; `opencode` stands for the sign-ins made in OpenCode itself. */
+  hiddenAgents: string[];
+  /** The picker's lab sections in the user's order; labs it doesn't name follow in the picker's own. */
+  modelSectionOrder: string[];
+  collapsedModelSections: string[];
+  /** The model feed nudges the user dismissed, by id. Absent from a server too old to keep them. */
+  seenNudges?: string[];
+}
+
+/** What openresearch.sh features in the model picker, as `orx up` last fetched it. */
+export interface ModelFeed {
+  /** OpenCode model ids (`provider/model`) the picker's Free section lists first, in this order. */
+  featured: { model: string }[];
+  nudge: ModelNudge | null;
+  /** The day (`YYYY-MM-DD`) each model came out, by line key, for those released lately. Absent from an older `orx up`. */
+  releases?: Record<string, string>;
+}
+
+export interface ModelNudge {
+  /** What dismissing it records. */
+  id: string;
+  model: string;
+  kind: "new" | "trial";
+  /** A trial's last free day, `YYYY-MM-DD`. */
+  until?: string;
+  /** Replaces the line orx writes under the model's name. */
+  message?: string;
+  /** Hex colors of its gradient, and of its model mark; the text color when `icon` is absent. */
+  colors: { from: string; to: string; icon?: string };
 }
 
 /** How much of the research the agent owns before checking in. */
@@ -198,7 +259,7 @@ export interface NewProject {
   githubSyncEnabled?: boolean;
   /** UI locale for the starter prompts the server warms up on creation. */
   locale?: string;
-  starterAgent?: Pick<AgentSelection, "harness" | "model">;
+  starterAgent?: Pick<AgentSelection, "harness" | "model" | "profile">;
 }
 
 export interface CreateProjectResult {
@@ -215,6 +276,10 @@ export interface PaperHit {
 export interface ResolvedPaper {
   paperId: string;
   title?: string | null;
+  /** Full names in byline order. */
+  authors?: string[];
+  /** First publication, in Unix milliseconds. */
+  publishedAt?: number;
   repoUrl?: string | null;
   repoStars?: number | null;
 }
@@ -471,6 +536,8 @@ export interface HfSettings {
   validationError: string | null;
   username: string | null;
   jobsWrite: boolean | null;
+  sourceStaging: boolean | null;
+  sourceStagingError: string | null;
 }
 
 export interface TinkerSettings {
@@ -505,6 +572,35 @@ export interface BuildNotes {
   base: string;
   /** Commit titles, newest first. */
   commits: string[];
+}
+
+/** What quitting does to a pending experiment. */
+export type AfterQuit = "reports" | "continues" | "needsApp";
+
+export interface PendingAgent {
+  projectId: string;
+  project: string | null;
+  sessionId: string;
+  sideParentId: string | null;
+  harness: HarnessId;
+  title: string | null;
+}
+
+export interface PendingRun {
+  projectId: string;
+  project: string | null;
+  experimentId: string;
+  runId: string;
+  sessionId: string | null;
+  name: string;
+  backend: string | null;
+  afterQuit: AfterQuit;
+}
+
+/** What a quit would interrupt on this machine. */
+export interface PendingWork {
+  agents: PendingAgent[];
+  runs: PendingRun[];
 }
 
 export interface UpdateStatus {
@@ -551,6 +647,7 @@ export interface K8sPreflight {
   kubectlFound: boolean;
   reachable: boolean;
   canCreateJobs: boolean;
+  canPatchJobs: boolean;
   error?: string;
 }
 
@@ -603,7 +700,24 @@ export interface EnvVar {
   maskedValue: string;
   /** Set only for non-secret keys, which are shown and edited in the clear. */
   value?: string | null;
+  description?: string | null;
   inProcessEnv: boolean;
+}
+
+export interface EnvSettings {
+  vars: EnvVar[];
+  /** The project's own variables, when one was asked for. */
+  projectVars?: EnvVar[];
+}
+
+export interface EnvVarChange {
+  key: string;
+  /** Omitted keeps the saved value. */
+  value?: string;
+  /** Omitted keeps the saved description; empty clears it. */
+  description?: string;
+  /** Saves it for this project instead of every project. */
+  projectId?: string;
 }
 
 /** Where `source` says the resolved data dir came from. `env` means the
@@ -628,6 +742,8 @@ export interface DataDirValidation {
 export interface SshHost {
   container?: string | null;
   host: string;
+  /** Saved in OpenResearch rather than read from ~/.ssh/config. */
+  saved?: boolean;
   hostname?: string;
   user?: string;
   port?: string;
@@ -667,6 +783,8 @@ export interface RemoteSessionInfo {
   user: string | null;
   status: RemoteSessionStatus;
   version: string | null;
+  /** The remote's version, or its canary tag; null when unknown. */
+  buildId: string | null;
   dashboardProtocol: number | null;
   gatewayUrl: string;
   error: string | null;
@@ -711,11 +829,17 @@ export interface SlurmSettings {
   /** Cluster defaults; null = the cluster decides. */
   partition: string | null;
   account: string | null;
+  /** The launch options below are absent from an older orx, which can't apply them. */
+  qos?: string | null;
   timeLimit: string | null;
   /** `--cpus-per-task` default; null = the partition decides (often one core). */
   cpusPerTask: number | null;
   /** `--mem` default in Slurm syntax ("64G"); null = the partition decides. */
   mem: string | null;
+  /** Extra `#SBATCH` arguments written into every job, after orx's own lines. */
+  sbatchArgs?: string[];
+  /** Whether every job carries `#SBATCH --ntasks=1`. */
+  requestOneTask?: boolean;
   /** Login-node candidates, from ~/.ssh/config (same source as SSH). */
   hosts: SshHost[];
 }
@@ -754,6 +878,25 @@ export interface TrackioRuns {
   runs: string[];
   /** A private Space's read-only `__sign`; without it the browser gets a 404. */
   dashboardSign: string | null;
+}
+
+export interface TrackioPoint {
+  step: number;
+  value: number;
+}
+
+export interface TrackioMetric {
+  name: string;
+  first: TrackioPoint;
+  last: TrackioPoint;
+  /** Evenly spaced points, first and last included. */
+  series: TrackioPoint[];
+}
+
+/** What one run logged to Trackio; `errors` holds what could not be read. */
+export interface TrackioRunMetrics {
+  metrics: TrackioMetric[];
+  errors: string[];
 }
 
 export interface TrackioPreflight {
@@ -889,7 +1032,7 @@ export interface FileTextBody {
   truncated: boolean;
 }
 
-export const FILE_PREVIEW_BYTES = 512_000;
+export const FILE_PREVIEW_BYTES = 512 * 1024;
 
 /** Decode a raw response only when it is valid, NUL-free UTF-8. */
 const decodeFileText = (bytes: ArrayBuffer, truncated: boolean): FileTextBody => {
@@ -988,7 +1131,9 @@ type UiEvent =
   | { name: "onboarding_step_viewed"; step: OnboardingStep }
   | { name: "demo_experiment_started"; kind: "curated" | "run"; experiment: string }
   | { name: "project_starter_clicked"; slot: number }
-  | { name: "first_action"; surface: FirstActionSurface; action: FirstAction };
+  | { name: "first_action"; surface: FirstActionSurface; action: FirstAction }
+  | { name: "model_callout"; kind: "release" | "free"; action: "shown" | "opened" | "dismissed"; model: string; harness: string }
+  | { name: "model_picked"; section: "free" | "favorites" | "lab" | "older" | "search"; model: string; harness: string; new: boolean; free: boolean };
 
 export type HarnessId =
   | "claude-code"
@@ -1022,13 +1167,47 @@ export interface HarnessModel {
   serviceTiers?: OptionChoice[];
   /** Whether the model accepts images; absent when the catalog doesn't say. */
   imageInput?: boolean;
+  /** Its id names a free tier, or a model the feed hosts. */
+  free?: boolean;
+  /** The image the model feed gives a model it hosts, in place of the mark matched from its name. */
+  icon?: { type: "image/png" | "image/webp"; data: string };
+  parsed: ModelName;
+}
+
+/** What an offer adds to its model: Cursor's and Antigravity's effort, any catalog's speed and thinking tiers, Claude
+ * Code's long context. */
+export interface ModelVariant {
+  effort: string | null;
+  /** `flex`, `fast` or `ultrafast`; null for the standard tier. */
+  speed: string | null;
+  /** `speed` is `fast`, as servers before `speed` say it. */
+  fast: boolean;
+  thinking: boolean;
+  context: string | null;
+}
+
+/** A model's name as the server reads it, so the picker groups what Settings hides and delegation skips. */
+export interface ModelName {
+  /** The same for one model in every agent's catalog, `:free` added for its free tier. Settings turns models off by it. */
+  key: string;
+  /** `key` without its version or free tier: what a favorite stars. */
+  family: string;
+  /** `family` without tier words a lab reuses across versions: a newer version of any tier makes an older one old. */
+  series: string;
+  version: number[] | null;
+  /** The catalog's name without variant words, dates or asides. */
+  label: string;
+  variant: ModelVariant;
+  /** How far the catalog's name is from its model's plain variant; a tile runs the lowest by default. */
+  variantRank: number;
+  /** A moving alias (`mistral-large-latest`) whose catalog also lists the versions it moves between. */
+  superseded?: boolean;
 }
 
 /** Display label for a harness model: the catalog's own name when it has one,
  * else prettified from the id. */
 export function harnessModelLabel(model: HarnessModel): string {
-  if (model.id === "default" && !model.displayName) return m.model_picker_default_model();
-  if (!model.id.startsWith("orx-local-")) return model.displayName ?? modelLabel(model.id);
+  if (!model.id.startsWith("orx-local-")) return model.displayName ? tidyModelName(model.displayName) : modelLabel(model.id);
   const provider = model.displayName?.split(" · ").slice(1).join(" · ").replace(/ \(local\)$/, "");
   const endpoint = provider === "OpenAI-compatible server" || provider === "Custom endpoint" || provider === "Custom Endpoint"
     ? m.local_models_custom_endpoint()
@@ -1154,14 +1333,76 @@ export function reconcileReasoning(
   return current && choices.some((c) => c.id === current) ? current : defaultId;
 }
 
+export type AgentIconColor = "gray" | "red" | "orange" | "amber" | "green" | "teal" | "blue" | "indigo" | "purple" | "pink";
+
+/** An added agent's mark: its provider's logo, a glyph, an emoji or a small image, on its colour or in a plain outline. */
+export type AgentIcon = { color?: AgentIconColor } & (
+  | { brand: true }
+  | { glyph: string }
+  | { emoji: string }
+  | { image: { type: "image/webp" | "image/png"; data: string } }
+);
+
+/** A project's mark: an agent's kinds of icon, where `brand` is its initials, or an image file in its repository. */
+export type ProjectIcon = AgentIcon | { color?: AgentIconColor; file: string };
+
+/** An account OpenResearch signs an agent in to, beside the user's own. */
+export interface AgentProfile {
+  id: string;
+  name: string;
+  icon?: AgentIcon;
+  /** The logo the user or an agent pinned; without one, the row's own. */
+  logo?: string;
+}
+
+/** A row's name, icon and pinned logo, as the user or an agent set them. */
+export interface AgentLabel {
+  name?: string;
+  icon?: AgentIcon;
+  logo?: string;
+}
+
+/** A provider set up in the user's own OpenCode, which no record of OpenResearch's stands for. */
+export interface FoundProvider {
+  /** OpenCode's provider id, the prefix of its models' ids. */
+  id: string;
+  /** The name its OpenCode config gives it. */
+  name?: string;
+  baseUrl?: string;
+  /** The AI SDK package its config runs it on. */
+  npm?: string;
+  /** Environment variables that hold its key. */
+  env?: string[];
+  sources: ("auth" | "config" | "env" | "catalog")[];
+  /** The OpenCode config file that defines it. */
+  configPath?: string;
+  /** Whether OpenResearch can delete it from the user's OpenCode. */
+  removable: boolean;
+  label?: AgentLabel;
+}
+
 export interface Harness {
   id: HarnessId;
+  /** Set on the extra entry for each of OpenResearch's accounts; `id` stays the agent's. */
+  profile?: AgentProfile;
+  /** The name and icon the user gave an agent found on this computer, and its pinned logo; never on a profile's entry. */
+  label?: AgentLabel;
+  /** The user turned this agent or account off in Settings. On OpenCode, `offProviders` says which providers are. */
+  off?: boolean;
+  /** A chat on this machine ran on this agent or account; absent from servers that predate it. */
+  hasChats?: boolean;
+  /** On OpenCode: the providers set up in the user's own OpenCode. */
+  foundProviders?: FoundProvider[];
+  /** On OpenCode: the providers whose models the user turned off. */
+  offProviders?: string[];
   name: string;
   installed: boolean;
   /** On PATH, but `--version` failed — a broken install a reinstall repairs.
    * Never `agentReady`: spawning it just dumps the CLI's own crash into chat. */
   installBroken: boolean;
   binPath?: string;
+  /** `binPath` is OpenResearch's own copy, which it downloaded and keeps current. */
+  managed?: boolean;
   version?: string;
   authenticated: boolean;
   authState: "ready" | "needsLogin" | "unknown" | "unsupported";
@@ -1194,14 +1435,20 @@ export interface Harness {
    * arrives and a plain re-read swaps in the real list. */
   catalogPending?: boolean;
   models: HarnessModel[];
+  /** The `models` id a new chat starts on, from the agent's own setting; set only when it's ready and lists a model. */
+  defaultModel?: string;
   options: HarnessOptions;
 }
 
 export interface HarnessSetupCommands {
+  /** Empty for an agent OpenResearch downloads itself (`managedFrom`). */
   install: string;
   /** The vendor bootstrap URL an install note quotes; `install` runs the
    * platform's own installer, which on Windows is a PowerShell script. */
   installUrl?: string;
+  /** The host OpenResearch downloads this agent from, when it installs it itself;
+   * absent from servers that predate it. */
+  managedFrom?: string | null;
   login: string;
   update: string;
   requiresNpm: boolean;
@@ -1258,24 +1505,48 @@ export interface SkillDiscovery {
   skipped: { path: string; reason: string }[];
 }
 
-/** "openai/gpt-5.5" → "GPT 5.5", "anthropic/claude-opus-4-8" → "Opus 4.8". */
+const MODEL_WORDS: Record<string, string> = { gpt: "GPT", glm: "GLM", oss: "OSS", deepseek: "DeepSeek", minimax: "MiniMax", longcat: "LongCat", mimo: "MiMo" };
+
+/** "openai/gpt-5.5" → "GPT-5.5", "anthropic/claude-opus-4-8" → "Opus 4.8", "deepseek-v4-flash" → "DeepSeek V4 Flash". */
 export function modelLabel(id: string): string {
   const last = (id.split("/").pop() ?? id).replace(/^~/, "").replace(/^claude-/, "");
   const words: string[] = [];
   const nums: string[] = [];
+  const version = () => {
+    if (!nums.length) return;
+    const number = nums.splice(0).join(".");
+    // GPT and GLM write their version on: "GPT-5.5".
+    if (words.at(-1) === "GPT" || words.at(-1) === "GLM") words.push(`${words.pop()}-${number}`);
+    else words.push(number);
+  };
   for (const part of last.split("-")) {
     if (/^\d+(\.\d+)?$/.test(part)) {
       nums.push(part);
     } else {
-      if (nums.length) words.push(nums.splice(0).join("."));
-      words.push(part === "gpt" ? "GPT" : part.charAt(0).toUpperCase() + part.slice(1));
+      version();
+      words.push(MODEL_WORDS[part] ?? (/^\d+b$/.test(part) ? part.toUpperCase() : /^o\d+$/.test(part) ? part : part.charAt(0).toUpperCase() + part.slice(1)));
     }
   }
-  if (nums.length) words.push(nums.join("."));
+  version();
   return words.join(" ");
 }
 
+/** Evens out the names catalogs send: a lowercase id standing in for one, hyphens
+ * between words ("DeepSeek-V4-Pro" → "DeepSeek V4 Pro", where "GPT-5.5" stays), lowercase
+ * words outside parentheses, and doubled or zero-width spaces. A name the user gave a
+ * second key, after " · ", stays as written. */
+export function tidyModelName(name: string): string {
+  const [model, ...owner] = name.replace(/[\u200B-\u200D\uFEFF]/g, "").split(" · ");
+  const clean = model.replace(/\s+/g, " ").trim();
+  if (!/[A-Z ]/.test(clean)) return [modelLabel(clean), ...owner].join(" · ");
+  return [clean.split(/(\([^)]*\))/).map((part, index) => index % 2 ? part : part
+    .replace(/(?<![A-Z]{2})-(?=[A-Z])|(?<=[a-z])-(?=\d)/g, " ")
+    .replace(/(?<![\w-])(?!(?:and|for|the|via|with)\b)[a-z]{3,}\b/g, (word) => MODEL_WORDS[word] ?? word[0].toUpperCase() + word.slice(1))).join(""), ...owner].join(" · ");
+}
+
 // --- chat (unified harness sessions) ------------------------------------------
+
+export type FailureCause = "sign_in" | "usage_limit" | "credits" | "model_unavailable" | "context_full" | "overloaded" | "network";
 
 export interface ChatToolState {
   status: "running" | "completed" | "error";
@@ -1290,6 +1561,11 @@ export interface ChatToolState {
     nextRetryAt?: number | null;
     turnId?: string;
     errorKind?: string;
+    /** Why the turn failed, in terms of what the user does next; absent when nothing says, and from older servers. */
+    cause?: FailureCause | null;
+    /** The agent and account the failed turn ran on; absent from older servers. */
+    harness?: HarnessId;
+    profile?: string | null;
     recoveryAction?: "retry" | "continue";
     [k: string]: unknown;
   };
@@ -1306,7 +1582,7 @@ export interface ChatQuestionOption {
 /** An interactive request the user acts on before the harness continues. */
 export interface ChatPrompt {
   nativeChoices?: { id: string; label: string; kind: string }[];
-  kind: "plan" | "permission" | "question";
+  kind: "plan" | "permission" | "question" | "env";
   resolved: boolean;
   plan?: string;
   /** plan: card synthesized from the turn's final text (no ExitPlanMode call). */
@@ -1330,6 +1606,29 @@ export interface ChatPrompt {
   /** Backend resume routing id. Presence marks a HELD mid-turn card (the
    * turn is blocked open waiting on this answer); absent on end-turn cards. */
   nativeId?: string;
+  /** env: the variables the agent asks the user to set. `question` holds its reason. */
+  variables?: EnvRequestVar[];
+}
+
+export type EnvScope = "global" | "project";
+
+export interface EnvRequestVar {
+  name: string;
+  description?: string;
+  /** A secret is typed masked and omitted from the tool result. */
+  secret: boolean;
+  /** A regex the value should match; a mismatch only warns. */
+  pattern?: string;
+  example?: string;
+  /** Answer echo: where the user saved it. Absent when left unset. */
+  savedTo?: EnvScope;
+}
+
+export interface EnvAnswer {
+  name: string;
+  value: string;
+  scope: EnvScope;
+  mismatched: boolean;
 }
 
 export interface ChatPart {
@@ -1371,15 +1670,118 @@ export interface ChatMessage {
 export interface ContextUsage {
   usedTokens: number;
   contextWindow?: number;
+  /** Tokens at which the agent compacts on its own; absent when it doesn't say or has auto-compaction off. */
+  compactAt?: number;
+}
+
+/** `GET /api/usage`: the machine's agent plans and the last seven days of OpenResearch's spend. */
+export interface UsageReport {
+  /** null until the first read of this machine's sign-ins finishes; [] when none is on a plan. */
+  plans: PlanUsage[] | null;
+  /** The last seven days in the machine's local time, oldest first, as `YYYY-MM-DD`; today last. */
+  days: string[];
+  agents: AgentSpend[];
+  compute: BackendSpend[];
+  /** The chat `?chat=` asked about. */
+  chat?: ChatSpend;
+}
+
+export interface ChatSpend {
+  /** What the chat's agent has cost, per currency, largest first. */
+  agent: Money[];
+  /** Runs the chat launched on backends that cost money. */
+  compute: ChatCompute | null;
+}
+
+/** Millionths of `currency` (ISO 4217). */
+export interface Money {
+  micros: number;
+  currency: string;
+}
+
+export interface PlanUsage {
+  harness: "claude-code" | "codex";
+  /** The agent profile's id; absent for the user's own sign-in. */
+  profile?: string;
+  plan: string | null;
+  account: string | null;
+  windows: PlanWindow[];
+  credits?: { balance: string | null; unlimited: boolean };
+  extraUsage?: { usedMicros: number; limitMicros: number | null; currency: string };
+  /** Codex resets that refill the limits now, only when one is available. */
+  resets?: PlanResets;
+  readAt: string | null;
+  /** Why the latest read failed; `windows` then hold the values from `readAt`. */
+  error?: { kind: "unsupported"; version: string } | { kind: "failed"; message: string };
+}
+
+export interface PlanResets {
+  available: number;
+  /** The available ones the provider lists, which may be fewer than `available`; null when it gives only the count. */
+  credits: ResetCredit[] | null;
+}
+
+export interface ResetCredit {
+  id: string;
+  title: string | null;
+  description: string | null;
+  expiresAt: string | null;
+}
+
+/** What `POST /api/usage/reset` did; on `reset` and `alreadyRedeemed` the limits are refilled. */
+export type ResetOutcome = "reset" | "nothingToReset" | "noCredit" | "alreadyRedeemed";
+
+export interface PlanWindow {
+  /** The window's length in minutes: 300 is "5-hour", 10080 is "Weekly". */
+  minutes: number | null;
+  /** The model a per-model window covers, as the provider names it; null for plan-wide windows. */
+  model: string | null;
+  /** What is left, 0 to 100. */
+  remainingPercent: number;
+  resetsAt: string | null;
+}
+
+export interface AgentSpend {
+  harness: string;
+  currency: string;
+  /** Millionths of `currency` per day in `UsageReport.days`, of what has a price. */
+  dayMicros: number[];
+  /** Days with tokens that neither the agent nor the price list put a price on. */
+  unpriced: number;
+}
+
+export interface BackendSpend {
+  /** The run backend's kind, such as `modal_job`. */
+  backend: string;
+  currency: string;
+  dayMicros: number[];
+  /** Runs on this backend whose price couldn't be read. */
+  unpriced: number;
+}
+
+export interface ChatCompute {
+  runs: number;
+  costMicros: number;
+  currency: string;
+  running: boolean;
+  unpriced: number;
 }
 
 export interface ChatSession {
   awaitingInput?: boolean;
   id: string;
   projectId: string;
+  /** A project the user asked this chat to move into once its turn ends. */
+  pendingProject?: { name: string; path: string } | null;
   harness: HarnessId;
+  /** The account the chat runs on, when it's one OpenResearch keeps. */
+  profile?: string | null;
   harnessName?: string | null;
+  /** The saved ACP chat's client controls, independent of the current catalog. */
+  harnessOptions?: HarnessOptions | null;
   nativeConfiguration?: unknown;
+  /** The models an ACP agent's live configuration offers, when it offers any. */
+  nativeModels?: HarnessModel[] | null;
   title: string | null;
   /** Who wrote `title`: `"fallback"` (first-line placeholder), `"generated"`
    * (harness auto-title), `"user"` (explicitly chosen — a rename, or the title a
@@ -1408,13 +1810,39 @@ export interface ChatSession {
     state: string | null;
     answer: string | null;
     error: string | null;
-    asking: "question" | "permission" | "plan" | null;
+    asking: "question" | "permission" | "plan" | "env" | null;
   } | null;
   createdAt: number;
   updatedAt: number;
   busy: boolean;
   activeLeafId: string | null;
   contextUsage?: ContextUsage;
+  /** Tasks the agent left running after its turn, which it resumes to report; in the session lists. */
+  background?: { count: number; since: number } | null;
+  /** The chat's most recent turn, in the session lists. */
+  lastTurn?: {
+    state: string;
+    startedAt: number;
+    errorKind: string | null;
+    error: string | null;
+  } | null;
+}
+
+/** Fields `PATCH /api/chat/sessions/<id>` changes; each is optional. */
+export interface ChatSessionPatch {
+  /** Trimmed by the server, which rejects an empty title. */
+  title?: string;
+  /** Archived chats stay resumable. */
+  archived?: boolean;
+  /** `false` keeps a delegate for the user: it stops telling the chat that started it and becomes a side chat. */
+  notifyParent?: false;
+  /** The session-specific Plan axis used by Codex, OpenCode and Cursor. */
+  planMode?: boolean;
+  /** `null` clears the goal. */
+  goal?: string | null;
+  autonomy?: Autonomy;
+  agent?: AgentSelection;
+  permissionMode?: string;
 }
 
 /** A chat the user had in an agent's own CLI, which orx has no session for. */
@@ -1464,12 +1892,16 @@ export interface TurnOptions {
   reasoningLevel?: string | null;
 }
 
-/** A message the user sent while a turn was running, parked to run next. */
+/**
+ * A message the user sent while a turn was running, parked to run next, or
+ * (`steering`) handed to that turn and not yet read by its agent.
+ */
 export interface QueuedMessage {
   id: string;
   text: string;
+  orx?: OrxSource | null;
   planMode?: boolean;
-  dispatchState?: "queued" | "retrying" | "blocked";
+  dispatchState?: "queued" | "retrying" | "blocked" | "steering";
   nextRetryAt?: number | null;
   error?: string | null;
 }
@@ -1502,6 +1934,8 @@ export interface PromptAnswer {
   answers?: string[];
   note?: string;
   annotations?: ChatTextAnnotation[];
+  /** Values saved from an env card. */
+  env?: EnvAnswer[];
 }
 
 // --- helpers shared across views --------------------------------------------
@@ -1526,20 +1960,6 @@ export function fmtDuration(ms: number): string {
   const hours = Math.floor(minutes / 60);
   if (hours < 24) return m.duration_hours_minutes({ hours: fmtNumber(hours), minutes: fmtNumber(minutes % 60) });
   return m.duration_days_hours({ days: fmtNumber(Math.floor(hours / 24)), hours: fmtNumber(hours % 24) });
-}
-
-/** Compact byte size, e.g. "512 B", "2.0 KB", "5.3 MB". Mirrors the backend's
- * `store::human_bytes`. */
-export function fmtBytes(n: number): string {
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let v = n;
-  let u = 0;
-  while (v >= 1024 && u < units.length - 1) {
-    v /= 1024;
-    u += 1;
-  }
-  const number = new Intl.NumberFormat(getLocale(), { maximumFractionDigits: u === 0 ? 0 : 1, minimumFractionDigits: u === 0 ? 0 : 1 });
-  return `${number.format(u === 0 ? n : v)} ${units[u]}`;
 }
 
 /** Compact token count, e.g. 62300 → "62k", 1_200_000 → "1.2M", 940 → "940". */
@@ -1583,9 +2003,55 @@ export function backendDetail(backend: Run["backend"]): string {
 export interface LocalModelConnection {
   id: string;
   name: string;
+  icon?: AgentIcon;
+  logo?: string;
   baseUrl: string;
   hasApiKey: boolean;
   models: Record<string, number>;
+}
+
+/** A provider OpenResearch keeps for OpenCode: a key, or a sign-in made through OpenCode. */
+export interface OpenCodeProvider {
+  /** OpenCode's provider id; a second key for one provider gets its own, naming the provider in `canonical`. */
+  id: string;
+  kind: "key" | "oauth";
+  canonical?: string;
+  /** The key's last characters, to tell keys apart. */
+  keyEnding?: string;
+  name: string;
+  icon?: AgentIcon;
+  logo?: string;
+}
+
+/** A provider OpenCode can sign in to, and how. */
+export interface OpenCodeIntegration {
+  id: string;
+  name: string;
+  methods: ({ type: "oauth"; id: string; label: string; form?: OpenCodeFormField[] } | { type: "key"; label?: string })[];
+  connected: boolean;
+}
+
+export type OpenCodeAnswer = string | number | boolean;
+
+/** A question OpenCode asks before a sign-in, shown only while every `when` holds. */
+export interface OpenCodeFormField {
+  key: string;
+  type: string;
+  title?: string;
+  description?: string;
+  placeholder?: string;
+  required?: boolean;
+  default?: OpenCodeAnswer;
+  options?: { value: string; label: string; description?: string }[];
+  when?: { key: string; op: "eq" | "neq"; value: OpenCodeAnswer }[];
+}
+
+/** `code` mode waits for a code the sign-in page shows; `auto` finishes on its own. */
+export interface OpenCodeSignIn {
+  attempt: string;
+  url: string;
+  mode: "auto" | "code";
+  instructions: string;
 }
 
 export type CitedMessage = { projectId: string | null; sessionId: string; messageId: string; harness: HarnessId | null; preview: string };
@@ -1630,9 +2096,16 @@ export interface PublicProject {
 /** Where a shared project comes from: a picked file, a file on this machine, or a published link. */
 export type SharedSource = File | string | { link: string };
 
-export interface RunEngineSettings {
-  enabled: boolean;
-  forcedBy: "canary" | "environment" | null;
+/** How work that orx up runs in the background is going: opening a shared project, or publishing one. */
+export interface OperationProgress {
+  phase: "downloading" | "unpacking" | "opening" | "preparing" | "uploading";
+  bytes: number;
+  totalBytes: number | null;
+}
+
+interface OperationStatus<T> extends OperationProgress {
+  result: T | null;
+  error: string | null;
 }
 
 export function createApi(
@@ -1669,9 +2142,13 @@ export function createApi(
                 : null;
             throw new FileChangedError(message, currentVersion, parsed.exists);
           }
+          if (res.status === 400 && "code" in parsed && (parsed.code === "unreachable" || parsed.code === "needsKey" || parsed.code === "noModels"))
+            throw new UnlistedError(message, parsed.code);
+          if (res.status === 400 && "fields" in parsed && typeof parsed.fields === "object" && parsed.fields !== null)
+            throw new FieldErrors(message, parsed.fields as Record<string, string[]>);
         }
       } catch (error) {
-        if (error instanceof FileChangedError) throw error;
+        if (error instanceof FileChangedError || error instanceof RejectedResponseError) throw error;
         // non-JSON body — show it raw
       }
       const ErrorType = res.status >= 400 && res.status < 500 ? RejectedResponseError : Error;
@@ -1770,6 +2247,8 @@ export function createApi(
 
   const getUiState = (signal?: AbortSignal) => get<UiState>("/api/settings/ui-state", signal);
 
+  const getModelFeed = (signal?: AbortSignal) => get<ModelFeed>("/api/model-feed", signal);
+
   const getProjectUiState = (projectId: string, signal?: AbortSignal) =>
     get<ProjectWorkspace | null>(`/api/projects/${encodeURIComponent(projectId)}/ui-state`, signal);
 
@@ -1784,6 +2263,15 @@ export function createApi(
     preferredAgent?: AgentSelection;
     preferredAutonomy?: Autonomy;
     nestedDelegation?: boolean;
+    opencodeFreeModels?: boolean;
+    /** Empty for the chat's own. */
+    opencodeReviewModel?: string;
+    favoriteModels?: string[];
+    hiddenModels?: string[];
+    hiddenAgents?: string[];
+    modelSectionOrder?: string[];
+    collapsedModelSections?: string[];
+    seenNudges?: string[];
   }) => post<UiState>("/api/settings/ui-state", body);
 
   const completeOnboarding = (selection: OnboardingSelection) =>
@@ -1829,7 +2317,20 @@ export function createApi(
       (r) => r.paper,
     );
 
-  const updateProject = (projectId: string, body: { runCommand?: string; name?: string }) =>
+  /** The project a new chat without a project starts in. */
+  const createScratchProject = () =>
+    post<{ project: Project }>("/api/projects/scratch", {}).then((r) => r.project);
+
+  /** Make a chat a project of its own at `path`, now or, while it runs, once its turn ends. */
+  const moveChatToProject = (sessionId: string, body: { name: string; path: string }) =>
+    post<{ pending: true } | { pending: false; project: Project }>(`/api/chat/sessions/${sessionId}/project`, body);
+
+  const cancelChatProjectMove = (sessionId: string) =>
+    writeResponse(`/api/chat/sessions/${sessionId}/project`, { method: "DELETE" }).then(async (r) => {
+      if (!r.ok) throw new Error((await r.json().catch(() => null))?.error ?? `cancel failed (${r.status})`);
+    });
+
+  const updateProject = (projectId: string, body: { runCommand?: string; name?: string; icon?: ProjectIcon }) =>
     patch<{ project: Project }>(`/api/projects/${projectId}`, body).then((r) => r.project);
 
   /** Start generating starter prompts for a project that is about to be created,
@@ -1839,7 +2340,7 @@ export function createApi(
     paperId?: string;
     path?: string;
     locale: string;
-    starterAgent?: Pick<AgentSelection, "harness" | "model">;
+    starterAgent?: Pick<AgentSelection, "harness" | "model" | "profile">;
   }) => post<{ ok: boolean }>("/api/projects/starter-prompts/prewarm", body);
 
   /** Slow on a cache miss (one headless model call over a brief of the project). */
@@ -1848,10 +2349,11 @@ export function createApi(
     harness: HarnessId,
     model: string | null,
     locale: string,
+    profile: string | null,
     signal?: AbortSignal,
   ) =>
     get<ProjectStarterPrompts>(
-      `/api/projects/${projectId}/starter-prompts?${new URLSearchParams({ harness, ...(model ? { model } : {}), locale })}`,
+      `/api/projects/${projectId}/starter-prompts?${new URLSearchParams({ harness, ...(model ? { model } : {}), ...(profile ? { profile } : {}), locale })}`,
       signal,
     );
 
@@ -1916,7 +2418,7 @@ export function createApi(
 
   /** One file from the project — a branch's committed copy when `ref` is given,
    * else a chat session's worktree, else the hub clone — capped server-side
-   * (~512 KB). */
+   * (512 KiB). */
   const getProjectFile = (projectId: string, path: string, opts: CheckoutRef = {}, signal?: AbortSignal) =>
     get<ProjectFile>(
       `/api/projects/${projectId}/file?${checkoutQuery(opts, new URLSearchParams({ path }))}`,
@@ -1924,7 +2426,7 @@ export function createApi(
     );
 
   /** One file by absolute path — the escape hatch for a file an agent references
-   * that lives outside the checkout and artifacts. Server-side capped (~512 KB);
+   * that lives outside the checkout and artifacts. Server-side capped (512 KiB);
    * loopback-only, so it reads whatever the user running `orx up` can read. */
   const getAbsoluteFile = (path: string, signal?: AbortSignal) =>
     get<AbsoluteFile>(`/api/files/abs?path=${encodeURIComponent(path)}`, signal);
@@ -2125,14 +2627,27 @@ export function createApi(
 
   const getUpdateStatus = (signal?: AbortSignal) => get<UpdateStatus>("/api/update", signal);
 
+  /** The machine's usage, or null from an `orx up` older than the route. */
+  const getUsage = (chat: string | null, signal?: AbortSignal) =>
+    fetch(chat ? `/api/usage?${new URLSearchParams({ chat })}` : "/api/usage", { signal }).then((r) => r.status === 404 ? null : json<UsageReport>(r));
+
+  /** Starts a re-read of the machine's plans; `usage.changed` announces its end. */
+  const refreshUsage = () => post<{ ok: boolean }>("/api/usage/refresh").then(() => undefined);
+
+  /** Spends one of a Codex plan's resets; `attempt` is one confirmed click's key, sent again on a retry so it never spends two. */
+  const resetUsage = (body: { profile?: string; creditId?: string; attempt: string }) =>
+    post<{ outcome: ResetOutcome }>("/api/usage/reset", body).then((r) => r.outcome);
+
+  const getPendingWork = (signal?: AbortSignal) => get<PendingWork>("/api/pending-work", signal);
+
   const getBuildNotes = (signal?: AbortSignal) => get<BuildNotes | null>("/api/update/notes", signal);
 
   const applyUpdate = () => post<UpdateStatus>("/api/update/apply");
 
-  /** Relaunch the server into the copy the updater installed. The old server
-   *  answers and then goes away; poll `getUpdateStatus` for the new one. */
-  const restartApp = () =>
-    post<{ restarting: boolean; version: string }>("/api/update/restart");
+  /** Relaunch the server into the copy the updater installed, stopping any agent at work when `stopAgents`.
+   *  The old server answers and then goes away; poll `getUpdateStatus` for the new one. */
+  const restartApp = (stopAgents = false) =>
+    post<{ restarting: boolean; version: string }>("/api/update/restart", { stopAgents });
 
   const setAutoUpdate = (enabled: boolean) =>
     post<UpdateStatus>("/api/update/auto", { enabled });
@@ -2159,16 +2674,16 @@ export function createApi(
   const saveVercelSetup = (setup: { token: string | null; teamId: string; projectId: string | null; newProject: string | null }) =>
     post<VercelSettings>("/api/settings/vercel", setup);
 
-  const getEnvVars = (signal?: AbortSignal) =>
-    get<{ vars: EnvVar[] }>("/api/settings/env", signal).then((r) => r.vars);
+  const envScope = (projectId?: string) => projectId ? `?projectId=${encodeURIComponent(projectId)}` : "";
 
-  const setEnvVar = (key: string, value: string) =>
-    post<{ vars: EnvVar[] }>("/api/settings/env", { key, value }).then((r) => r.vars);
+  const getEnvVars = (projectId?: string, signal?: AbortSignal) =>
+    get<EnvSettings>(`/api/settings/env${envScope(projectId)}`, signal);
 
-  const deleteEnvVar = (key: string) =>
-    writeResponse(`/api/settings/env/${encodeURIComponent(key)}`, { method: "DELETE" })
-      .then((r) => json<{ vars: EnvVar[] }>(r))
-      .then((r) => r.vars);
+  const setEnvVar = (change: EnvVarChange) => post<EnvSettings>("/api/settings/env", change);
+
+  const deleteEnvVar = (key: string, projectId?: string) =>
+    writeResponse(`/api/settings/env/${encodeURIComponent(key)}${envScope(projectId)}`, { method: "DELETE" })
+      .then((r) => json<EnvSettings>(r));
 
   const getDataDir = (signal?: AbortSignal) => get<DataDirSettings>("/api/settings/data-dir", signal);
 
@@ -2195,6 +2710,26 @@ export function createApi(
 
   const saveSshConfig = (content: string, previousContent: string) =>
     put<{ ok: boolean }>("/api/settings/ssh/config", { content, previousContent });
+
+  /** Saves a host from what the user typed: an alias, `user@host[:port]` or an `ssh …` command. */
+  const addComputeHost = (command: string) =>
+    post<{ host: string }>("/api/settings/ssh/hosts", { command }).then((r) => r.host);
+
+  const removeComputeHost = (host: string) =>
+    writeResponse(`/api/settings/ssh/hosts/${encodeURIComponent(host)}`, { method: "DELETE" }).then((r) =>
+      json<{ ok: boolean }>(r),
+    );
+
+  const listRemoteHosts = (signal?: AbortSignal) =>
+    get<{ hosts: SshHost[] }>("/api/remote/hosts", signal).then((r) => r.hosts);
+
+  const addRemoteHost = (command: string) =>
+    post<{ host: string }>("/api/remote/hosts", { command }).then((r) => r.host);
+
+  const removeRemoteHost = (host: string) =>
+    writeResponse(`/api/remote/hosts/${encodeURIComponent(host)}`, { method: "DELETE" }).then((r) =>
+      json<{ ok: boolean }>(r),
+    );
 
   const getSshMasterStatus = (host: string, signal?: AbortSignal) =>
     get<{ running: boolean | null }>(`/api/settings/ssh/master?host=${encodeURIComponent(host)}`, signal);
@@ -2245,10 +2780,14 @@ export function createApi(
     host?: string;
     partition?: string;
     account?: string;
+    qos?: string;
     timeLimit?: string;
     /** 0 clears it back to the partition default. */
     cpusPerTask?: number;
     mem?: string;
+    /** Replaces the saved list. */
+    sbatchArgs?: string[];
+    requestOneTask?: boolean;
   }) => post<SlurmSettings>("/api/settings/slurm", body);
 
   const getRaySettings = (signal?: AbortSignal) => get<RaySettings>("/api/settings/ray", signal);
@@ -2264,11 +2803,10 @@ export function createApi(
   const getTrackioRuns = (projectId: string, signal?: AbortSignal) =>
     get<TrackioRuns>(`/api/trackio/projects/${encodeURIComponent(projectId)}/runs`, signal);
 
+  const getTrackioRunMetrics = (projectId: string, runId: string, signal?: AbortSignal) =>
+    get<TrackioRunMetrics>(`/api/trackio/projects/${encodeURIComponent(projectId)}/runs/${encodeURIComponent(runId)}/metrics`, signal);
+
   const trackioPreflight = () => post<TrackioPreflight>("/api/settings/trackio/preflight", {});
-
-  const getRunEngine = (signal?: AbortSignal) => get<RunEngineSettings>("/api/settings/run-engine", signal);
-
-  const setRunEngine = (enabled: boolean) => post<RunEngineSettings>("/api/settings/run-engine", { enabled });
 
   const getComputeSettings = (projectId?: string, signal?: AbortSignal) =>
     get<ComputeSettings>(
@@ -2426,24 +2964,59 @@ export function createApi(
   const getProjectLink = (projectId: string, signal?: AbortSignal) =>
     get<{ signedIn: boolean; sharedProject: PublishedProject | null }>(`/api/projects/${projectId}/publish`, signal);
 
+  /** Follows background work `started` until it finishes; an older orx up answers with the result itself. */
+  async function followOperation<T extends object>(started: T | { operationId: string }, invalidates: string, onProgress?: (progress: OperationProgress) => void): Promise<T> {
+    if (!("operationId" in started)) return started;
+    const scope = workspaceScope();
+    const path = `/api/operations/${encodeURIComponent(started.operationId)}`;
+    let missed = 0;
+    for (;;) {
+      let status: OperationStatus<T>;
+      try {
+        status = await get<OperationStatus<T>>(path);
+        missed = 0;
+      } catch (error) {
+        // The work carries on in orx up, so a poll lost to the connection, even mid-body, is worth asking again.
+        if (!(error instanceof ConnectionLostError || error instanceof TypeError)) throw error;
+        if (++missed > 3) throw error instanceof TypeError ? new ConnectionLostError(m.request_connection_lost(), { cause: error }) : error;
+        await new Promise((resolve) => setTimeout(resolve, 1000 * missed));
+        continue;
+      }
+      if (status.error !== null) throw new Error(status.error);
+      if (status.result !== null) {
+        invalidateWrite(invalidates, scope);
+        return status.result;
+      }
+      onProgress?.(status);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+  }
+
   /** Upload the project to openresearch.sh; publishing again updates the same link. */
-  const publishProject = (projectId: string, options: ShareChoice) =>
-    post<{ sharedProject: PublishedProject; skipped: string[] }>(`/api/projects/${projectId}/publish`, options);
+  const publishProject = async (projectId: string, options: ShareChoice, onProgress?: (progress: OperationProgress) => void) => {
+    const url = `/api/projects/${projectId}/publish`;
+    type Published = { sharedProject: PublishedProject; skipped: string[] };
+    return followOperation(await post<Published | { operationId: string }>(`${url}?background=true`, options), url, onProgress);
+  };
 
   /** What anyone with a published link sees, fetched by the machine that will open it. */
   const getPublicProject = (slug: string, signal?: AbortSignal) =>
     get<{ sharedProject: PublicProject }>(`/api/shared-projects/${encodeURIComponent(slug)}`, signal);
 
-  /** Open a shared project as a new project in `path`. */
-  const importSharedProject = (path: string, source: SharedSource) => {
-    const query = `path=${encodeURIComponent(path)}`;
-    if (typeof source === "string") return post<OpenedSharedProject>(`/api/projects/import?${query}&file=${encodeURIComponent(source)}`);
-    if (!(source instanceof File)) return post<OpenedSharedProject>(`/api/projects/import?${query}&shared=${encodeURIComponent(source.link)}`);
-    return writeResponse(`/api/projects/import?${query}`, {
-      method: "POST",
-      headers: { "content-type": "application/octet-stream" },
-      body: source,
-    }).then((r) => json<OpenedSharedProject>(r));
+  /** Open a shared project as a new project in `path`, following it until it opens. */
+  const importSharedProject = async (path: string, source: SharedSource, onProgress?: (progress: OperationProgress) => void) => {
+    const url = `/api/projects/import?path=${encodeURIComponent(path)}&background=true`;
+    type Started = OpenedSharedProject | { operationId: string };
+    const start = () => {
+      if (typeof source === "string") return post<Started>(`${url}&file=${encodeURIComponent(source)}`);
+      if (!(source instanceof File)) return post<Started>(`${url}&shared=${encodeURIComponent(source.link)}`);
+      return writeResponse(url, {
+        method: "POST",
+        headers: { "content-type": "application/octet-stream" },
+        body: source,
+      }).then((r) => json<Started>(r));
+    };
+    return followOperation(await start(), "/api/projects/import", onProgress);
   };
 
   const getTelemetry = (signal?: AbortSignal) => get<TelemetrySettings>("/api/settings/telemetry", signal);
@@ -2474,7 +3047,11 @@ export function createApi(
     if (retryRejected) params.set("retry", "1");
     if (harness) params.set("harness", harness);
     const query = params.size > 0 ? `?${params.toString()}` : "";
-    return get<{ harnesses: Harness[] }>(`/api/harnesses${query}`, signal).then((r) => r.harnesses);
+    return get<{ harnesses: Harness[] }>(`/api/harnesses${query}`, signal).then((r) => {
+      // A server from before speed tiers says only whether a model is fast.
+      for (const model of r.harnesses.flatMap((h) => h.models)) model.parsed.variant.speed ??= model.parsed.variant.fast ? "fast" : null;
+      return r.harnesses;
+    });
   };
 
   const listAcpHarnesses = () => get<AcpDefinition[]>("/api/harnesses/acp");
@@ -2483,6 +3060,10 @@ export function createApi(
     ? put<AcpDefinition>(`/api/harnesses/acp/${encodeURIComponent(id)}`, definition)
     : post<AcpDefinition>("/api/harnesses/acp", definition);
   const removeAcpHarness = (id: string) => writeResponse(`/api/harnesses/acp/${encodeURIComponent(id)}`, { method: "DELETE" }).then((response) => json<{ ok: boolean }>(response));
+  /** Deletes OpenResearch's copy of an agent, and what it kept only for that copy. */
+  const removeHarnessInstall = (id: HarnessId) => writeResponse(`/api/harnesses/${encodeURIComponent(id)}/install`, { method: "DELETE" }).then(async (response) => {
+    if (!response.ok) await json(response);
+  });
   const testAcpHarness = (definition: Omit<AcpDefinition, "id">) => post<{ status: string; agentInfo?: { version?: string }; harnessId: AcpDefinition["id"] | null }>("/api/harnesses/acp/test", definition);
   const setChatConfiguration = (sessionId: string, optionId: string, value: string) => post<ChatSession>(`/api/chat/sessions/${sessionId}/configuration`, { optionId, value });
 
@@ -2575,7 +3156,7 @@ export function createApi(
   const createChatSession = (
     projectId: string,
     harness: HarnessId,
-    opts: TurnOptions & { autonomy?: Autonomy } = {},
+    opts: TurnOptions & { autonomy?: Autonomy; profile?: string | null } = {},
   ) =>
     post<{ session: ChatSession }>("/api/chat/sessions", { projectId, harness, ...opts }).then(
       (r) => r.session,
@@ -2589,57 +3170,17 @@ export function createApi(
       json<{ ok: boolean }>(r).then((result) => { removeSession(sessionId); return result; }),
     );
 
-  /** Archive/unarchive a session (archived chats stay resumable). */
-  const setChatSessionArchived = (sessionId: string, archived: boolean) =>
-    patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { archived }).then(
-      (r) => r.session,
-    );
-
-  /** Rename a session. The title is trimmed server-side; empty titles are rejected. */
-  /** Keep a delegate for the user: it stops telling the chat that started it and becomes a side chat. */
-  const releaseDelegate = (sessionId: string) =>
-    patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { notifyParent: false }).then(
+  const patchChatSession = (sessionId: string, changes: ChatSessionPatch) =>
+    patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, changes).then(
       (r) => r.session,
     );
 
   /** The message an agent cited by ref: where it lives, the agent that wrote it if one did, and its first words. */
   const citedMessage = (cited: string) => get<CitedMessage>(`/api/chat/messages/${encodeURIComponent(cited)}`);
 
-  const renameChatSession = (sessionId: string, title: string) =>
-    patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { title }).then(
-      (r) => r.session,
-    );
-
-  /** Enter/leave the session-specific Plan axis used by Codex/OpenCode/Cursor. */
-  const setChatSessionPlanMode = (sessionId: string, planMode: boolean) =>
-    patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { planMode }).then(
-      (r) => r.session,
-    );
-
   /** Branch a persistent side chat off a snapshot of `sessionId`'s transcript. */
   const openSideChat = (sessionId: string) =>
     post<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}/side`, {}).then(
-      (r) => r.session,
-    );
-
-  /** `null` clears the goal. */
-  const setChatSessionGoal = (sessionId: string, goal: string | null) =>
-    patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { goal }).then(
-      (r) => r.session,
-    );
-
-  const setChatSessionAutonomy = (sessionId: string, autonomy: Autonomy) =>
-    patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { autonomy }).then(
-      (r) => r.session,
-    );
-
-  const setChatSessionAgent = (sessionId: string, agent: AgentSelection) =>
-    patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { agent }).then(
-      (r) => r.session,
-    );
-
-  const setChatSessionPermissionMode = (sessionId: string, permissionMode: string) =>
-    patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { permissionMode }).then(
       (r) => r.session,
     );
 
@@ -2731,10 +3272,34 @@ export function createApi(
   const respondChat = (sessionId: string, answer: PromptAnswer) =>
     post<{ ok: boolean }>(`/api/chat/sessions/${sessionId}/respond`, answer);
   const getLocalModels = (signal?: AbortSignal) => get<LocalModelConnection[]>("/api/local-models", signal);
-  const discoverLocalModels = (request: { baseUrl: string; apiKey: string }) => post<{ models: string[] }>("/api/local-models/discover", request);
-  const connectLocalModel = (request: { name: string; baseUrl: string; apiKey: string; model: string; contextWindow: number }) => post<{ model: string }>("/api/local-models", request);
+  /** `ownedBy` is the owner the server names for its models; an orx from before it sends none. */
+  const discoverLocalModels = (request: { baseUrl: string; apiKey: string }) => post<{ models: string[]; ownedBy?: string | null }>("/api/local-models/discover", request);
+  const connectLocalModel = (request: { name: string; baseUrl: string; apiKey: string; model: string; contextWindow: number }) => post<{ model: string; created: boolean }>("/api/local-models", request);
   const checkLocalModel = (id: string) => post<{ models: string[] }>(`/api/local-models/${encodeURIComponent(id)}/check`, {});
-  const removeLocalModel = (id: string) => writeResponse(`/api/local-models/${encodeURIComponent(id)}`, { method: "DELETE" }).then((r) => json<{ ok: boolean }>(r));
+  /** Removes one model, or with none named the whole connection. */
+  const removeLocalModel = (id: string, model?: string) => writeResponse(`/api/local-models/${encodeURIComponent(id)}${model ? `?${new URLSearchParams({ model })}` : ""}`, { method: "DELETE" }).then((r) => json<{ ok: boolean }>(r));
+
+  const createAgentProfile = (body: { harness: "claude-code" | "codex"; name: string; icon?: AgentIcon }) => post<{ id: string }>("/api/agent-profiles", body);
+  /**
+   * Names a row of Settings → Agents, keyed as the picker keys it: an agent's or account's id, or `opencode:` and a
+   * provider's or endpoint's id. `null` clears the icon, and a found agent's name back to its own.
+   */
+  const updateAgent = (key: string, body: { name?: string | null; icon?: AgentIcon | null; logo?: string | null }) => patch<unknown>(`/api/agents/${encodeURIComponent(key)}`, body);
+  const removeAgentProfile = (id: string) => writeResponse(`/api/agent-profiles/${encodeURIComponent(id)}`, { method: "DELETE" }).then((r) => json<unknown>(r));
+
+  const getOpenCodeProviders = (signal?: AbortSignal) => get<OpenCodeProvider[]>("/api/opencode/providers", signal);
+  /** A second key for a provider comes back under an id of its own. */
+  const addOpenCodeProvider = (body: { provider: string; apiKey: string; name: string; icon?: AgentIcon }) => post<{ id: string }>("/api/opencode/providers", body);
+  const replaceOpenCodeProviderKey = (id: string, apiKey: string) => put<unknown>(`/api/opencode/providers/${encodeURIComponent(id)}/key`, { apiKey });
+  const removeOpenCodeProvider = (id: string) => writeResponse(`/api/opencode/providers/${encodeURIComponent(id)}`, { method: "DELETE" }).then((r) => json<unknown>(r));
+  /** Deletes a provider from the user's own OpenCode: its sign-in and its config entry. */
+  const removeFoundProvider = (id: string) => writeResponse(`/api/opencode/found-providers/${encodeURIComponent(id)}`, { method: "DELETE" }).then((r) => json<unknown>(r));
+  const getOpenCodeIntegrations = (signal?: AbortSignal) => get<OpenCodeIntegration[]>("/api/opencode/integrations", signal);
+  const startOpenCodeSignIn = (body: { integration: string; method: string; name: string; icon?: AgentIcon; answer?: Record<string, OpenCodeAnswer> }) => post<OpenCodeSignIn>("/api/opencode/sign-in", body);
+  const getOpenCodeSignIn = (attempt: string, signal?: AbortSignal) =>
+    get<{ status: "pending" | "complete" | "failed" | "expired"; message?: string }>(`/api/opencode/sign-in/${encodeURIComponent(attempt)}`, signal);
+  const sendOpenCodeSignInCode = (attempt: string, code: string) => post<unknown>(`/api/opencode/sign-in/${encodeURIComponent(attempt)}/code`, { code });
+  const cancelOpenCodeSignIn = (attempt: string) => writeResponse(`/api/opencode/sign-in/${encodeURIComponent(attempt)}`, { method: "DELETE" }).then((r) => json<unknown>(r));
 
   const listChatActiveRuns = (signal?: AbortSignal) =>
     get<ChatActiveRun[]>("/api/chat/active-runs", signal);
@@ -2771,6 +3336,9 @@ export function createApi(
     repoAccess,
     resolvePaper,
     updateProject,
+    createScratchProject,
+    moveChatToProject,
+    cancelChatProjectMove,
     prewarmStarterPrompts,
     getProjectStarterPrompts,
     deleteProject,
@@ -2817,6 +3385,10 @@ export function createApi(
     getTinkerSettings,
     saveTinkerKey,
     getUpdateStatus,
+    getUsage,
+    refreshUsage,
+    resetUsage,
+    getPendingWork,
     getBuildNotes,
     applyUpdate,
     restartApp,
@@ -2844,6 +3416,11 @@ export function createApi(
     getSshConfig,
     saveSshConfig,
     getSshMasterStatus,
+    addComputeHost,
+    removeComputeHost,
+    listRemoteHosts,
+    addRemoteHost,
+    removeRemoteHost,
     getRuntime,
     listRemoteSessions,
     createRemoteSession,
@@ -2861,9 +3438,8 @@ export function createApi(
     saveRaySettings,
     rayPreflight,
     getTrackioRuns,
+    getTrackioRunMetrics,
     trackioPreflight,
-    getRunEngine,
-    setRunEngine,
     getComputeSettings,
     setComputeDefault,
     getLocalMachine,
@@ -2907,6 +3483,7 @@ export function createApi(
     listAcpPresets,
     saveAcpHarness,
     removeAcpHarness,
+    removeHarnessInstall,
     testAcpHarness,
     setChatConfiguration,
     getSkills,
@@ -2928,16 +3505,9 @@ export function createApi(
     createChatSession,
     getChatSession,
     deleteChatSession,
-    setChatSessionArchived,
-    renameChatSession,
-    releaseDelegate,
+    patchChatSession,
     citedMessage,
-    setChatSessionPlanMode,
     openSideChat,
-    setChatSessionGoal,
-    setChatSessionAutonomy,
-    setChatSessionAgent,
-    setChatSessionPermissionMode,
     getChatMessages,
     cancelQueuedMessage,
     retryQueuedMessage,
@@ -2955,6 +3525,20 @@ export function createApi(
     connectLocalModel,
     checkLocalModel,
     removeLocalModel,
+    createAgentProfile,
+    updateAgent,
+    removeAgentProfile,
+    getOpenCodeProviders,
+    getModelFeed,
+    addOpenCodeProvider,
+    replaceOpenCodeProviderKey,
+    removeOpenCodeProvider,
+    removeFoundProvider,
+    getOpenCodeIntegrations,
+    startOpenCodeSignIn,
+    getOpenCodeSignIn,
+    sendOpenCodeSignInCode,
+    cancelOpenCodeSignIn,
     listChatActiveRuns,
     getSubagentTranscript,
   };

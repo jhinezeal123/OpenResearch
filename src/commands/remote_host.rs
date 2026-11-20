@@ -44,6 +44,9 @@ pub(crate) struct HostDescriptor {
     pub hostname: String,
     pub port: u16,
     pub version: String,
+    /// Absent from hosts that predate it.
+    #[serde(default)]
+    pub build_id: Option<String>,
     pub dashboard_protocol: u32,
     pub control_protocol: u32,
 }
@@ -478,7 +481,7 @@ pub(crate) async fn run(args: RemoteHostArgs) -> Result<()> {
 #[cfg(unix)]
 async fn ensure(expected_instance: Option<String>) -> Result<()> {
     let data_dir = canonical_data_dir()?;
-    match live_descriptor(&data_dir).await {
+    match live_descriptor(&data_dir).await? {
         LiveHost::Running(descriptor) => {
             verify_expected(&descriptor, expected_instance.as_deref())?;
             return print_descriptor(&descriptor);
@@ -512,7 +515,7 @@ async fn ensure(expected_instance: Option<String>) -> Result<()> {
         move || {
             let data_dir = data_dir.clone();
             async move {
-                match live_descriptor(&data_dir).await {
+                match live_descriptor(&data_dir).await? {
                     LiveHost::Running(descriptor) => Ok(Some(descriptor)),
                     LiveHost::Stopping(_) => {
                         wait_for_server_lock_free(&data_dir).await?;
@@ -605,19 +608,23 @@ enum LiveHost {
     Missing,
 }
 
+/// A host that holds the lock but answers too slowly is an error: it is neither gone nor
+/// another dashboard.
 #[cfg(unix)]
-async fn live_descriptor(data_dir: &Path) -> LiveHost {
-    let Ok(response) = control_exchange(data_dir, &ControlRequest::Status).await else {
-        return LiveHost::Missing;
+async fn live_descriptor(data_dir: &Path) -> Result<LiveHost> {
+    let response = match control_exchange(data_dir, &ControlRequest::Status).await {
+        Ok(response) => Ok(response),
+        Err(error) if error.is::<tokio::time::error::Elapsed>() => Err(error),
+        Err(_) => return Ok(LiveHost::Missing),
     };
     if !server_lock_is_held(data_dir).unwrap_or(false) {
-        return LiveHost::Missing;
+        return Ok(LiveHost::Missing);
     }
-    match response {
+    Ok(match response? {
         ControlResponse::Status { descriptor, .. } => LiveHost::Running(descriptor),
         ControlResponse::Stopping { descriptor } => LiveHost::Stopping(descriptor),
         _ => LiveHost::Missing,
-    }
+    })
 }
 
 #[cfg(unix)]
@@ -656,7 +663,10 @@ async fn control_exchange(data_dir: &Path, request: &ControlRequest) -> Result<C
         Ok::<_, crate::error::Error>(serde_json::from_str(&line)?)
     })
     .await
-    .map_err(|_| anyhow!("Timed out contacting the persistent OpenResearch host."))?
+    .map_err(|elapsed| {
+        crate::error::Error::new(elapsed)
+            .context("The persistent OpenResearch host is not responding. Try again in a moment.")
+    })?
 }
 
 #[cfg(unix)]
@@ -854,7 +864,36 @@ fn spawn_detached_host(
         use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS};
         command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
     }
-    match command.spawn() {
+
+    #[cfg(not(windows))]
+    let spawned = command.spawn();
+    #[cfg(windows)]
+    let spawned = {
+        use windows_sys::Win32::Foundation::{
+            GetHandleInformation, SetHandleInformation, HANDLE_FLAG_INHERIT,
+        };
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        // A server inheriting this CLI's std pipes keeps whoever reads its output waiting until the server exits.
+        let inheritable: Vec<_> = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+            .into_iter()
+            .map(|id| unsafe { GetStdHandle(id) })
+            .filter(|&handle| unsafe {
+                let mut flags = 0;
+                GetHandleInformation(handle, &mut flags) != 0
+                    && flags & HANDLE_FLAG_INHERIT != 0
+                    && SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) != 0
+            })
+            .collect();
+        let spawned = command.spawn();
+        for handle in inheritable {
+            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
+        }
+        spawned
+    };
+
+    match spawned {
         Ok(child) => {
             #[cfg(unix)]
             let readiness = readiness.map(|(reader, _)| Readiness::Pipe(reader));
@@ -948,7 +987,7 @@ fn open_lock(path: &Path) -> Result<fd_lock::RwLock<File>> {
 
 pub(crate) fn canonical_data_dir() -> Result<PathBuf> {
     let data_dir = crate::store::data_dir();
-    std::fs::create_dir_all(&data_dir)?;
+    crate::paths::create_dir_all(&data_dir)?;
     crate::paths::canonicalize(&data_dir)
         .map_err(|error| anyhow!("Could not resolve {}: {error}", data_dir.display()))
 }
@@ -1159,9 +1198,25 @@ mod tests {
             hostname: "box".into(),
             port: 1,
             version: "0".into(),
+            build_id: None,
             dashboard_protocol: 0,
             control_protocol: CONTROL_PROTOCOL,
         }
+    }
+
+    #[test]
+    fn a_descriptor_from_a_host_without_build_ids_still_reads() {
+        let old = r#"{"instanceId":"i","hostname":"box","port":1,"version":"0.2.26","dashboardProtocol":5,"controlProtocol":1}"#;
+        let descriptor: HostDescriptor = serde_json::from_str(old).unwrap();
+        assert_eq!(descriptor.build_id, None);
+        assert_eq!(descriptor.dashboard_protocol, 5);
+
+        let current = HostDescriptor {
+            build_id: Some("canary-20261112.3".into()),
+            ..descriptor
+        };
+        let written = serde_json::to_value(&current).unwrap();
+        assert_eq!(written["buildId"], "canary-20261112.3");
     }
 
     #[cfg(unix)]
@@ -1200,6 +1255,25 @@ mod tests {
             assert!(started.is_err(), "target exists: {target_exists}");
             assert!(link_kept, "target exists: {target_exists}");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_host_holding_the_lock_is_not_responding_not_missing() {
+        let root = crate::local::git::TemporaryDirectory::new("orx-silent-host").unwrap();
+        let data_dir = root.path().join("data");
+        std::fs::create_dir(&data_dir).unwrap();
+        let mut lock = open_lock(&shared_path(&data_dir, "lock").unwrap()).unwrap();
+        let _held = lock.try_write().unwrap();
+        let socket = control_socket_path(&data_dir).unwrap();
+        let _silent = UnixListener::bind(&socket).unwrap();
+
+        let error = match live_descriptor(&data_dir).await {
+            Err(error) => error,
+            Ok(_) => panic!("a silent host read as running or missing"),
+        };
+        std::fs::remove_file(&socket).unwrap();
+        assert!(error.to_string().contains("not responding"), "{error}");
     }
 
     #[cfg(unix)]
@@ -1401,6 +1475,12 @@ impl ServerDescriptor {
         if let Some(mut file) = READY_PIPE.lock().unwrap().take() {
             std::io::Write::write_all(&mut file, &[1])?;
         }
+        Ok(())
+    }
+
+    /// Withdraws this server's descriptor before an exec relaunch, which keeps the pid and start time that vouch for it.
+    pub(crate) fn withdraw(data_dir: &Path) -> Result<()> {
+        std::fs::remove_file(runtime_path(data_dir, "server.json")?)?;
         Ok(())
     }
 

@@ -6,7 +6,7 @@ import { markLiveUpdate } from "./live";
 import { inputSummaryChanged } from "./chatState";
 import { useEffect, useMemo } from "react";
 
-import { artifactFamilies, liveFamilies } from "./invalidation";
+import { artifactFamilies } from "./invalidation";
 
 function upsert<T extends { id: string; updatedAt: number }>(rows: T[] | undefined, next: T) {
   if (!rows) return undefined;
@@ -17,7 +17,7 @@ function upsert<T extends { id: string; updatedAt: number }>(rows: T[] | undefin
 
 export function QueryEvents() {
   const { workspaceScope, isCurrentScope, queryClient, deletedSessionIds } = useWorkspace();
-  const { invalidateFamilies, removeSession } = useWorkspace().invalidation;
+  const { invalidateFamilies, repairLiveQueries, removeSession } = useWorkspace().invalidation;
   const {
     useOrxEventStream,
     emitEntity,
@@ -86,10 +86,12 @@ export function QueryEvents() {
       invalidateFamilies(artifactFamilies, scope, (query) => query.queryKey[3] === projectId);
       invalidateFamilies(["resolvedFile"], scope, (query) => query.queryKey[3] === projectId && query.queryKey[5] === "artifacts");
     },
+    onUsageChanged() {
+      invalidateFamilies(["getUsage"], scope);
+    },
     onReconnect() {
       if (!isCurrentScope(scope)) return;
-      invalidateFamilies(liveFamilies, scope);
-      invalidateFamilies(["getSessionExperiments"], scope);
+      void repairLiveQueries();
       emitEntity.onReconnect();
     },
   });
@@ -114,6 +116,8 @@ export function QueryEvents() {
     const offChat = onChatEvent((event) => {
       if (!isCurrentScope(scope)) return;
       if (inputSummaryChanged(event, promptStates)) refreshSidebar();
+      else if (event.type === "busy") invalidateFamilies(["listSidebarChatSessions"], scope);
+      if (event.type === "background") invalidateFamilies(["listSidebarChatSessions", "listChatSessions"], scope);
       if (event.type === "branch" || event.type === "sessionDeleted" || event.type === "busy" && !event.busy) invalidateFamilies(["chatSearch"], scope);
       if (event.type === "session") markLiveUpdate(queryClient, listChatSessionsQuery(event.session.projectId).queryKey, event.session.id);
       else if (event.type === "busy" || event.type === "usage") markLiveUpdate(queryClient, [...scope, "listChatSessions"], event.sessionId);
@@ -124,11 +128,17 @@ export function QueryEvents() {
             : { type: "activeLeaf", sessionId: event.sessionId, leafId: event.activeLeafId }, true);
       }
       if (event.type === "session" && !deletedSessionIds.has(event.session.id)) {
+        // A chat that moved into another project leaves its old project's list.
+        for (const [key, rows] of queryClient.getQueriesData<ChatSession[]>({ queryKey: [...scope, "listChatSessions"] })) {
+          if (key[3] !== event.session.projectId && rows?.some((row) => row.id === event.session.id)) {
+            queryClient.setQueryData(key, rows.filter((row) => row.id !== event.session.id));
+          }
+        }
         queryClient.setQueryData(listChatSessionsQuery(event.session.projectId).queryKey, (rows) => {
           if (!rows) return undefined;
           const old = rows.find((row) => row.id === event.session.id);
           if (!old) return [event.session, ...rows];
-          return upsert(rows, { ...event.session, contextUsage: event.session.contextUsage ?? old.contextUsage });
+          return upsert(rows, { ...event.session, contextUsage: event.session.contextUsage ?? old.contextUsage, awaitingInput: event.session.awaitingInput ?? old.awaitingInput });
         });
       } else if (event.type === "sessionDeleted") {
         removeSession(event.sessionId);

@@ -4,8 +4,8 @@ import { ltr } from "../i18n";
 import { FlaskConical, CircleStop, FolderTree, Terminal } from "lucide-react";
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { fmtNumber, timeAgo, type Experiment, type Run } from "../api";
-import { runActive, runDisplay } from "../runDisplay";
-import { statusLabel, StatusBadge } from "./StatusBadge";
+import { runActive, runDisplay, runStoppable } from "../runDisplay";
+import { StatusBadge } from "./StatusBadge";
 import { tabOpenGestureHandlers, type TabOpenIntent } from "../tabPreview";
 import { IconButton, Tooltip } from "./ui";
 import { ArchiveMenu, type ArchiveActions } from "./ArchiveMenu";
@@ -41,7 +41,6 @@ export function ExperimentsTable({
   onDelete: (id: string) => void;
   onCancel: (runId: string) => Promise<void>;
 }) {
-  const [pendingCancellation, setPendingCancellation] = useState<ReadonlySet<string>>(new Set());
   const [cancelError, setCancelError] = useState<string | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const [placed, setPlaced] = useState<Placed[]>([]);
@@ -92,15 +91,9 @@ export function ExperimentsTable({
 
   async function requestCancel(runId: string) {
     setCancelError(null);
-    setPendingCancellation((current) => new Set(current).add(runId));
     try {
       await onCancel(runId);
     } catch (cause) {
-      setPendingCancellation((current) => {
-        const next = new Set(current);
-        next.delete(runId);
-        return next;
-      });
       setCancelError(cause instanceof Error ? cause.message : String(cause));
     }
   }
@@ -121,9 +114,7 @@ export function ExperimentsTable({
           const latestRun = experimentRuns[0] ?? null;
           const liveRun = experimentRuns.find((run) => runActive(run.status));
           const logsRun = liveRun ?? latestRun;
-          const cancelling = Boolean(liveRun && (liveRun.cancelling || pendingCancellation.has(liveRun.id)));
-          const shownRun = liveRun && pendingCancellation.has(liveRun.id) ? { ...liveRun, cancelling: true } : logsRun;
-          const display = shownRun ? runDisplay(shownRun) : { status: "idle" };
+          const display = logsRun ? runDisplay(logsRun) : { status: "idle" };
 
           return (
             <div
@@ -195,13 +186,12 @@ export function ExperimentsTable({
                     <FolderTree size={16} />
                   </IconButton>
                 </Tooltip>
-                {liveRun && (
-                  <Tooltip interactive content={cancelling ? statusLabel(display.status) : m.experiments_stop_run()}>
+                {liveRun && runStoppable(liveRun) && (
+                  <Tooltip interactive content={m.experiments_stop_run()}>
                     <IconButton
                       size="small"
-                      variant="stop"
-                      disabled={cancelling}
-                      aria-label={cancelling ? statusLabel(display.status) : m.common_stop()}
+                      variant="filled"
+                      aria-label={m.common_stop()}
                       onClick={() => void requestCancel(liveRun.id)}
                     >
                       <CircleStop size={16} />

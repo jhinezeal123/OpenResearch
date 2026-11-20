@@ -88,7 +88,7 @@ when a notebook is reused. A later Run is bounded by the remaining lifetime.
 - **Stop Run** cancels only that Run's process group. The notebook is retained.
   **Close session** or TTL shuts down the notebook. An account is released only
   after a provider stop receipt. Unknown stop outcomes remain reserved.
-- Stop also reconciles the remote Run after a supervisor restart. If monitoring
+- Stop also reconciles the remote Run after an engine restart. If monitoring
   fails for 15 minutes, the local Run fails but its session stays reserved until
   the owner confirms completion or the notebook reaches its deadline.
 - Commands stop on failed steps and pipelines. Each Run receives `ORX_RUN_ID`
@@ -99,19 +99,14 @@ when a notebook is reused. A later Run is bounded by the remaining lifetime.
 
 ### Who watches a Run
 
-OpenResearch's run engine setting decides (Settings, `ORX_RUN_ENGINE`, always on
-for canary builds):
-
-- **Off:** a detached `orx supervise` process follows each Run
-  (`supervisor.rs`), as in 0.2.x.
-- **On:** the engine in `orx up` launches and watches Kaggle Runs through
-  `engine.rs`. It drives the same acquire, launch and inspect steps, one at a
-  time in the background, and never ends a Run on a timer: an unreachable
-  bridge or account shows as lost contact until Kaggle answers. The engine also
-  adopts Runs whose 0.2.x supervisor died, once they have been quiet for five
-  minutes. A cancel leaves a `.cancel` marker beside the saved launch so a
-  queued Run never acquires a notebook afterwards. The notebook is released for
-  reuse only after the log is kept and Kaggle reports the Run finished.
+The engine in `orx up` launches and watches Kaggle Runs through `engine.rs`.
+It drives the same acquire, launch and inspect steps, one at a time in the
+background, and never ends a Run on a timer: an unreachable bridge or account
+shows as lost contact until Kaggle answers. The engine also adopts Runs whose
+0.2.x supervisor died, once they have been quiet for five minutes. A cancel
+leaves a `.cancel` marker beside the saved launch so a queued Run never
+acquires a notebook afterwards. The notebook is released for reuse only after
+the log is kept and Kaggle reports the Run finished.
 
 Logs are persisted in OpenResearch. Notebook storage remains ephemeral;
 export required artifacts before closing the Session. No Workbench workflow,
@@ -154,8 +149,8 @@ model](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects).
 
 Token proxies run only during bootstrap. Idle notebooks hold no persistent
 SSH/Tailcat pipe. One active notebook still needs a worker, SSH and Tailcat,
-plus one scheduler shared by the pool; the Run supervisor and short bridge
-calls are separate processes. These are background processes, and internal
+plus one scheduler shared by the pool; short bridge calls are separate
+processes. These are background processes, and internal
 Windows commands run without opening terminal windows. Windows workers and the
 scheduler launch the underlying interpreter directly while preserving their
 virtualenv, so launcher PIDs cannot cause false stale-heartbeat recovery or
@@ -191,8 +186,8 @@ descriptors and pools migrate without changing notebook or Run identities.
 
 ## Ownership and maintenance
 
-`compute.rs`, `engine.rs`, `runtime.rs`, `supervisor.rs`, `settings.rs`, `ui/`, `python/`,
-setup and tests belong here. `downstream/bridge.rs` exposes the upstream
+`compute.rs`, `engine.rs`, `runtime.rs`, `settings.rs`, `ui/`, `python/`, setup
+and tests belong here. `downstream/bridge.rs` exposes the upstream
 contracts. `VENDORED.json` records the native package origin and original
 hashes; local changes redirect data, profile and cookie recovery paths.
 

@@ -34,26 +34,16 @@ const LR_PROBE_EXPERIMENT_ID: &str = "demo_nanochat_lr_probe_v1";
 const LR_PROBE_BRANCH: &str = "orx/tiny-learning-rate-probe-interactive";
 const VOCAB_PROBE_EXPERIMENT_ID: &str = "demo_nanochat_vocab_probe_v1";
 const VOCAB_PROBE_BRANCH: &str = "orx/vocab-8192-probe";
-// Git Bash: uv has no shell installer there, and venvs may use `Scripts/` not `bin/`.
-fn probe_uv() -> String {
-    let install_uv = if cfg!(windows) {
-        "powershell -NoProfile -ExecutionPolicy Bypass -Command \"irm https://astral.sh/uv/install.ps1 | iex\""
-    } else {
-        "curl -LsSf https://astral.sh/uv/install.sh | sh"
-    };
-    format!(
-        "export NANOCHAT_BASE_DIR=\"$PWD/.cache/nanochat\" UV_CACHE_DIR=\"${{ORX_CACHE_DIR:-$HOME/.cache/openresearch}}/uv\" \
-         && mkdir -p \"$NANOCHAT_BASE_DIR\" \"$UV_CACHE_DIR\" \
-         && {{ command -v uv >/dev/null || {{ {install_uv} && export PATH=\"$HOME/.local/bin:$PATH\"; }}; }}"
-    )
-}
+// Git Bash venvs keep their scripts in `Scripts/`, not `bin/`.
+const PROBE_UV: &str = "export NANOCHAT_BASE_DIR=\"$PWD/.cache/nanochat\" UV_CACHE_DIR=\"${ORX_CACHE_DIR:-$HOME/.cache/openresearch}/uv\" \
+     && mkdir -p \"$NANOCHAT_BASE_DIR\" \"$UV_CACHE_DIR\" \
+     && { command -v uv >/dev/null || { curl -LsSf https://astral.sh/uv/install.sh | sh && export PATH=\"$HOME/.local/bin:$PATH\"; }; }";
 
 fn probe_setup() -> String {
     format!(
-        "{} && ([ -d .venv ] || uv venv) && uv sync --extra cpu \
+        "{PROBE_UV} && ([ -d .venv ] || uv venv) && uv sync --extra cpu \
          && {{ . .venv/bin/activate 2>/dev/null || . .venv/Scripts/activate; }} \
-         && python -m nanochat.dataset -n 8",
-        probe_uv()
+         && python -m nanochat.dataset -n 8"
     )
 }
 
@@ -70,9 +60,9 @@ const TURN_CONTEXT: &str = r#"<openresearch-demo-evidence>
 This is a recorded OpenResearch demo run. The project's Artifacts/evidence directory contains real checkpoint metadata, the trained tokenizer, structured training and evaluation metrics, the final inference transcript, and run-manifest.json. To reduce the bundled demo project's download size, the multi-gigabyte model checkpoints, optimizer states, datasets, and environment are intentionally not included; the manifest records their original paths, sizes, hashes, and omission status. Do not search for or claim access to omitted files. Before proposing work that requires model weights, explain that the weights must be regenerated or downloaded. When the user asks you to choose an autonomous follow-up, prefer an analysis supported by the bundled evidence unless they explicitly ask to regenerate or download the weights.
 </openresearch-demo-evidence>"#;
 
-const USER_PROMPT: &str = "Run nanochat's CPU/Apple-Silicon pipeline end-to-end with bash runs/runcpu.sh (the local shrunk-down version, not speedrun.sh, ~40 min), streaming output and surfacing val_bpb/eval numbers as they appear, fixing any setup errors in place, and when it finishes chat with the model via python -m scripts.chat_cli -p \"What is the capital of France?\" to confirm it works.";
+const USER_PROMPT: &str = "Run nanochat's local pipeline end-to-end with bash runs/runcpu.sh (the shrunk-down version for laptops, not speedrun.sh, ~40 min), streaming output and surfacing val_bpb/eval numbers as they appear, fixing any setup errors in place, and when it finishes chat with the model via python -m scripts.chat_cli -p \"What is the capital of France?\" to confirm it works.";
 
-const FIGURE_USER_PROMPT: &str = "Using nanochat’s recorded base-training and SFT logs, create publication-quality SVG-only figures for base and SFT loss/validation BPB, Apple-Silicon throughput, and CORE evaluation results. Use Helvetica Neue, a restrained academic style, exact metric labels, colorblind-safe colors, and no decorative infographics or PNG duplicates.";
+const FIGURE_USER_PROMPT: &str = "Using nanochat’s recorded base-training and SFT logs, create publication-quality SVG-only figures for base and SFT loss/validation BPB, training throughput, and CORE evaluation results. Use Helvetica Neue, a restrained academic style, exact metric labels, colorblind-safe colors, and no decorative infographics or PNG duplicates.";
 
 const LITERATURE_USER_PROMPT: &str = "My 73.5M-parameter nanochat model was pretrained on 81.9M tokens and then SFT-tuned on SmolTalk, MMLU, and GSM8K. SFT validation loss improved substantially, but generation remains repetitive and benchmark performance is weak. Based on the literature, is the main bottleneck insufficient pretraining, model size, data quality, or the SFT recipe—and what experiment should I run next?";
 
@@ -92,9 +82,9 @@ Continue naturally from this completed state."#;
 
 const BOOTSTRAP_CONTEXT: &str = r#"You are continuing a live OpenResearch demo session. The following exchange already happened and is authoritative project context.
 
-The user asked you to run nanochat's CPU/Apple-Silicon pipeline end to end, surface validation and evaluation metrics, repair setup issues, and confirm the trained model can answer the capital of France.
+The user asked you to run nanochat's local runs/runcpu.sh pipeline end to end, surface validation and evaluation metrics, repair setup issues, and confirm the trained model can answer the capital of France.
 
-You inspected the repository and prepared the CPU pipeline before launching it: caches were made checkout-local, SFT conversations longer than a row were excluded, all-masked SFT batches were guarded, periodic ChatCORE was disabled for Apple-Silicon memory safety, and the chat CLI was made to re-enter the project environment. You created the CPU baseline experiment and completed one successful run.
+You inspected the repository and prepared the CPU pipeline before launching it: caches were made checkout-local, SFT conversations longer than a row were excluded, all-masked SFT batches were guarded, periodic ChatCORE was disabled to bound memory pressure, and the chat CLI was made to re-enter the project environment. You created the CPU baseline experiment and completed one successful run.
 
 Recorded results: a 6-layer 73.5M-parameter model trained for 5,000 base steps over 81.92M tokens; final training validation BPB 1.165758; base-eval train/validation BPB 1.152185/1.119301; SFT completed 1,500 steps with final validation BPB 0.7389. The final CLI loaded the SFT checkpoint and answered that the capital of France is Paris. The results are saved in cpu-apple-silicon-pipeline-results.md.
 
@@ -104,7 +94,7 @@ Operational note: when the user asks to run one of them, launch it with `orx exp
 
 Continue naturally from this completed state. Do not claim you are rerunning the historical training unless the user asks you to."#;
 
-const RESULT_MARKDOWN: &str = r#"Completed the nanochat CPU / Apple-Silicon pipeline end to end.
+const RESULT_MARKDOWN: &str = r#"Completed the nanochat local pipeline end to end.
 
 - Base training: 5,000 steps, 81.92M tokens, final validation BPB 1.165758
 - Base evaluation: train BPB 1.152185, validation BPB 1.119301
@@ -113,7 +103,7 @@ const RESULT_MARKDOWN: &str = r#"Completed the nanochat CPU / Apple-Silicon pipe
 - Evidence pack: [README](evidence/README.md), structured metrics, checkpoint metadata, tokenizer, inference transcript, and run manifest
 "#;
 
-const REPORT: &str = r#"# nanochat CPU / Apple-Silicon pipeline results
+const REPORT: &str = r#"# nanochat local pipeline results
 
 This bundled demo records a completed local `runs/runcpu.sh` pipeline on Apple Silicon. It is historical evidence included with OpenResearch; onboarding does not rerun training on the new user's machine.
 
@@ -150,6 +140,8 @@ The `evidence/` directory contains the real checkpoint metadata, trained tokeniz
 "#;
 
 const RUN_LOG: &str = include_str!("../../demo/nanochat/run-output.txt");
+/// The leading "n" of nanochat's wordmark, cropped square.
+const PROJECT_ICON: &[u8] = include_bytes!("../../demo/nanochat/icon.png");
 // The log's own timestamps run 10:51:52 -> 14:33:21; the seeded run must span them.
 const RUN_LOG_SPAN_MIN: i64 = 222;
 
@@ -179,6 +171,7 @@ const BOTTLENECK_REPORT: &str =
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DemoSelection {
+    pub profile: Option<String>,
     pub harness: String,
     pub model: Option<String>,
     pub permission_mode: Option<String>,
@@ -393,6 +386,7 @@ fn seed_at(
             newly_created: false,
             selection: stored
                 .map(|session| DemoSelection {
+                    profile: session.profile_id,
                     harness: session.harness,
                     model: session.model,
                     permission_mode: session.permission_mode,
@@ -465,6 +459,10 @@ fn seed_at(
         repo_path: repo.to_string_lossy().into_owned(),
         run_command: Some("bash runs/runcpu.sh".into()),
         paper_id: None,
+        icon: Some(serde_json::json!({ "image": {
+            "type": "image/png",
+            "data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, PROJECT_ICON),
+        } })),
         created_at: ago(seeded_at, 250, 0),
         updated_at: ago(seeded_at, 6, 0),
     };
@@ -474,7 +472,7 @@ fn seed_at(
         parent_experiment_id: None,
         slug: "cpu-apple-silicon-end-to-end-baseline".into(),
         branch_name: BRANCH.into(),
-        title: Some("CPU Apple-Silicon end-to-end baseline".into()),
+        title: Some("Local end-to-end baseline".into()),
         description: Some(
             "Completed a portable CPU/MPS pipeline: 5,000 base steps, base evaluation, 1,500 SFT steps, and a successful Paris chat confirmation. Final base validation BPB was 1.165758 and final SFT validation BPB was 0.7389."
                 .into(),
@@ -497,10 +495,7 @@ fn seed_at(
                 "Train a real 0.8M-parameter nanochat model for 20 steps per arm on bundled text, comparing AdamW LR 0.001 with 0.002 from identical initialization and batches. Saves training/held-out validation loss, an interactive HTML loss chart, and raw metrics. No dataset download or full tokenizer training. Demonstrates early optimization, not coherent generation; results are separate from the recorded 73.5M baseline. First use prepares Python dependencies."
                     .into(),
             ),
-            run_command: format!(
-                "{} && uv run --script scripts/demo_probe.py",
-                probe_uv()
-            ),
+            run_command: format!("{PROBE_UV} && uv run --script scripts/demo_probe.py"),
             agent_status: "idle".into(),
             created_at: ago(seeded_at, 8, 0),
             updated_at: ago(seeded_at, 8, 0),
@@ -548,10 +543,12 @@ fn seed_at(
         chat_session_id: None,
     };
     let session = StoredChatSession {
+        profile_id: selection.profile.clone(),
         id: SESSION_ID.into(),
         project_id: PROJECT_ID.into(),
         harness: selection.harness.clone(),
         native_session_id: None,
+        native_fork_at: None,
         title: Some("Run Nanochat CPU Pipeline End-to-End".into()),
         title_source: Some("generated".into()),
         model: selection.model.clone(),
@@ -582,6 +579,7 @@ fn seed_at(
         parent_id: None,
         base_native_session_id: None,
         result_native_session_id: None,
+        result_native_message_id: None,
         native_harness: None,
     };
     let assistant = StoredChatMessage {
@@ -594,13 +592,16 @@ fn seed_at(
         parent_id: Some(USER_MESSAGE_ID.into()),
         base_native_session_id: None,
         result_native_session_id: None,
+        result_native_message_id: None,
         native_harness: None,
     };
     let figure_session = StoredChatSession {
+        profile_id: selection.profile.clone(),
         id: FIGURE_SESSION_ID.into(),
         project_id: PROJECT_ID.into(),
         harness: selection.harness.clone(),
         native_session_id: None,
+        native_fork_at: None,
         title: Some("Visualize Nanochat Training Results".into()),
         title_source: Some("generated".into()),
         model: selection.model.clone(),
@@ -633,6 +634,7 @@ fn seed_at(
         parent_id: None,
         base_native_session_id: None,
         result_native_session_id: None,
+        result_native_message_id: None,
         native_harness: None,
     };
     let figure_assistant = StoredChatMessage {
@@ -645,13 +647,16 @@ fn seed_at(
         parent_id: Some(FIGURE_USER_MESSAGE_ID.into()),
         base_native_session_id: None,
         result_native_session_id: None,
+        result_native_message_id: None,
         native_harness: None,
     };
     let literature_session = StoredChatSession {
+        profile_id: selection.profile.clone(),
         id: LITERATURE_SESSION_ID.into(),
         project_id: PROJECT_ID.into(),
         harness: selection.harness.clone(),
         native_session_id: None,
+        native_fork_at: None,
         title: Some("Diagnosing Nanochat Training Bottlenecks".into()),
         title_source: Some("generated".into()),
         model: selection.model,
@@ -684,6 +689,7 @@ fn seed_at(
         parent_id: None,
         base_native_session_id: None,
         result_native_session_id: None,
+        result_native_message_id: None,
         native_harness: None,
     };
     let literature_assistant = StoredChatMessage {
@@ -696,6 +702,7 @@ fn seed_at(
         parent_id: Some(LITERATURE_USER_MESSAGE_ID.into()),
         base_native_session_id: None,
         result_native_session_id: None,
+        result_native_message_id: None,
         native_harness: None,
     };
     let worktree = data_root
@@ -832,6 +839,7 @@ fn validate_snapshot(store: &Store, repo: &Path, newly_created: bool) -> Result<
         project,
         newly_created,
         selection: DemoSelection {
+            profile: stored.profile_id.clone(),
             harness: stored.harness.clone(),
             model: stored.model.clone(),
             permission_mode: stored.permission_mode.clone(),
@@ -854,7 +862,7 @@ const SFT_PROGRESS: &[&str] = &[
 fn assistant_parts(harness: &str) -> Vec<WirePart> {
     let mut parts = vec![WirePart::text(
         "intro",
-        "I’ll keep this attached to one CPU / Apple-Silicon baseline, inspect the exact local pipeline, make the portability and SFT safeguards part of the experiment before launch, then stay on the streamed output through tokenizer training, base training and evaluation, SFT, and the final chat check.",
+        "I’ll keep this attached to one local baseline, inspect the exact local pipeline, make the portability and SFT safeguards part of the experiment before launch, then stay on the streamed output through tokenizer training, base training and evaluation, SFT, and the final chat check.",
     )];
     if harness == "opencode" {
         parts.push(tool_part(
@@ -921,7 +929,7 @@ fn assistant_parts(harness: &str) -> Vec<WirePart> {
     ));
     parts.push(WirePart::text(
         "experiment-created",
-        "The baseline is now fixed to one end-to-end command: the CPU/MPS pipeline followed immediately by the one-shot France prompt. I created the CPU / Apple-Silicon end-to-end baseline experiment and I’m launching its single local run now; I’ll keep reading the supervised log and surface every validation checkpoint as it lands.",
+        "The baseline is now fixed to one end-to-end command: the CPU/MPS pipeline followed immediately by the one-shot France prompt. I created the local end-to-end baseline experiment and I’m launching its single local run now; I’ll keep reading the supervised log and surface every validation checkpoint as it lands.",
     ));
     parts.push(tool_part(
         "launch",
@@ -997,7 +1005,7 @@ fn assistant_parts(harness: &str) -> Vec<WirePart> {
     ));
     parts.push(WirePart::text(
         "sft-start",
-        "SFT loaded the clean base weights with a fresh optimizer and reported initial validation BPB **1.0174**. The packing guard is keeping over-capacity conversations out of the 513-token rows, all supervised batches are finite, and periodic ChatCORE is disabled to keep Apple-Silicon unified-memory pressure bounded.",
+        "SFT loaded the clean base weights with a fresh optimizer and reported initial validation BPB **1.0174**. The packing guard is keeping over-capacity conversations out of the 513-token rows, all supervised batches are finite, and periodic ChatCORE is disabled to keep memory pressure on this laptop bounded.",
     ));
     for (index, text) in SFT_PROGRESS.iter().enumerate() {
         parts.push(WirePart::text(format!("sft-progress-{index}"), *text));
@@ -1027,11 +1035,11 @@ fn assistant_parts(harness: &str) -> Vec<WirePart> {
     let (report_tool, report_input) = match harness {
         "claude-code" | "cursor" | "antigravity" => (
             "Bash",
-            json!({ "command": "printf '%s\\n' '# nanochat CPU / Apple-Silicon pipeline results' 'Base validation BPB: 1.165758' 'SFT validation BPB: 0.7389' 'Chat confirmation: Paris' > cpu-apple-silicon-pipeline-results.md" }),
+            json!({ "command": "printf '%s\\n' '# nanochat local pipeline results' 'Base validation BPB: 1.165758' 'SFT validation BPB: 0.7389' 'Chat confirmation: Paris' > cpu-apple-silicon-pipeline-results.md" }),
         ),
         "opencode" => (
             "bash",
-            json!({ "command": "printf '%s\\n' '# nanochat CPU / Apple-Silicon pipeline results' 'Base validation BPB: 1.165758' 'SFT validation BPB: 0.7389' 'Chat confirmation: Paris' > cpu-apple-silicon-pipeline-results.md" }),
+            json!({ "command": "printf '%s\\n' '# nanochat local pipeline results' 'Base validation BPB: 1.165758' 'SFT validation BPB: 0.7389' 'Chat confirmation: Paris' > cpu-apple-silicon-pipeline-results.md" }),
         ),
         _ => (
             edit_name,
@@ -1229,7 +1237,7 @@ fn literature_assistant_parts(harness: &str) -> Vec<WirePart> {
         (
             "inspect-project",
             "git branch -a && git status --short --branch && orx projects",
-            "nanochat\nbaseline branch: main\nexperiment: CPU Apple-Silicon end-to-end baseline",
+            "nanochat\nbaseline branch: main\nexperiment: Local end-to-end baseline",
             "Inspect nanochat project history",
         ),
         (
@@ -1977,6 +1985,7 @@ mod tests {
                 &data,
                 &repo,
                 DemoSelection {
+                    profile: None,
                     harness: harness.into(),
                     model: None,
                     permission_mode: None,
@@ -2020,6 +2029,7 @@ mod tests {
         prepare_origin(&demo_bare_path_in(&data));
         let store = Store::open_at(data.clone()).unwrap();
         let selection = DemoSelection {
+            profile: None,
             harness: "codex".into(),
             model: None,
             permission_mode: None,
@@ -2043,6 +2053,7 @@ mod tests {
             &data,
             &reuse_path,
             DemoSelection {
+                profile: None,
                 harness: "claude-code".into(),
                 ..selection
             },
@@ -2258,6 +2269,7 @@ mod tests {
                 repo_path: root.join("user-nanochat").to_string_lossy().into_owned(),
                 run_command: None,
                 paper_id: None,
+                icon: None,
                 created_at: 1,
                 updated_at: 1,
             })
@@ -2272,6 +2284,7 @@ mod tests {
             &data,
             &repo,
             DemoSelection {
+                profile: None,
                 harness: "codex".into(),
                 model: None,
                 permission_mode: None,
@@ -2337,6 +2350,7 @@ mod tests {
             &data,
             &repo,
             DemoSelection {
+                profile: None,
                 harness: "codex".into(),
                 model: None,
                 permission_mode: None,
@@ -2372,6 +2386,7 @@ mod tests {
             &data,
             &repo,
             DemoSelection {
+                profile: None,
                 harness: "codex".into(),
                 model: None,
                 permission_mode: None,
@@ -2437,6 +2452,7 @@ mod tests {
         let repo = data.join("repos").join(OWNER).join(REPO);
         prepare_origin(&demo_bare_path_in(&data));
         let selection = DemoSelection {
+            profile: None,
             harness: "codex".into(),
             model: None,
             permission_mode: None,

@@ -10,15 +10,6 @@ A project's experiments form a tree. A root is a **baseline**: starting code and
 
 Agents are taught that a run's command and environment are a fixed contract inherited down the tree, and that an experiment whose run answered its question is frozen, so a recorded result always matches its branch (`agent-skills/orx-experiment-tree/`).
 
-## Choosing the run engine
-
-The saved `runEngine` setting chooses who launches new runs; it defaults to off on stable and dev builds. `ORX_RUN_ENGINE=1` or `0` in the `orx up` server's environment overrides it, and any other value is an error. Canary builds always use the engine, ignoring both (`src/config.rs`). `POST /api/v2/runs` and the dashboard's `/api/runs` share one launch path, which reads this on every launch.
-
-- **On:** the engine launches and watches new runs.
-- **Off:** backend launchers and detached `orx supervise` processes do, as in 0.2.x (`src/compute.rs`, `src/local/`, `src/commands/supervise.rs`). The engine still runs, importing their results and wake-ups and recovering engine runs already in flight.
-
-Existing owners stay in place; the setting chooses which path recovers orphaned supervised runs ([Runs from 0.2.x](#runs-from-02x)). Snapshots work the same in both modes. The engine sections describe engine-owned runs.
-
 ## A run is an immutable snapshot
 
 **A backend never sees the project's history.** It gets one archive of the recorded commit, extracted into the run's own directory, and never clones the repository or touches an agent's worktree. Uncommitted edits do not ship.
@@ -44,6 +35,10 @@ Launching returns a **handle**, stored on the run with everything a later proces
 
 A default flavor applies only to its own backend and never leaks onto an explicitly chosen one.
 
+### The price of a run
+
+**A run is priced once, when its job exists.** The engine asks the backend what it charges per minute or hour (`Backend::quote`) and stores the answer on the run; a later price change never rewrites it. An OpenResearch box keeps the price openresearch.sh gave when creating it. A read that fails is retried a few times, then leaves the run unpriced; it never holds up the launch. Spend is the quote times the run's running time, so a running run's grows and is an estimate. Hugging Face Jobs, Modal and OpenResearch boxes are priced, and a run of theirs without a price shows that its cost is unavailable. Vercel and Tinker have no per-run price orx can read, and the user's own machines and clusters cost nothing orx can see; their runs show no cost.
+
 ## The engine
 
 **One engine per data directory, inside `orx up`.** The engine lock keeps it single ([storage](storage.md)). The dashboard, the desktop window, the CLI and agents are clients; none of them writes run state.
@@ -57,6 +52,8 @@ A default flavor applies only to its own backend and never leaks onto an explici
 
 **The process that runs a job is never the engine.** A wrapper owns its payload and records the outcome in receipts on its machine; hosted services and rentals hold that state themselves. `orx up` may restart, sleep or update; it reconnects, reads what the job left and catches up. A headless `orx up` exits after a sustained idle period: no unfinished run, undelivered notice, active chat turn or client ([desktop](desktop.md) for the window).
 
+A local run keeps its machine from idle sleep until its exit receipt, as a playing video does; closing the lid still sleeps it. Its wrapper holds the operating system's idle-sleep prevention, which dies with the wrapper. Windows runs have no wrapper, so there `orx up` holds one while any local run is unfinished.
+
 [FROZEN.md](../crates/orx-host-proto/FROZEN.md) is the contract for host disk, the payload's environment, stored run state, API v2 and SSE, for the life of every queued job and lingering cleanup. Read it before changing any of them.
 
 ### Phase and contact
@@ -66,6 +63,8 @@ A run has two independent fields.
 - **Queue detail** explains a backend wait without changing phase or contact. It is stored as optional `queueDetail` in the run descriptor, reaches the dashboard and CLI, and clears when the run starts, ends or loses contact.
 - **Phase** is the lifecycle: submitting, starting, running, done, failed, cancelled or lost.
 - **Contact** is how fresh that knowledge is: live, unreachable, needs auth (SSH Connect or provider credentials), unreconciled (an outcome the engine cannot establish) or stopping (a cancelled run with processes left).
+
+A run that has not started also keeps the backend's latest word on why it waits, such as a Slurm pending reason or a pod no node can fit. It is provider text, shown beside the status, written only when it changes and dropped once the run runs or ends.
 
 The invariants:
 
@@ -82,7 +81,9 @@ A fence is written before the backend is called, and any launcher subprocess rec
 - handle → starting
 - rejected → failed
 - never sent → stay submitting, with that contact; relaunch next tick
-- reply lost → recover: found → starting; absent → relaunch once, then back off with the error shown; unknown → unreconciled, retried with backoff
+- reply lost → recover: found → starting; absent → relaunch once, then back off with the error shown; unknown → unreconciled, retried with backoff; the backend unreachable → stay submitting, with that contact
+
+An accepted cancel or Abandon cuts the backoff short: recovery decides at once, with the cancel in hand.
 
 **A launch is idempotent in the run ID.** On a host, the first launch intent is published exclusively; an identical retry adopts it, a different one conflicts, and the wrapper refuses a run that already started, so a payload never runs twice. API backends find a lost launch by the run ID where the provider allows it; elsewhere the run stays unreconciled until the user abandons it.
 
@@ -90,11 +91,12 @@ A fence is written before the backend is called, and any launcher subprocess rec
 
 Cancelling records the intent and reason on the run. Before the fence it is immediate; after it, the backend's stop proof decides the result, and a death seen while that verdict is pending does not end the run. After an accepted cancel, a job proven gone ends cancelled, and so does a nonzero exit or signal on a hosted service, keeping the reported exit code.
 
-The engine delivers the stop once per connection, whenever the machine is reachable; the run's wrapper performs it, so verification never races its own exit ([remote](remote.md)). A run completes when its direct child exits; processes left behind are listed, raise one notice and stop only on request.
+The engine delivers the stop once per connection, whenever the machine is reachable, and again whenever the run loses contact; the run's wrapper performs it, so verification never races its own exit ([remote](remote.md)). A run completes when its direct child exits; processes left behind are listed, raise one notice and stop only on request.
 
 | State | Meaning |
 | --- | --- |
 | cancelling, while submitting, unreachable or needs auth | The cancel has not reached the machine. |
+| cancelling, with a cancel error | The backend refuses the stop; it is retried every round and shown with its error. |
 | cancelling, otherwise | The stop is running. |
 | cancelled, live | The stop finished and a complete scan found nothing left. |
 | cancelled, stopping | Survivors outlived the stop; the wrapper keeps killing them. |
@@ -102,11 +104,11 @@ The engine delivers the stop once per connection, whenever the machine is reacha
 
 `ui/src/runDisplay.ts` builds the dashboard's labels from these fields.
 
-**Abandon** ends an unfinished run with no live contact as lost and sends the terminal notice. The kill stays pending: a terminal run without live contact is a **tombstone**, still watched, whose stop is delivered whenever the job or host returns, and which settles on the next proof that nothing is left.
+**Abandon** ends an unfinished run with no live contact, or whose stop its backend keeps refusing, as lost and sends the terminal notice. The kill stays pending: a terminal run without live contact is a **tombstone**, still watched, whose stop is delivered whenever the job or host returns, and which settles on the next proof that nothing is left.
 
 ### Logs
 
-A run's log is written on the machine that ran it. The engine pages it from the host by byte range and file identity; a changed identity resets the reader rather than splicing different bytes. API backends offer no random access, so their logs stream into a local spool.
+A run's log is written on the machine that ran it. The engine pages it from the host by byte range and file identity; a changed identity resets the reader rather than splicing different bytes. API backends offer no random access, so a running job's log streams into a local spool whether or not anyone is reading it. A stream that goes quiet is reopened, and resumes from a position that holds however the provider rechunks or cuts short its replay: a timestamp, a log entry, a byte offset. The spool outlives `orx up`: a restart continues it from that position, saved beside it after the bytes it covers, or from the spool's length when the provider replays the whole log. A spool without that file beside it came from an older orx and is rebuilt from the provider.
 
 When a run ends, keeping its log becomes an obligation recorded in the same transaction as the terminal phase (`src/engine/runtime.rs`):
 
@@ -130,10 +132,7 @@ Agents are taught to end their turn after launching: a blocking wait would die w
 
 ### Runs from 0.2.x
 
-A run under a detached `orx supervise` stays with that supervisor until it ends; the engine only reads it (`src/engine/legacy.rs`). Per-run supervisor locks decide who may write ([storage](storage.md)). Orphans depend on the setting:
-
-- **Off:** `orx up` re-spawns missing supervisors at startup and periodically.
-- **On:** only the engine adopts them, once the run has gone quiet for a settle period and its locks are free. Adopted runs keep their original descriptors and stop semantics.
+orx 0.2 and later builds with the engine switched off launched runs under a detached `orx supervise`; orx no longer launches that way. Such a run stays with its supervisor until it ends; the engine only reads it (`src/engine/legacy.rs`). Per-run supervisor locks decide who may write ([storage](storage.md)). Once a run has gone quiet for a settle period and its locks are free, the engine adopts it, keeping its original descriptor and stop semantics. A launch that died before recording its job takes the handle from its recovery file, or fails as its supervisor would have failed it.
 
 The engine imports each 0.2.x wake-up once, including ones accepted after a downgrade or while it runs.
 
@@ -143,7 +142,7 @@ A run's results are what its command prints to the run log and what it logs to T
 
 ## Managed rentals
 
-A run on an OpenResearch box rents a machine through openresearch.sh for that run alone. **The laptop sleeping, losing its network or quitting never decides when billing stops.** With the engine on, a box is an `orx-host` root like an SSH host, staged through the same transport, with the same receipts and log collection ([remote](remote.md)); billing duty is the one addition.
+A run on an OpenResearch box rents a machine through openresearch.sh for that run alone. **The laptop sleeping, losing its network or quitting never decides when billing stops.** A box is an `orx-host` root like an SSH host, staged through the same transport, with the same receipts and log collection ([remote](remote.md)); billing duty is the one addition.
 
 1. orx creates the box with a rental lease and stages source over SSH. While provisioning and staging, the laptop heartbeats the rental, within a bounded preparation budget.
 2. An owner-only file on the box holds a capability scoped to that rental; it never appears in API responses.
@@ -154,7 +153,8 @@ The rules around it (`crates/orx-host/src/rental.rs`, `src/engine/adapters/openr
 
 - **An uncertain start is never repeated;** the engine inspects the run's intent on the box instead.
 - **Cancel and Abandon release the rental** from the laptop too, so stopping billing never waits on the box. A successful release is stop proof: Cancel ends cancelled, Abandon ends lost with no kill pending.
-- **A rejected key cancels the run.** After a box reachable during this run rejects its SSH key continuously for a grace period, the engine issues Cancel if the companion API shows the rental active. Connect or live contact resets the clock; network outages never qualify. The timer only requests cancellation: release proof makes the run terminal, and an already released rental settles as lost.
+- **A box that never comes online fails the run.** A box the service reports failed, offline or dead, or deletes before it is online, ends the run failed with the service's reason. One still provisioning when the preparation budget runs out is released, and the release ends the run failed.
+- **A rejected key ends the run.** A box the engine never reached during the run launched nothing, so once its key refusals open the breaker the engine releases the rental and fails the run, naming the cause: the box lacks the registered key, no registered key is on this computer, or the local key needs a passphrase no agent supplies. `orx exp run` refuses that last one before creating a box, and only warns on macOS, where the keychain may supply it. After a box reachable during this run rejects its SSH key continuously for a grace period, the engine issues Cancel if the companion API shows the rental active. Connect or live contact resets the clock; network outages never qualify. The timer only requests cancellation: release proof makes the run terminal, and an already released rental settles as lost.
 - **No research data crosses this protocol.** Logs, commands, source, experiment IDs, outcomes and artifacts never reach the billing service.
-- **Collection is bounded by the box's life.** Once release is verified, the local copy is the kept log, even if empty. A run whose final outcome went with the machine ends as lost.
-- **Older rentals keep their supervisor.** A run already under a detached `orx rental-supervise` stays a `Handle::Legacy` run the engine only inspects and collects; with the engine off, rentals still launch that way.
+- **Collection is bounded by the box's life.** Once release is verified, the local copy is the kept log, even if empty. A run whose final outcome went with the machine ends as lost, with the service's reason when it reports the box failed or dead.
+- **Rentals from 0.2 stay `Handle::Legacy`.** The engine inspects their run directory on the box and collects their logs; it never launches on them.

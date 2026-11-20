@@ -10,14 +10,9 @@
 
 use std::time::Duration;
 
-use crate::client::{delete_sandbox, get_sandbox, Sandbox, SandboxTarget};
+use crate::client::{current_user, delete_sandbox, list_orgs, SandboxTarget};
 use crate::config::Credentials;
 use crate::error::{anyhow, Result};
-
-/// The API and CLI share the same five-minute provisioning deadline.
-pub const PROVISION_DEADLINE: Duration = Duration::from_secs(5 * 60);
-
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The remote run dir for a run, relative to `$HOME` (shared convention with
 /// the ssh backend; derived, not stored in the descriptor).
@@ -77,131 +72,48 @@ pub fn wrap_with_timeout(script: &str, timeout_secs: u64) -> String {
     )
 }
 
-/// What `wait_online` resolved to when it didn't error.
-pub enum WaitOutcome {
-    /// The box is online with its SSH endpoint populated.
-    Online(Box<Sandbox>),
-    /// The API retained a terminal provisioning failure.
-    Failed(String),
-    /// The local wait ended; the API still owns failure recording and cleanup.
-    TimedOut(String),
-    /// The caller's cancel check fired first; the box may still be booting.
-    Cancelled,
-}
-
-fn retained_failure_reason(
-    status: &str,
-    code: Option<&str>,
-    message: Option<&str>,
-) -> Option<String> {
-    (status == "failed").then(|| {
-        format!(
-            "{}: {}",
-            code.unwrap_or("provider_error"),
-            message.unwrap_or("The provider could not provision this instance.")
-        )
-    })
-}
-
 pub(crate) fn is_not_found_error(message: &str) -> bool {
     message.contains("(404 ")
 }
 
-/// Poll the box until it is online (SSH endpoint known), the deadline passes,
-/// or `cancel_check` fires. `offline`/`dead` mid-provision is a hard error —
-/// the box will never come up. Transient API errors are retried until the
-/// deadline. The API owns cleanup for failed and timed-out provisioning.
-pub async fn wait_online(
-    creds: &Credentials,
-    sandbox_id: &str,
-    deadline: Duration,
-    mut cancel_check: impl FnMut() -> bool,
-) -> Result<WaitOutcome> {
-    let started = std::time::Instant::now();
-    loop {
-        if cancel_check() {
-            return Ok(WaitOutcome::Cancelled);
-        }
-        let deadline_reached = started.elapsed() > deadline;
-        let last_err = match get_sandbox(creds, sandbox_id).await {
-            Ok(envelope) => {
-                let sandbox = envelope.sandbox;
-                if let Some(reason) = retained_failure_reason(
-                    &sandbox.status,
-                    sandbox.failure_code.as_deref(),
-                    sandbox.failure_message.as_deref(),
-                ) {
-                    return Ok(WaitOutcome::Failed(reason));
-                }
-                match sandbox.status.as_str() {
-                    "online"
-                        if sandbox.ssh_hostname.is_some()
-                            && sandbox.ssh_port.is_some()
-                            && sandbox.ssh_username.is_some() =>
-                    {
-                        return Ok(WaitOutcome::Online(Box::new(sandbox)));
-                    }
-                    "offline" | "dead" => {
-                        return Err(anyhow!(
-                            "Box {sandbox_id} went {} while provisioning{}.",
-                            sandbox.status,
-                            sandbox
-                                .provision_warnings
-                                .map(|w| format!(": {w}"))
-                                .unwrap_or_default()
-                        ));
-                    }
-                    _ => {}
-                }
-                None
-            }
-            Err(err) if is_not_found_error(&err.to_string()) => {
-                return Ok(WaitOutcome::Failed(format!(
-                    "Box {sandbox_id} was not found; the server has no retained provisioning result."
-                )));
-            }
-            Err(err) => Some(err.to_string()),
-        };
-        if deadline_reached {
-            return Ok(WaitOutcome::TimedOut(format!(
-                "Box {sandbox_id} did not come online within {}m{}.",
-                deadline.as_secs() / 60,
-                last_err
-                    .map(|e| format!(" (last API error: {e})"))
-                    .unwrap_or_default()
-            )));
-        }
-        tokio::time::sleep(crate::config::paced(POLL_INTERVAL)).await;
+/// OpenResearch hides a box from an account outside its organization, so a 404 for it says
+/// nothing about whether it still bills.
+#[derive(Debug)]
+pub struct OtherAccount(pub String);
+
+impl std::fmt::Display for OtherAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
-/// Whether the run dir on the box was already launched (pid or exit_code
-/// present). Distinguishes a supervisor restart mid-run (reattach, don't
-/// relaunch) from one that died between recording the endpoint and launching.
-pub async fn launched(target: &super::ssh::SshTarget, run_id: &str) -> Result<bool> {
-    let dir = run_dir(run_id);
-    let out = super::ssh::ssh_run(
-        target,
-        &format!(
-            "d=\"$HOME/{dir}\"; \
-             if [ -e \"$d/pid\" ] || [ -e \"$d/exit_code\" ] || [ -e \"$d/launch_started\" ]; then echo STARTED; else echo FRESH; fi"
-        ),
-        None,
-    )
-    .await?;
-    Ok(out.contains("STARTED"))
-}
+impl std::error::Error for OtherAccount {}
 
-/// Whether the API positively reports the box as deleted; an unreachable API is not proof.
-pub async fn box_deleted(creds: &Credentials, sandbox_id: &str) -> bool {
-    let lookup = tokio::time::timeout(Duration::from_secs(15), get_sandbox(creds, sandbox_id));
-    matches!(lookup.await, Ok(Err(err)) if is_not_found_error(&err.to_string()))
+/// After a 404 for box `sandbox_id` of organization `org`: Ok when the signed-in account
+/// belongs to `org`, so the box is gone; `OtherAccount` when it doesn't.
+pub(crate) async fn confirm_gone(creds: &Credentials, org: &str, sandbox_id: &str) -> Result<()> {
+    if list_orgs(creds)
+        .await?
+        .orgs
+        .iter()
+        .any(|member| member.id == org)
+    {
+        return Ok(());
+    }
+    let account = current_user(creds)
+        .await
+        .map_or_else(|_| "signed in now".into(), |me| me.user.email);
+    Err(OtherAccount(format!(
+        "OpenResearch can't show box {sandbox_id} to the account {account}, which isn't in organization {org} that launched it, so orx can't tell whether it still runs. Sign in with an account in that organization (`orx login`)."
+    ))
+    .into())
 }
 
 /// Delete the box, retrying transient failures. A 404 is success — the box is
 /// already gone (dashboard delete, billing sweeper) — which makes teardown
-/// idempotent across supervisor restarts.
-pub async fn teardown(creds: &Credentials, sandbox_id: &str) -> Result<()> {
+/// idempotent across supervisor restarts, once the signed-in account can see
+/// `org`'s boxes.
+pub async fn teardown(creds: &Credentials, org: &str, sandbox_id: &str) -> Result<()> {
     let mut last = None;
     for backoff_secs in [0u64, 2, 5, 10] {
         if backoff_secs > 0 {
@@ -209,7 +121,9 @@ pub async fn teardown(creds: &Credentials, sandbox_id: &str) -> Result<()> {
         }
         match delete_sandbox(creds, sandbox_id).await {
             Ok(()) => return Ok(()),
-            Err(err) if err.to_string().contains("(404 ") => return Ok(()),
+            Err(err) if is_not_found_error(&err.to_string()) => {
+                return confirm_gone(creds, org, sandbox_id).await
+            }
             Err(err) => last = Some(err),
         }
     }
@@ -316,50 +230,5 @@ mod tests {
     #[test]
     fn run_dir_matches_ssh_convention() {
         assert_eq!(run_dir("abc"), ".orx/runs/abc");
-    }
-
-    #[test]
-    fn provisioning_deadline_is_five_minutes() {
-        assert_eq!(PROVISION_DEADLINE, Duration::from_secs(300));
-    }
-
-    #[tokio::test]
-    async fn only_a_404_reports_the_box_deleted() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let creds = Credentials {
-            api_url: format!("http://{}", listener.local_addr().unwrap()),
-            token: "token".into(),
-        };
-        let server = tokio::spawn(async move {
-            for status in ["404 Not Found", "503 Service Unavailable", "403 Forbidden"] {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let _ = stream.read(&mut [0u8; 4096]).await.unwrap();
-                let response =
-                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-                stream.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-        assert!(box_deleted(&creds, "sb").await);
-        assert!(!box_deleted(&creds, "sb").await);
-        assert!(!box_deleted(&creds, "sb").await);
-        server.await.unwrap();
-        let unreachable = Credentials {
-            api_url: "http://127.0.0.1:1".into(),
-            token: "token".into(),
-        };
-        assert!(!box_deleted(&unreachable, "sb").await);
-    }
-
-    #[test]
-    fn terminal_provisioning_results_are_classified() {
-        assert_eq!(
-            retained_failure_reason("failed", Some("capacity_unavailable"), Some("No capacity.")),
-            Some("capacity_unavailable: No capacity.".to_owned())
-        );
-        assert!(retained_failure_reason("provisioning", None, None).is_none());
-        assert!(is_not_found_error(
-            "Request to /sandboxes/sb failed (404 Not Found)"
-        ));
     }
 }

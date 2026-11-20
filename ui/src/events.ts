@@ -32,6 +32,7 @@ export type ChatEvent =
   | { type: "sessionDeleted"; sessionId: string }
   | { type: "message"; sessionId: string; message: ChatMessage }
   | { type: "busy"; sessionId: string; busy: boolean }
+  | { type: "background"; sessionId: string }
   | { type: "usage"; sessionId: string; usage: ContextUsage }
   | { type: "queued"; sessionId: string; items: QueuedMessage[] }
   /** A different fork of a turn is now the branch on screen. */
@@ -86,6 +87,8 @@ export interface OrxEventHandlers {
   onReconnect?: () => void;
   /** The project's artifacts changed on disk — refetch the listing. */
   onArtifacts?: (projectId: string) => void;
+  /** A re-read of the machine's plans finished. */
+  onUsageChanged?: () => void;
 }
 
 type EntityObservers = Pick<OrxEventHandlers, "onRun" | "onRunLog" | "onReconnect">;
@@ -113,6 +116,28 @@ export function createEvents(client: WorkspaceClient) {
     listeners.add(fn);
     return () => {
       listeners.delete(fn);
+    };
+  }
+
+  // Pending until taken, since a hidden machine's app subscribes only once it is shown again.
+  let computeViewPending = false;
+  const computeViewListeners = new Set<() => void>();
+
+  function requestComputeView() {
+    computeViewPending = true;
+    computeViewListeners.forEach((fn) => fn());
+  }
+
+  function takeComputeView(): boolean {
+    const pending = computeViewPending;
+    computeViewPending = false;
+    return pending;
+  }
+
+  function onComputeViewRequest(fn: () => void): () => void {
+    computeViewListeners.add(fn);
+    return () => {
+      computeViewListeners.delete(fn);
     };
   }
 
@@ -300,10 +325,10 @@ export function createEvents(client: WorkspaceClient) {
           offlineTimer = undefined;
           setConnected(true);
           if (needsRepair || hasOpened.current) {
+            ref.current.onReconnect?.();
             emitChat({ type: "reconnected" });
             emitProjectActivityEvent();
             if (needsRepair) emitHarnessAuth({ harness: "*", authState: "unknown" });
-            ref.current.onReconnect?.();
           }
           hasOpened.current = true;
           // Every open after this one follows a drop by definition.
@@ -317,9 +342,9 @@ export function createEvents(client: WorkspaceClient) {
           }
         };
         es.addEventListener("resync.required", () => {
+          ref.current.onReconnect?.();
           emitChat({ type: "reconnected" });
           emitProjectActivityEvent();
-          ref.current.onReconnect?.();
         });
         es.addEventListener("run.updated", (e) => {
           const d = parse<{ run: Run }>(e as MessageEvent);
@@ -386,6 +411,10 @@ export function createEvents(client: WorkspaceClient) {
             emitChat({ type: "busy", sessionId: d.sessionId, busy: d.busy });
           }
         });
+        es.addEventListener("chat.background", (e) => {
+          const d = parse<{ sessionId: string }>(e as MessageEvent);
+          if (d?.sessionId) emitChat({ type: "background", sessionId: d.sessionId });
+        });
         es.addEventListener("chat.usage", (e) => {
           const d = parse<{ sessionId: string; usage: ContextUsage }>(e as MessageEvent);
           if (d?.sessionId && d.usage) emitChat({ type: "usage", sessionId: d.sessionId, usage: d.usage });
@@ -404,6 +433,7 @@ export function createEvents(client: WorkspaceClient) {
           if (d?.harness && d.authState) emitHarnessAuth(d);
         });
         es.addEventListener("harness.catalog", () => emitHarnessCatalog());
+        es.addEventListener("usage.changed", () => ref.current.onUsageChanged?.());
         es.addEventListener("datadir.move.progress", (e) => {
           const d = parse<{ phase: string; copiedBytes: number; totalBytes: number }>(
             e as MessageEvent,
@@ -465,6 +495,9 @@ export function createEvents(client: WorkspaceClient) {
     pendingHostConnect,
     takeHostConnect,
     onHostConnectRequest,
+    requestComputeView,
+    takeComputeView,
+    onComputeViewRequest,
     onEngineHost,
     onRunLog,
     onChatEvent,

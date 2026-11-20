@@ -18,6 +18,12 @@ struct Fake {
     scripted_pages: Mutex<VecDeque<LogPage>>,
     identities: Mutex<Vec<Option<FileIdent>>>,
     launch_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+    /// A stop the backend never answers.
+    cancel_hangs: AtomicBool,
+    /// A stop the backend refuses each time.
+    cancel_refused: AtomicBool,
+    cancel_entered: tokio::sync::Notify,
+    cancels: AtomicUsize,
     reads: AtomicUsize,
     follows: Arc<AtomicUsize>,
     /// Launch admissions currently held.
@@ -46,6 +52,16 @@ impl Backend for Fake {
         vec![]
     }
     async fn cancel(&self, _: &WatchedRun) -> CancelOutcome {
+        self.cancel_entered.notify_one();
+        self.cancels.fetch_add(1, Ordering::SeqCst);
+        if self.cancel_hangs.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        if self.cancel_refused.load(Ordering::SeqCst) {
+            return CancelOutcome::Undelivered {
+                detail: "refused by the provider".into(),
+            };
+        }
         CancelOutcome::Pending
     }
     async fn read_log(
@@ -107,7 +123,7 @@ impl Commands for Services {
             chat_session_id: None,
             spec_digest: "digest",
             launch: &LaunchSpec {
-                kind: "local".into(),
+                kind: "local_job".into(),
                 target: None,
                 options: json!({}),
             },
@@ -197,24 +213,6 @@ async fn completion(events: &mut (impl Stream<Item = Result<Value>> + Unpin)) ->
     panic!("event stream ended before completion")
 }
 
-fn run_with_engine(test: &str) -> bool {
-    if std::env::var("ORX_RUN_ENGINE").as_deref() == Ok("1") {
-        return false;
-    }
-    let output = crate::process::command(std::env::current_exe().unwrap())
-        .env("ORX_RUN_ENGINE", "1")
-        .args(["--exact", test, "--nocapture"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    true
-}
-
 struct Fixture {
     api: Arc<Api>,
     backend: Arc<Fake>,
@@ -276,6 +274,11 @@ impl Fixture {
                 engine.clone(),
                 Arc::new(Services(backend.clone(), engine, data_dir.clone())),
                 admit,
+                Arc::new(crate::local::chat::ChatHost::new(
+                    Arc::new(crate::local::opencode::AgentHost::new(None)),
+                    Arc::new(crate::local::codex::CodexHost::new()),
+                    Arc::new(crate::local::claude::ClaudeHost::new()),
+                )),
                 data_dir,
             )
             .unwrap(),
@@ -696,11 +699,11 @@ async fn idle_requires_ten_uninterrupted_minutes_and_all_blockers_clear() {
     let _serial = crate::commands::up::ACTIVE_TEST_LOCK.lock().await;
     let f = Fixture::new().await;
     let mut idle = Idle::default();
-    assert!(!idle.check(&f.api, Duration::ZERO).unwrap());
-    assert!(idle.check(&f.api, Duration::from_secs(600)).unwrap());
+    assert!(!idle.check(&f.api, Duration::ZERO).await.unwrap());
+    assert!(idle.check(&f.api, Duration::from_secs(600)).await.unwrap());
     f.insert("run", "exp", "project", "running");
-    assert!(f.api.store().engine_runs_block_idle().unwrap());
-    assert!(!idle.check(&f.api, Duration::from_secs(601)).unwrap());
+    assert_eq!(f.api.pending_work().await.unwrap().runs.len(), 1);
+    assert!(!idle.check(&f.api, Duration::from_secs(601)).await.unwrap());
     f.api
         .store()
         .set_engine_phase("run", "running", "lost", Some(1), None, None)
@@ -715,25 +718,33 @@ async fn idle_requires_ten_uninterrupted_minutes_and_all_blockers_clear() {
             },
         )
         .unwrap();
-    assert!(!f.api.store().engine_runs_block_idle().unwrap());
-    assert!(!idle.check(&f.api, Duration::from_secs(1201)).unwrap());
+    assert_eq!(f.api.pending_work().await.unwrap().runs.len(), 0);
+    assert!(!idle.check(&f.api, Duration::from_secs(1201)).await.unwrap());
     f.api.store().queue_log_collection("run").unwrap();
-    assert!(idle.check(&f.api, Duration::from_secs(1801)).unwrap());
+    assert!(idle.check(&f.api, Duration::from_secs(1801)).await.unwrap());
     f.api
         .store()
         .set_run_contact("run", &Contact::Live)
         .unwrap();
     let connection = rusqlite::Connection::open(f.api.data_dir.join("orx.db")).unwrap();
     connection.execute("INSERT INTO run_notices(run_id, chat_session_id, kind, dedupe, body, created_at) VALUES ('run','chat','attention','one','body',1)", []).unwrap();
-    assert!(!f.api.store().engine_runs_block_idle().unwrap());
-    assert!(!idle.check(&f.api, Duration::from_secs(1801)).unwrap());
+    assert_eq!(f.api.pending_work().await.unwrap().runs.len(), 1);
+    assert!(!idle.check(&f.api, Duration::from_secs(1801)).await.unwrap());
     connection
         .execute("UPDATE run_notices SET delivered_at=1", [])
         .unwrap();
-    connection.execute("INSERT INTO chat_turns(id,session_id,assistant_message_id,client_turn_id,request_hash,prepared_input,settings_json,state,delivery_state,created_at,updated_at) VALUES ('turn','chat','assistant','client','hash','input','{}','running','pending',1,1)", []).unwrap();
-    assert!(!f.api.store().engine_runs_block_idle().unwrap());
-    assert!(!idle.check(&f.api, Duration::from_secs(2401)).unwrap());
-    connection.execute("DELETE FROM chat_turns", []).unwrap();
+    let chat = format!("chat-{}", uuid::Uuid::new_v4());
+    connection.execute("INSERT INTO chat_sessions(id,project_id,harness,created_at,updated_at) VALUES (?1,'project','codex',1,1)", [&chat]).unwrap();
+    let turn = crate::local::chat::TurnGuard::claim(&f.api.chat, &chat, None)
+        .await
+        .unwrap();
+    let pending = f.api.pending_work().await.unwrap();
+    assert_eq!((pending.agents.len(), pending.runs.len()), (1, 0));
+    assert!(!idle.check(&f.api, Duration::from_secs(2401)).await.unwrap());
+    drop(turn);
+    while !f.api.chat.busy_sessions().await.is_empty() {
+        tokio::task::yield_now().await;
+    }
     let events = f
         .client
         .events(&Filter {
@@ -744,8 +755,8 @@ async fn idle_requires_ten_uninterrupted_minutes_and_all_blockers_clear() {
         .await
         .unwrap();
     assert_eq!(f.backend.follows.load(Ordering::SeqCst), 1);
-    assert!(!f.api.store().engine_runs_block_idle().unwrap());
-    assert!(!idle.check(&f.api, Duration::from_secs(3001)).unwrap());
+    assert!(f.api.pending_work().await.unwrap().is_empty());
+    assert!(!idle.check(&f.api, Duration::from_secs(3001)).await.unwrap());
     drop(events);
     f.task.abort();
     tokio::task::yield_now().await;
@@ -754,13 +765,97 @@ async fn idle_requires_ten_uninterrupted_minutes_and_all_blockers_clear() {
 }
 
 #[tokio::test]
+async fn a_force_quit_stops_runs_that_need_the_app_even_those_launched_while_a_backend_stays_silent(
+) {
+    let _serial = crate::commands::up::ACTIVE_TEST_LOCK.lock().await;
+    let f = Fixture::new().await;
+    let needs_app = |run: &str| {
+        let connection = rusqlite::Connection::open(f.api.data_dir.join("orx.db")).unwrap();
+        connection
+            .execute(
+                r#"UPDATE runs SET backend_json='{"kind":"engine","handle":{"type":"Legacy","descriptor":{"kind":"local_job"}}}' WHERE id=?1"#,
+                [run],
+            )
+            .unwrap();
+    };
+    f.insert("local", "exp", "project", "running");
+    needs_app("local");
+    f.insert("remote", "exp", "project", "running");
+    let cancelling = |run: &str| {
+        f.api
+            .store()
+            .engine_run_state(run)
+            .unwrap()
+            .is_some_and(|state| state.cancel_accepted_at.is_some())
+    };
+
+    f.backend.cancel_hangs.store(true, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let launch_late = async {
+        f.backend.cancel_entered.notified().await;
+        f.insert("late", "exp", "project", "running");
+        needs_app("late");
+    };
+    tokio::join!(f.api.force_stop_runs(Duration::from_secs(2)), launch_late);
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(cancelling("local"));
+    assert!(cancelling("late"));
+    assert!(!cancelling("remote"));
+}
+
+#[tokio::test]
+async fn a_force_quit_waits_for_a_launching_run_to_answer_its_stop() {
+    use clap::Parser;
+    let _serial = crate::commands::up::ACTIVE_TEST_LOCK.lock().await;
+    let f = Fixture::new().await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *f.backend.launch_gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+    let cli =
+        crate::Cli::try_parse_from(["orx", "exp", "run", "exp", "--backend", "local"]).unwrap();
+    let Some(crate::Command::Exp(crate::ExpArgs {
+        command: crate::ExpCommand::Run(args),
+    })) = cli.command
+    else {
+        panic!("run command")
+    };
+    let api = f.api.clone();
+    let launch = tokio::spawn(async move { api.launch(*args).await });
+    entered.notified().await;
+
+    let (api, backend) = (f.api.clone(), f.backend.clone());
+    let wait = Duration::from_secs(1);
+    let stopping = tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        api.force_stop_runs(wait).await;
+        (started.elapsed(), backend.cancels.load(Ordering::SeqCst))
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while f
+            .api
+            .store()
+            .engine_run_state("run")
+            .unwrap()
+            .is_none_or(|state| state.cancel_accepted_at.is_none())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    f.backend.cancel_hangs.store(true, Ordering::SeqCst);
+    release.notify_one();
+    let (elapsed, cancels) = stopping.await.unwrap();
+    assert!(cancels > 0);
+    assert!(
+        elapsed >= wait,
+        "returned after {elapsed:?} with the stop unanswered"
+    );
+    launch.abort();
+}
+
+#[tokio::test]
 async fn cli_launch_and_cancel_use_the_server_and_kept_pages_span_file_boundaries() {
-    if run_with_engine(concat!(
-        module_path!(),
-        "::cli_launch_and_cancel_use_the_server_and_kept_pages_span_file_boundaries"
-    )) {
-        return;
-    }
     use clap::Parser;
     let f = Fixture::new().await;
     let cli =
@@ -889,12 +984,6 @@ async fn log_feed_is_refcounted_and_pushes_without_a_cli_poll() {
 
 #[tokio::test]
 async fn v2_launches_are_host_checked_admitted_and_keep_a_run_submission_active() {
-    if run_with_engine(concat!(
-        module_path!(),
-        "::v2_launches_are_host_checked_admitted_and_keep_a_run_submission_active"
-    )) {
-        return;
-    }
     use clap::Parser;
     let _guard = crate::commands::up::ACTIVE_TEST_LOCK.lock().await;
     let f = Fixture::new().await;
@@ -986,16 +1075,16 @@ async fn terminal_nonlive_contacts_do_not_block_idle_exit() {
     ] {
         let mut idle = Idle::default();
         f.api.store().set_run_contact("run", &contact).unwrap();
-        assert!(!idle.check(&f.api, Duration::ZERO).unwrap());
-        assert!(idle.check(&f.api, Duration::from_secs(601)).unwrap());
+        assert!(!idle.check(&f.api, Duration::ZERO).await.unwrap());
+        assert!(idle.check(&f.api, Duration::from_secs(601)).await.unwrap());
     }
     f.api
         .store()
         .set_run_contact("run", &Contact::Live)
         .unwrap();
     let mut idle = Idle::default();
-    assert!(!idle.check(&f.api, Duration::ZERO).unwrap());
-    assert!(idle.check(&f.api, Duration::from_secs(600)).unwrap());
+    assert!(!idle.check(&f.api, Duration::ZERO).await.unwrap());
+    assert!(idle.check(&f.api, Duration::from_secs(600)).await.unwrap());
 }
 
 #[tokio::test]
@@ -1034,6 +1123,46 @@ async fn experiment_wait_excludes_older_completed_runs_after_subscribing() {
         )
         .unwrap();
     assert_eq!(completion(&mut events).await["id"], "run");
+}
+
+#[tokio::test]
+async fn experiment_wait_follows_new_launches_and_excludes_older_active_runs() {
+    let f = Fixture::new().await;
+    f.insert("old", "exp", "project", "running");
+    f.insert("run", "exp", "project", "running");
+    let connection = rusqlite::Connection::open(f.api.data_dir.join("orx.db")).unwrap();
+    connection
+        .execute("UPDATE runs SET created_at=2 WHERE id='run'", [])
+        .unwrap();
+    let mut events = f
+        .client
+        .events(&Filter {
+            experiment: Some("exp".into()),
+            wait: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    for id in ["old", "run", "new"] {
+        if id == "new" {
+            f.insert("new", "exp", "project", "running");
+            connection
+                .execute("UPDATE runs SET created_at=3 WHERE id='new'", [])
+                .unwrap();
+        }
+        f.api
+            .engine
+            .observe(
+                id,
+                Observation::Exited {
+                    finished_at: None,
+                    code: Some(0),
+                    signal: None,
+                },
+            )
+            .unwrap();
+    }
+    assert_eq!(completion(&mut events).await["id"], "new");
 }
 
 #[tokio::test]
@@ -1710,10 +1839,9 @@ async fn dashboard_host_routes_report_states_and_retry_only_key_hosts() {
     let bytes = axum::body::to_bytes(response.into_body(), 4096)
         .await
         .unwrap();
-    let connect_required = cfg!(windows) && !crate::config::run_engine_settings().unwrap().0;
     assert_eq!(
         serde_json::from_slice::<Value>(&bytes).unwrap(),
-        json!([{"alias":"lab","status":"backoff","class":"key","connectRequired":connect_required,"sinceMs":100,"nextRetryMs":200,"cause":"offline","root":"/engine"}])
+        json!([{"alias":"lab","status":"backoff","class":"key","connectRequired":false,"sinceMs":100,"nextRetryMs":200,"cause":"offline","root":"/engine"}])
     );
     let request = || {
         Request::builder()
@@ -1809,7 +1937,7 @@ async fn dashboard_retry_returns_the_worst_root_state() {
 #[test]
 fn dashboard_connect_clears_the_engine_breaker_and_resumes_pending_runs() {
     let directory =
-        std::env::temp_dir().join(format!("orx-dashboard-host-{}", uuid::Uuid::new_v4()));
+        crate::config::test_home().join(format!("orx-dashboard-host-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&directory).unwrap();
     let mut command = crate::process::command(std::env::current_exe().unwrap());
     command
@@ -1841,7 +1969,7 @@ async fn dashboard_host_lifecycle_child() {
     use crate::engine::transport::Status;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let server = orx_test_support::Sshd::start().unwrap();
-    let ssh_dir = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".ssh");
+    let ssh_dir = crate::config::home_dir().unwrap().join(".ssh");
     std::fs::create_dir_all(&ssh_dir).unwrap();
     std::fs::copy(server.config_path(), ssh_dir.join("config")).unwrap();
     let f = Fixture::new().await;
@@ -1929,6 +2057,11 @@ async fn dashboard_host_lifecycle_child() {
             f.api.engine.clone(),
             runtime.clone(),
             Box::new(|_| Ok(Box::new(()))),
+            Arc::new(crate::local::chat::ChatHost::new(
+                Arc::new(crate::local::opencode::AgentHost::new(None)),
+                Arc::new(crate::local::codex::CodexHost::new()),
+                Arc::new(crate::local::claude::ClaudeHost::new()),
+            )),
             f.api.data_dir.clone(),
         )
         .unwrap(),
@@ -2367,17 +2500,23 @@ async fn idle_closes_admission_then_rechecks_in_flight_requests_and_sse() {
     let f = Fixture::new().await;
     let mut idle = Idle::default();
     let active = crate::commands::up::Active::new();
-    assert!(!idle.check(&f.api, Duration::ZERO).unwrap());
-    assert!(!idle.check(&f.api, Duration::from_secs(600)).unwrap());
-    assert!(!crate::commands::up::stop_admitting_if_idle(&f.api).unwrap());
+    assert!(!idle.check(&f.api, Duration::ZERO).await.unwrap());
+    assert!(!idle.check(&f.api, Duration::from_secs(600)).await.unwrap());
+    assert!(!crate::commands::up::stop_admitting_if_idle(&f.api)
+        .await
+        .unwrap());
     assert!(!crate::commands::up::IDLE_EXIT.load(Ordering::SeqCst));
     drop(active);
-    assert!(!idle.check(&f.api, Duration::from_secs(601)).unwrap());
-    assert!(idle.check(&f.api, Duration::from_secs(1201)).unwrap());
+    assert!(!idle.check(&f.api, Duration::from_secs(601)).await.unwrap());
+    assert!(idle.check(&f.api, Duration::from_secs(1201)).await.unwrap());
     f.api.clients.fetch_add(1, Ordering::SeqCst);
-    assert!(!crate::commands::up::stop_admitting_if_idle(&f.api).unwrap());
+    assert!(!crate::commands::up::stop_admitting_if_idle(&f.api)
+        .await
+        .unwrap());
     f.api.clients.fetch_sub(1, Ordering::SeqCst);
-    assert!(crate::commands::up::stop_admitting_if_idle(&f.api).unwrap());
+    assert!(crate::commands::up::stop_admitting_if_idle(&f.api)
+        .await
+        .unwrap());
     crate::commands::up::IDLE_EXIT.store(false, Ordering::SeqCst);
 }
 
@@ -2692,4 +2831,126 @@ async fn cancellation_proof_reaches_both_api_projections_without_contact_prose()
             json!(note)
         );
     }
+}
+
+#[tokio::test]
+async fn a_waiting_reason_reaches_both_views_and_the_event_stream() {
+    let f = Fixture::new().await;
+    f.insert("run", "exp", "project", "starting");
+    let mut events = f
+        .client
+        .events(&Filter {
+            run: Some("run".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    async fn next(events: &mut (impl Stream<Item = Result<Value>> + Unpin)) -> Value {
+        tokio::time::timeout(Duration::from_secs(1), events.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    }
+    assert!(next(&mut events).await["waitingReason"].is_null());
+
+    f.api
+        .engine
+        .observe(
+            "run",
+            Observation::Queued {
+                detail: Some("Provisioning box".into()),
+            },
+        )
+        .unwrap();
+    let event = next(&mut events).await;
+    assert_eq!(event["event"], "changed");
+    assert_eq!(event["waitingReason"], "Provisioning box");
+    let cli: crate::plane::Run = serde_json::from_value(event).unwrap();
+    assert_eq!(
+        cli.waiting_detail().as_deref(),
+        Some("waiting: Provisioning box")
+    );
+    let dashboard = {
+        let store = f.api.store();
+        let run = store.get_run("run").unwrap().unwrap();
+        serde_json::to_value(crate::commands::up::ApiRun::new(&store, &run).unwrap()).unwrap()
+    };
+    assert_eq!(dashboard["waitingReason"], "Provisioning box");
+
+    f.api
+        .engine
+        .observe("run", Observation::Running { started_at: None })
+        .unwrap();
+    let event = next(&mut events).await;
+    assert_eq!(event["status"], "running");
+    assert!(event["waitingReason"].is_null());
+}
+
+#[tokio::test]
+async fn abandon_refusals_name_their_cause_and_the_way_forward() {
+    use tower::ServiceExt;
+    let f = Fixture::new().await;
+    let app = dashboard_routes(f.api.clone());
+    let refusal = |id: &'static str| {
+        let app = app.clone();
+        async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri(format!("/api/runs/{id}/abandon"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            (status, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+    };
+
+    f.insert("done", "exp", "project", "done");
+    let (status, message) = refusal("done").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(message.contains("already ended (done)"), "{message}");
+
+    f.insert("live", "exp", "project", "running");
+    let (status, message) = refusal("live").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(message.contains("`orx exp cancel --run live`"), "{message}");
+
+    f.insert("legacy", "exp", "project", "running");
+    let mut legacy = f.api.run("legacy").unwrap();
+    legacy.backend_json = r#"{"kind":"ssh_job","host":"gpu-box"}"#.into();
+    f.api.store().upsert_run(&legacy).unwrap();
+    f.api
+        .store()
+        .set_run_contact(
+            "legacy",
+            &Contact::Unreachable {
+                since: 1,
+                cause: "offline".into(),
+            },
+        )
+        .unwrap();
+    let (status, message) = refusal("legacy").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(message.contains("orx 0.2"), "{message}");
+    assert!(
+        message.contains("`orx exp cancel --run legacy`"),
+        "{message}"
+    );
+    assert_eq!(f.api.run("legacy").unwrap().status, "running");
+
+    // A stop its backend keeps refusing leaves a reachable run nothing but Abandon.
+    f.backend.cancel_refused.store(true, Ordering::SeqCst);
+    let cancel = f
+        .client
+        .json(reqwest::Method::POST, "runs/live/cancel", None)
+        .await
+        .unwrap();
+    assert_eq!(cancel["cancelError"], "refused by the provider");
+    let (status, message) = refusal("live").await;
+    assert_eq!(status, StatusCode::OK, "{message}");
+    assert_eq!(f.api.run("live").unwrap().status, "lost");
 }

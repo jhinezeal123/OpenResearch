@@ -314,6 +314,41 @@ fn release_asset_url(tag: &str, asset: &str) -> String {
     format!("{REPO_URL}/releases/download/{release}/{asset}")
 }
 
+/// The headless `orx` archive canary `tag` publishes for a Rust target triple.
+pub(crate) fn canary_cli_url(tag: &str, target: &str) -> String {
+    release_asset_url(tag, &format!("{tag}--OpenResearch-cli-{target}.tar.gz"))
+}
+
+/// The SHA-256 published beside a release asset, or `None` when the release
+/// no longer has it.
+pub(crate) async fn published_sha256(url: &str) -> Result<Option<String>> {
+    let url = format!("{url}.sha256");
+    let unreachable = |error: reqwest::Error| {
+        anyhow!("Can't check {url} from this computer: {error}. Check this computer's internet connection, then try again.")
+    };
+    let response = http()
+        .get(&url)
+        .header("user-agent", UA)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(unreachable)?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let body = response
+        .error_for_status()
+        .map_err(unreachable)?
+        .text()
+        .await
+        .map_err(unreachable)?;
+    let digest = body.split_whitespace().next().unwrap_or_default();
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!("{url} doesn't hold a SHA-256 digest."));
+    }
+    Ok(Some(digest.to_ascii_lowercase()))
+}
+
 // ---------------------------------------------------------------------------
 // Install receipt (written by the cargo-dist shell installer)
 // ---------------------------------------------------------------------------
@@ -332,18 +367,16 @@ pub struct Receipt {
 pub fn receipt_path() -> PathBuf {
     // Through `shell_env`, like `config::config_dir()`: in macOS app mode the
     // user's real XDG_CONFIG_HOME lives only in this process.
-    let base = crate::local::shell_env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            // Where the PowerShell installer writes it.
-            #[cfg(windows)]
-            if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-                return PathBuf::from(local);
-            }
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".config")
-        });
+    let base = crate::config::env_path("XDG_CONFIG_HOME").unwrap_or_else(|| {
+        // Where the PowerShell installer writes it.
+        #[cfg(windows)]
+        if let Some(local) = crate::config::env_path("LOCALAPPDATA") {
+            return local;
+        }
+        crate::config::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".config")
+    });
     base.join(APP_NAME)
         .join(format!("{}-receipt.json", APP_NAME))
 }
@@ -1138,8 +1171,14 @@ pub fn updater_lock_path() -> PathBuf {
 
 /// Whether an `orx update` is still running, e.g. one `apply_now` stopped waiting for.
 pub fn updater_running() -> bool {
-    std::fs::File::open(updater_lock_path())
-        .is_ok_and(|file| matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)))
+    std::fs::File::open(updater_lock_path()).is_ok_and(|file| match file.try_lock() {
+        Ok(()) => {
+            drop(crate::file_lock::FileLock::new(file));
+            false
+        }
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(_)) => false,
+    })
 }
 
 /// Consecutive failed update attempts recorded so far.
@@ -1317,6 +1356,7 @@ fn mutate_cache_at(path: &Path, legacy: &Path, f: impl FnOnce(&mut CheckCache)) 
     if lock.lock().is_err() {
         return;
     }
+    let _lock = crate::file_lock::FileLock::new(lock);
     let mut cache = read_cache_from(path, legacy).unwrap_or_default();
     f(&mut cache);
     let Ok(body) = serde_json::to_string(&cache) else {
@@ -1593,7 +1633,7 @@ fn open_lock(path: Option<PathBuf>) -> Option<std::fs::File> {
 /// Held shared for an `orx up`'s lifetime. Swapping the binary under it would hand
 /// its agents a different `orx` than the backend running them, so updaters defer.
 pub struct BackendLock {
-    _file: std::fs::File,
+    _file: crate::file_lock::FileLock,
 }
 
 impl BackendLock {
@@ -1602,13 +1642,15 @@ impl BackendLock {
     pub fn acquire() -> Option<Self> {
         let file = open_lock(backend_lock_path())?;
         file.lock_shared().ok()?;
-        Some(Self { _file: file })
+        Some(Self {
+            _file: crate::file_lock::FileLock::new(file),
+        })
     }
 }
 
 /// An updater's exclusive hold on the install, kept until it finishes replacing it.
 pub struct InstallClaim {
-    _file: Option<std::fs::File>,
+    _file: Option<crate::file_lock::FileLock>,
 }
 
 /// `None` while an `orx up` is using this install. A lock nobody could open protects nobody.
@@ -1617,8 +1659,11 @@ pub fn claim_install(target: &UpdateTarget) -> Option<InstallClaim> {
         return Some(InstallClaim { _file: None });
     };
     match file.try_lock() {
+        Ok(()) => Some(InstallClaim {
+            _file: Some(crate::file_lock::FileLock::new(file)),
+        }),
         Err(std::fs::TryLockError::WouldBlock) => None,
-        _ => Some(InstallClaim { _file: Some(file) }),
+        Err(std::fs::TryLockError::Error(_)) => Some(InstallClaim { _file: None }),
     }
 }
 
@@ -2131,6 +2176,9 @@ impl UpdateWarning {
         if opted_out() {
             return UpdateWarning { refresh: None };
         }
+        // In an `orx up` chat, the server checks and updates; a send cut off at
+        // exit can fail the agent's command in its sandbox.
+        let in_chat = crate::local::chat::in_local_session();
 
         let current = current_version();
         let cache = read_cache();
@@ -2143,7 +2191,7 @@ impl UpdateWarning {
                     && release_available(&current, latest, &cache.latest_tag)
             })
         });
-        let automatic = available && auto_update_eligible();
+        let automatic = available && !in_chat && auto_update_eligible();
 
         if let Some(message) = cached_latest
             .as_ref()
@@ -2182,7 +2230,7 @@ impl UpdateWarning {
             .as_ref()
             .map(|c| now_unix().saturating_sub(c.checked_at) >= CHECK_TTL.as_secs())
             .unwrap_or(true);
-        if !stale {
+        if !stale || in_chat {
             return UpdateWarning { refresh: None };
         }
 
@@ -2247,17 +2295,34 @@ impl UpdateWarning {
 #[cfg(test)]
 mod tests {
     use super::{
-        app_bundle_root, attempt_backoff, attempt_due, bold, claim_install, current_version,
-        detect_channel, exe_matches_prefix, now_unix, package_manager_owns, parse_manifest,
-        portable_dir, portable_outside_prefix, precedence, relaunch_args, release_asset_url,
-        render, restart_target, retired_path, staged_release_in, target_lock_path, warning_for,
-        write_staged_release, BackendLock, Changes, CheckCache, DistManifest, InstallChannel,
-        ReleaseChannel, UpdateTarget, ATTEMPT_BACKOFF_MAX, ATTEMPT_BACKOFF_MIN,
+        app_bundle_root, attempt_backoff, attempt_due, bold, canary_cli_url, claim_install,
+        current_version, detect_channel, exe_matches_prefix, now_unix, package_manager_owns,
+        parse_manifest, portable_dir, portable_outside_prefix, precedence, relaunch_args,
+        release_asset_url, render, restart_target, retired_path, staged_release_in,
+        target_lock_path, warning_for, write_staged_release, BackendLock, Changes, CheckCache,
+        DistManifest, InstallChannel, ReleaseChannel, UpdateTarget, ATTEMPT_BACKOFF_MAX,
+        ATTEMPT_BACKOFF_MIN,
     };
     use semver::Version;
     use std::ffi::OsString;
     use std::path::Path;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn chat_commands_leave_update_checks_to_orx_up() {
+        let cleared = [
+            crate::local::chat::LOCAL_SESSION_ENV,
+            "ORX_NO_UPDATE_CHECK",
+            "NO_UPDATE_NOTIFIER",
+            "OPENRESEARCH_CLI_DISABLE_UPDATE",
+        ];
+        if !crate::config::in_test_child(&cleared) {
+            return;
+        }
+        std::env::set_var(crate::local::chat::LOCAL_SESSION_ENV, "1");
+
+        assert!(super::UpdateWarning::start(true).refresh.is_none());
+    }
 
     #[test]
     fn changes_are_the_difference_of_cumulative_totals() {
@@ -2301,6 +2366,10 @@ mod tests {
         assert_eq!(
             release_asset_url("v0.2.22", "OpenResearch.dmg"),
             format!("{base}/v0.2.22/OpenResearch.dmg")
+        );
+        assert_eq!(
+            canary_cli_url("canary-20261027.3", "aarch64-unknown-linux-musl"),
+            format!("{base}/canary/canary-20261027.3--OpenResearch-cli-aarch64-unknown-linux-musl.tar.gz")
         );
     }
 

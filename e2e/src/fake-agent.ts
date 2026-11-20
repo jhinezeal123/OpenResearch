@@ -14,6 +14,9 @@ const log = process.env.ORX_E2E_AGENT_LOG
 const reverse = new Map<string, (message: Message) => void>()
 let nextReverse = 0
 let turn: { abort: AbortController } | undefined
+// orx gives every chat session its MCP servers and a one-shot (title, starter prompts, summary) none. One-shots end with
+// no text, so they keep orx's fallbacks and never take a script meant for a chat turn.
+const oneShots = new Set<string>()
 
 function send(message: Omit<Message, 'jsonrpc'>) {
   const line = JSON.stringify({ jsonrpc: '2.0', ...message })
@@ -58,6 +61,7 @@ async function run(sessionId: string, step: Extract<Step, { run: string }>) {
 
 async function prompt(request: Message) {
   const { sessionId, prompt: blocks } = request.params
+  if (oneShots.has(sessionId)) return send({ id: request.id, result: { stopReason: 'end_turn' } })
   const text = blocks.map((block: { text?: string }) => block.text ?? '').join('\n')
   const abort = new AbortController()
   turn = { abort }
@@ -67,6 +71,27 @@ async function prompt(request: Message) {
       else if ('think' in step) update(sessionId, { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: step.think } })
       else if ('hold' in step) await fetch(`${control}/hold/${encodeURIComponent(step.hold)}`, { method: 'POST', signal: abort.signal })
       else if ('run' in step) await run(sessionId, step)
+      else if ('permissionAfterReply' in step) {
+        send({ id: request.id, result: { stopReason: 'end_turn' } })
+        await ask('session/request_permission', {
+          sessionId, toolCall: { toolCallId: 'late-permission', title: step.permissionAfterReply, kind: 'execute' },
+          options: [{ optionId: 'late-allow', name: 'Allow late action', kind: 'allow_once' }],
+        })
+        return
+      }
+      else if ('permission' in step) {
+        const toolCallId = `permission-${nextReverse}`
+        const toolCall = { toolCallId, title: step.permission, kind: step.kind ?? 'execute', status: 'pending' }
+        update(sessionId, { sessionUpdate: 'tool_call', ...toolCall })
+        const grant = step.grant ?? 'allow_once'
+        const options = [
+          ...(grant === 'none' ? [] : [{ optionId: 'opaque-allow', name: 'Allow this action', kind: grant }]),
+          { optionId: 'opaque-reject', name: 'Reject this action', kind: 'reject_once' },
+        ]
+        const response = await ask('session/request_permission', { sessionId, toolCall, options })
+        const selected = response.result?.outcome?.optionId ?? response.result?.outcome?.outcome
+        update(sessionId, { sessionUpdate: 'tool_call_update', toolCallId, status: selected === 'opaque-allow' ? 'completed' : 'failed', rawOutput: selected })
+      }
       else if ('exit' in step) process.exit(step.exit)
     }
     send({ id: request.id, result: { stopReason: 'end_turn' } })
@@ -90,9 +115,14 @@ function handle(message: Message) {
         id: message.id,
         result: { protocolVersion: 1, agentInfo: { name: 'orx e2e agent', version: '1.0.0' }, agentCapabilities: { loadSession: true } },
       })
-    case 'session/new':
-      return send({ id: message.id, result: { sessionId: `e2e-${crypto.randomUUID()}` } })
+    case 'session/new': {
+      const sessionId = `e2e-${crypto.randomUUID()}`
+      if (!message.params?.mcpServers?.length) oneShots.add(sessionId)
+      const models = { currentModelId: 'e2e', availableModels: [{ modelId: 'e2e', name: 'E2E Model' }] }
+      return send({ id: message.id, result: { sessionId, models } })
+    }
     case 'session/load':
+    case 'session/set_model':
       return send({ id: message.id, result: {} })
     case 'session/prompt':
       return void prompt(message)

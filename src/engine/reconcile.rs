@@ -11,6 +11,8 @@ const OUTAGE_ATTENTION: Duration = Duration::from_secs(10 * 60);
 pub(crate) const ABANDONED: &str =
     "Abandoned; the cancel stays pending until the job is confirmed gone.";
 
+const WAITING_REASON_CHARS: usize = 500;
+
 /// What one fact does to a run. The phase applies only if it moves forward.
 #[derive(Debug, Default)]
 pub(super) struct Change {
@@ -22,6 +24,8 @@ pub(super) struct Change {
     pub started_at: Option<i64>,
     pub reason: Option<String>,
     pub cancel_unconfirmed: Option<Option<Vec<u32>>>,
+    /// The backend's latest word on why the run waits; `Some(None)` means it gave none.
+    pub waiting: Option<Option<String>>,
     pub contact: Option<Contact>,
     pub queue_detail: Option<Option<String>>,
     /// Raise the outage's attention notice even though the contact did not change.
@@ -136,7 +140,8 @@ fn observed(phase: Phase, contact: &Contact, observation: Observation, now: i64)
     };
     match observation {
         Queued { detail } => Change {
-            queue_detail: Some(Some(detail)),
+            queue_detail: Some(detail.clone()),
+            waiting: Some(detail.as_deref().and_then(waiting_reason)),
             ..progressed(Phase::Starting)
         },
         Running { started_at } => Change {
@@ -183,6 +188,17 @@ fn observed(phase: Phase, contact: &Contact, observation: Observation, now: i64)
         }),
         Notify { .. } | Log { .. } | Lingering { .. } | CancelReceipt { .. } => Change::default(),
     }
+}
+
+/// Provider text on one line, short enough for a status.
+fn waiting_reason(detail: &str) -> Option<String> {
+    let line = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() <= WAITING_REASON_CHARS {
+        return Some(line).filter(|line| !line.is_empty());
+    }
+    let mut short: String = line.chars().take(WAITING_REASON_CHARS - 1).collect();
+    short.push('…');
+    Some(short)
 }
 
 /// A continuing outage keeps its start; its cause or detail follows the latest report.
@@ -295,6 +311,14 @@ impl Engine {
             if verifying && observation.ends_run() {
                 return Change::default();
             }
+            // Proof the job is gone, which is what an accepted cancel waits for.
+            if let Observation::Lost { reason } = &observation {
+                if state.cancel_accepted_at.is_some()
+                    && matches!(phase, Phase::Starting | Phase::Running)
+                {
+                    return Change::terminal(Phase::Cancelled, Some(reason.clone()));
+                }
+            }
             let observation = match observation {
                 Observation::Exited {
                     finished_at,
@@ -384,11 +408,7 @@ impl Engine {
                 contact: Some(Contact::Stopping { since: now, count }),
                 ..Change::terminal(Phase::Cancelled, legacy_note)
             },
-            CancelOutcome::Undelivered { detail } => {
-                eprintln!("Cancel pending for {}: {detail}", run.id);
-                Change::default()
-            }
-            CancelOutcome::Pending => Change::default(),
+            CancelOutcome::Undelivered { .. } | CancelOutcome::Pending => Change::default(),
         })
     }
 
@@ -418,7 +438,7 @@ impl Engine {
         decide: impl FnOnce(Phase, &EngineRunState) -> Change,
     ) -> Result<()> {
         let now = self.clock.wall_ms();
-        let (phase, contact, cancelling, chats, changed) = {
+        let (phase, contact, cancelling, chats, changed, lost_contact) = {
             let store = self.store();
             let tx = store.begin_immediate()?;
             let (run, state) = load(&store, run_id)?;
@@ -487,6 +507,21 @@ impl Engine {
                 )?;
             }
 
+            let waiting = match phase {
+                Phase::Submitting | Phase::Starting => change
+                    .waiting
+                    .clone()
+                    .unwrap_or_else(|| state.waiting_reason.clone()),
+                _ => None,
+            };
+            let waiting_changed = waiting != state.waiting_reason;
+            if waiting_changed {
+                tx.execute(
+                    "UPDATE runs SET waiting_reason = ?2 WHERE id = ?1",
+                    rusqlite::params![run_id, waiting],
+                )?;
+            }
+
             let settled = phase.is_terminal() && !moved && state.contact == Contact::Live;
             let contact = match change.contact {
                 Some(new) if !settled => merged(&state.contact, new),
@@ -503,11 +538,23 @@ impl Engine {
                 change.queue_detail
             };
             let queue_changed = match queue_detail {
-                Some(Some(detail)) if !detail.is_empty() => tx.execute(
-                    "UPDATE runs SET backend_json = json_set(backend_json, '$.queueDetail', ?2), updated_at = ?3
-                     WHERE id = ?1 AND json_extract(backend_json, '$.queueDetail') IS NOT ?2",
-                    rusqlite::params![run_id, detail, now],
-                )? > 0,
+                Some(Some(detail)) if !detail.is_empty() => {
+                    let current = serde_json::from_str::<serde_json::Value>(&run.backend_json)
+                        .ok()
+                        .and_then(|backend| backend["queueDetail"].as_str().map(str::to_owned));
+                    if current.as_deref().is_some_and(|current| {
+                        current == detail.as_str()
+                            || waiting_reason(current) == waiting_reason(&detail)
+                    }) {
+                        false
+                    } else {
+                        tx.execute(
+                            "UPDATE runs SET backend_json = json_set(backend_json, '$.queueDetail', ?2), updated_at = ?3
+                             WHERE id = ?1 AND json_extract(backend_json, '$.queueDetail') IS NOT ?2",
+                            rusqlite::params![run_id, detail, now],
+                        )? > 0
+                    }
+                }
                 Some(_) => tx.execute(
                     "UPDATE runs SET backend_json = json_remove(backend_json, '$.queueDetail'), updated_at = ?2
                      WHERE id = ?1 AND CASE WHEN json_valid(backend_json)
@@ -516,6 +563,13 @@ impl Engine {
                 )? > 0,
                 None => false,
             };
+            let lost_contact = discriminant(&contact) != discriminant(&state.contact)
+                && matches!(
+                    contact,
+                    Contact::Unreachable { .. }
+                        | Contact::NeedsAuth { .. }
+                        | Contact::Unreconciled { .. }
+                );
             if contact_changed {
                 store.set_run_contact(run_id, &contact)?;
             }
@@ -527,6 +581,8 @@ impl Engine {
             let mut chats = Vec::new();
             for chat in store.run_subscribers(run_id)? {
                 let notice = if let Some(body) = &terminal_body {
+                    // The ending supersedes an outage notice the chat has not been sent yet.
+                    store.settle_outage_notice(run_id, &chat)?;
                     Some((TERMINAL, body.clone()))
                 } else if phase == Phase::Cancelled && contact_changed && contact == Contact::Live {
                     if store.queue_cancel_settled_notice(run_id, &chat, now)? {
@@ -578,7 +634,8 @@ impl Engine {
                 contact,
                 cancelling,
                 chats,
-                moved || contact_changed || recorded || queue_changed,
+                moved || contact_changed || recorded || queue_changed || waiting_changed,
+                lost_contact,
             )
         };
 
@@ -590,10 +647,8 @@ impl Engine {
             } else {
                 memory.outages.remove(run_id);
             }
-            if matches!(
-                contact,
-                Contact::Unreachable { .. } | Contact::NeedsAuth { .. }
-            ) {
+            // A stop delivered before contact was lost may not have landed; send it once more.
+            if lost_contact {
                 memory.cancels_sent.remove(run_id);
             }
             let tombstone = is_tombstone(phase, &contact);
@@ -602,6 +657,7 @@ impl Engine {
             }
             if phase.is_terminal() && !tombstone {
                 memory.cancels_sent.remove(run_id);
+                memory.cancel_errors.remove(run_id);
                 memory.verifying.remove(run_id);
                 memory.locks.release(run_id);
             }

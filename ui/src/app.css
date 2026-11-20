@@ -19,6 +19,25 @@
   --titlebar-lights: 0.475rem;
 }
 
+/* The sidebar's bottom-start corner is the window's own on macOS and Windows 11. The status
+   strip's bottom-start segment sits 4px in from it, so its corner is the window's radius less 4px. */
+:root {
+  --strip-corner: var(--radius-md);
+}
+
+:root.mac-titlebar {
+  --strip-corner: var(--radius-lg);
+}
+
+:root.win-titlebar {
+  --strip-corner: var(--radius-xs);
+}
+
+:root[data-fullscreen],
+:root[data-maximized] {
+  --strip-corner: var(--radius-md);
+}
+
 :root[data-theme="dark"] .tinker-logo {
   filter: invert(1);
 }
@@ -412,17 +431,41 @@
     transform: scale(0.4);
   }
 }
-@keyframes title-char-in {
+/* The mask lives only in the keyframes, so with `backwards` fill it is gone
+   once the sweep ends and the title paints exactly like a static one. Block
+   sizing takes the parent's visible width, so the sweep and the inherited
+   ellipsis cover what is on screen rather than the full overflowing string. */
+.title-reveal {
+  display: block;
+  overflow: hidden;
+  text-overflow: inherit;
+  animation: title-reveal 700ms cubic-bezier(0.4, 0, 0.2, 1) backwards;
+}
+
+@keyframes title-reveal {
   from {
-    opacity: 0;
-    filter: blur(4px);
-    transform: translateY(0.15em);
+    mask-image: linear-gradient(to right, black 33.3%, transparent 66.7%);
+    mask-size: 300% 100%;
+    mask-repeat: no-repeat;
+    mask-position: 100% 0;
+  }
+  to {
+    mask-image: linear-gradient(to right, black 33.3%, transparent 66.7%);
+    mask-size: 300% 100%;
+    mask-repeat: no-repeat;
+    mask-position: 0 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .title-reveal {
+    animation: none;
   }
 }
 
 /* Reserve room for the workspace toolbar. */
 .workspace-body > .chat-pane .chat-header {
-  padding-inline-end: 12rem;
+  padding-inline-end: 14.25rem;
 }
 
 .workspace-card-visible > .chat-pane {
@@ -446,7 +489,7 @@
 }
 
 .win-titlebar .app:not(:has(> :is(.update-banner, .offline-banner, [role="alert"]))) .workspace-body:not(.workspace-card-visible):is(:not(:has(> .right-pane)), .flex-col) > .chat-pane .chat-header {
-  padding-inline-end: calc(12rem + var(--spacing-win-controls));
+  padding-inline-end: calc(14.25rem + var(--spacing-win-controls));
 }
 
 .win-titlebar .app:not(:has(> :is(.update-banner, .offline-banner, [role="alert"]))) .settings-view-scroll:first-child {
@@ -510,13 +553,12 @@
   .workspace-mobile-nav button[aria-pressed="true"] { background: var(--surface); color: var(--text); }
   .mobile-rail-dialog { width: min(320px, calc(100vw - 40px)); padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); background: var(--base); }
   .mobile-rail-dialog .session-rail { width: 100%; height: 100%; }
-  .session-rail .rail-nav-item { min-height: 44px; }
   .workspace-body .right-pane, .workspace-body .right-pane.max {
     position: fixed;
     inset: env(safe-area-inset-top) 0 calc(var(--workspace-mobile-nav-height) + env(safe-area-inset-bottom));
     width: 100%;
     border: 0;
-    z-index: 60;
+    z-index: 40;
   }
   .right-pane .panel-resizer, .right-pane .panel-controls > :first-child { display: none; }
   .right-pane > .tabs { min-height: 52px; }
@@ -528,19 +570,19 @@
   input, textarea, select { font-size: 16px; }
 }
 
-/* The macOS app's window material (src/commands/app.rs) shows through the sidebar. */
-.mac-titlebar:has(.app-body > .session-rail),
-.mac-titlebar:has(.app-body > .session-rail) body {
+/* The desktop app's window material shows through the sidebar. */
+.window-material:has(.app-body > .session-rail),
+.window-material:has(.app-body > .session-rail) body {
   background: transparent;
 }
 
 /* A veil toward white (light) or black (dark) over the material. */
-.mac-titlebar .app-body > .session-rail {
+.window-material .app-body > .session-rail {
   background: var(--material-veil);
 }
 
 /* Hover and selection fills tint the material like a native sidebar's. */
-.mac-titlebar :is(.app-body > .session-rail, .titlebar-sidebar-toggle) {
+.window-material :is(.app-body > .session-rail, .titlebar-sidebar-toggle) {
   --surface: var(--material-hover);
   --panel: var(--material-selected);
 }
