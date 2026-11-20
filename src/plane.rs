@@ -130,6 +130,12 @@ impl Run {
         Some(format!("waiting: {reason}"))
     }
 
+    /// Progress line detail for `orx exp wait`: contact/monitoring issues first, else the wait reason.
+    pub fn wait_detail(&self) -> Option<String> {
+        self.contact_detail()
+            .or_else(|| (!self.cancelling).then(|| self.waiting_detail()).flatten())
+    }
+
     pub fn display_status(&self) -> std::borrow::Cow<'_, str> {
         if self.status == "cancelled" {
             if let crate::store::Contact::Stopping { count, .. } = self.contact {
@@ -470,6 +476,22 @@ mod cancel_tests {
             .contact_detail()
             .unwrap()
             .contains("Queued on Kaggle"));
+        assert!(queued.wait_detail().unwrap().contains("Queued on Kaggle"));
+        let mut with_waiting = value.clone();
+        with_waiting["waitingReason"] = "Queued on Kaggle".into();
+        let engine_queued: Run = serde_json::from_value(with_waiting.clone()).unwrap();
+        assert_eq!(engine_queued.contact_detail(), None);
+        assert_eq!(
+            engine_queued.wait_detail().as_deref(),
+            Some("waiting: Queued on Kaggle")
+        );
+        with_waiting["cancelling"] = true.into();
+        assert_eq!(
+            serde_json::from_value::<Run>(with_waiting)
+                .unwrap()
+                .wait_detail(),
+            None
+        );
         value["backendJson"] = serde_json::json!({"kind":"kaggle_job", "monitoringError":"Could not contact the local Kaggle worker"}).to_string().into();
         let failed_check: Run = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(

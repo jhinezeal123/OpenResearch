@@ -97,7 +97,7 @@ export function runDisplay(run: RunState): RunDisplay {
 /** What the run detail strip says about a run, or null when there is nothing to add. */
 type CollectionFields = Partial<Pick<Run, "logCollection" | "logCollectionError" | "noticeError">>;
 
-export function runNotice(run: Pick<Run, "status" | "backend"> & Partial<Pick<Run, "contact" | "cancelling" | "lostReason" | "host" | "cancelUnconfirmed" | "queueDetail" | "cancelError">> & CollectionFields): RunNotice | null {
+export function runNotice(run: Pick<Run, "status" | "backend"> & Partial<Pick<Run, "contact" | "cancelling" | "lostReason" | "host" | "cancelUnconfirmed" | "queueDetail" | "waitingReason" | "cancelError">> & CollectionFields): RunNotice | null {
   const contact: RunContact | null = run.contact ?? null;
   const host = run.host ?? null;
 
@@ -115,7 +115,7 @@ export function runNotice(run: Pick<Run, "status" | "backend"> & Partial<Pick<Ru
     if (runCancelling(run)) return run.status === "submitting" ? { kind: "cancel_pending_launch", detail: null } : { kind: "cancelling" };
     const error = run.backend?.monitoringError;
     if (typeof error === "string" && error) return { kind: "monitoring", error };
-    return run.status === "starting" && run.queueDetail ? { kind: "queued", detail: run.queueDetail } : null;
+    return run.status === "starting" && run.queueDetail && !run.waitingReason ? { kind: "queued", detail: run.queueDetail } : null;
   }
   if (contact.type === "stopping") return null;
   if (!runActive(run.status)) {

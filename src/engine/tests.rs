@@ -2602,6 +2602,14 @@ async fn unreadable_backend_status_can_still_reach_the_user() {
         .set_backend_json("unreadable", "unreadable")
         .unwrap();
     f.engine
+        .observe(
+            "unreadable",
+            Observation::Queued {
+                detail: Some("Queued on Kaggle".into()),
+            },
+        )
+        .unwrap();
+    f.engine
         .unreconciled(
             "unreadable",
             &anyhow!("Could not read the run's backend descriptor"),

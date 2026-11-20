@@ -813,7 +813,7 @@ impl ApiClient {
                 }
                 if filter.project.is_none() {
                     let status = run.display_status();
-                    let progress = match run.contact_detail() {
+                    let progress = match run.wait_detail() {
                         Some(detail) => format!("{status}: {detail}"),
                         None => status.into_owned(),
                     };

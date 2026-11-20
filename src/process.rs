@@ -194,6 +194,27 @@ pub(crate) fn wait_with_timeout(
     Err(error)
 }
 
+/// A launch from Git Bash otherwise hands its MSYS ssh.exe to native Rust
+/// children. MSYS parses quoted -o/ProxyCommand arguments differently from
+/// CreateProcess, swallowing subsequent SSH options. Prefer Windows' native
+/// OpenSSH client when installed, without overriding a test's fake `ssh`.
+#[cfg(windows)]
+fn windows_native_ssh(found_on_path: Option<PathBuf>) -> Option<PathBuf> {
+    #[cfg(test)]
+    if found_on_path
+        .as_deref()
+        .is_some_and(crate::config::contained)
+    {
+        return None;
+    }
+    #[cfg(not(test))]
+    let _ = found_on_path;
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|root| root.join("System32").join("OpenSSH").join("ssh.exe"))
+        .filter(|exe| exe.is_file())
+}
+
 /// A bare name found on the search PATH stays bare on Unix, so a caller that
 /// gives the child its own PATH still decides what runs. Windows spawning
 /// tries only `.exe`, so there every hit is spelled out to reach `.cmd` shims.
@@ -206,6 +227,12 @@ fn resolve(program: &OsStr) -> OsString {
     };
     if cfg!(unix) && shell_env::find_on_path(name).is_some() {
         return program.to_owned();
+    }
+    #[cfg(windows)]
+    if name.eq_ignore_ascii_case("ssh") {
+        if let Some(native) = windows_native_ssh(shell_env::find_on_path(name)) {
+            return native.into_os_string();
+        }
     }
     shell_env::find(name).map_or_else(|| program.to_owned(), PathBuf::into_os_string)
 }
@@ -328,5 +355,26 @@ mod tests {
     #[test]
     fn a_name_on_path_stays_bare() {
         assert_eq!(command("sh").get_program(), "sh");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ssh_prefers_windows_native_openssh_over_git_bash() {
+        let Some(expected) = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .map(|root| root.join("System32").join("OpenSSH").join("ssh.exe"))
+            .filter(|exe| exe.is_file())
+        else {
+            return;
+        };
+        assert_eq!(
+            windows_native_ssh(Some(PathBuf::from(r"C:\Program Files\Git\usr\bin\ssh.exe"))),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            windows_native_ssh(Some(crate::config::test_root().join("ssh.cmd"))),
+            None
+        );
+        assert_eq!(PathBuf::from(command("ssh").get_program()), expected);
     }
 }

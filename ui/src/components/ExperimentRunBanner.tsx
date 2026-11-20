@@ -53,8 +53,11 @@ function RunRow({ item, onOpenRun, onOpenExperiment }: { item: ChatActiveRun; on
           </Button>
         )}
       </div>
-      {display.status === "queued" && run.queueDetail && <span className="w-full wrap-anywhere text-subtext" role="status">{run.queueDetail}</span>}
-      {display.waiting && <span className="w-full min-w-0 truncate ps-6 text-subtext" title={display.waiting}>{autoDir(display.waiting)}</span>}
+      {display.waiting ? (
+        <span className="w-full min-w-0 truncate ps-6 text-subtext" role="status" title={display.waiting}>{autoDir(display.waiting)}</span>
+      ) : display.status === "queued" && run.queueDetail && (
+        <span className="w-full wrap-anywhere text-subtext" role="status">{run.queueDetail}</span>
+      )}
       {error && <span className="w-full text-accent-red" role="alert">{error}</span>}
       {showNotice && <RunContactNotice run={run} className="w-full" />}
     </div>

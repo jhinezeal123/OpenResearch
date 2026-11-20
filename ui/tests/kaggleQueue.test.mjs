@@ -20,6 +20,10 @@ test("queue labels and accessible notices give way to contact failure, cancellat
   const banner = await render(createElement(ExperimentRunBanner, { runs: [{ run: { ...queued, createdAt: 1 }, experimentName: "Queue test" }] }));
   assert.ok(banner.container.textContent.includes(m.status_queued()));
   assert.ok(banner.container.textContent.includes(queued.queueDetail));
+  const withWaiting = { ...queued, waitingReason: queued.queueDetail };
+  assert.equal(runNotice(withWaiting), null);
+  const dedupedBanner = await render(createElement(ExperimentRunBanner, { runs: [{ run: { ...withWaiting, createdAt: 1 }, experimentName: "Queue test" }] }));
+  assert.equal(dedupedBanner.container.textContent.split(queued.queueDetail).length - 1, 1);
   const unknown = { ...queued, contact: { type: "unreachable", since: 1, cause: "Could not check Kaggle status" } };
   assert.equal(runDisplay(unknown).status, "unreachable");
   await rerender(createElement(RunContactNotice, { run: unknown }));

@@ -139,11 +139,14 @@ fn observed(phase: Phase, contact: &Contact, observation: Observation, now: i64)
         ..Change::default()
     };
     match observation {
-        Queued { detail } => Change {
-            queue_detail: Some(detail.clone()),
-            waiting: Some(detail.as_deref().and_then(waiting_reason)),
-            ..progressed(Phase::Starting)
-        },
+        Queued { detail } => {
+            let waiting = detail.as_deref().and_then(waiting_reason);
+            Change {
+                queue_detail: Some(waiting.clone()),
+                waiting: Some(waiting),
+                ..progressed(Phase::Starting)
+            }
+        }
         Running { started_at } => Change {
             started_at: Some(started_at.unwrap_or(now)),
             ..progressed(Phase::Running)
@@ -539,21 +542,12 @@ impl Engine {
             };
             let queue_changed = match queue_detail {
                 Some(Some(detail)) if !detail.is_empty() => {
-                    let current = serde_json::from_str::<serde_json::Value>(&run.backend_json)
-                        .ok()
-                        .and_then(|backend| backend["queueDetail"].as_str().map(str::to_owned));
-                    if current.as_deref().is_some_and(|current| {
-                        current == detail.as_str()
-                            || waiting_reason(current) == waiting_reason(&detail)
-                    }) {
-                        false
-                    } else {
-                        tx.execute(
-                            "UPDATE runs SET backend_json = json_set(backend_json, '$.queueDetail', ?2), updated_at = ?3
-                             WHERE id = ?1 AND json_extract(backend_json, '$.queueDetail') IS NOT ?2",
-                            rusqlite::params![run_id, detail, now],
-                        )? > 0
-                    }
+                    tx.execute(
+                        "UPDATE runs SET backend_json = json_set(backend_json, '$.queueDetail', ?2), updated_at = ?3
+                         WHERE id = ?1 AND CASE WHEN json_valid(backend_json)
+                         THEN json_extract(backend_json, '$.queueDetail') IS NOT ?2 ELSE 0 END",
+                        rusqlite::params![run_id, detail, now],
+                    )? > 0
                 }
                 Some(_) => tx.execute(
                     "UPDATE runs SET backend_json = json_remove(backend_json, '$.queueDetail'), updated_at = ?2
