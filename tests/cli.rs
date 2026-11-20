@@ -1,6 +1,13 @@
 // Out of the crate, so `crate::process` is unreachable; tests run from a terminal anyway.
 #![allow(clippy::disallowed_methods)]
 
+#[path = "common/home.rs"]
+mod home;
+
+#[path = "cli/agents_cli.rs"]
+mod agents_cli;
+#[path = "cli/antigravity_gate_cli.rs"]
+mod antigravity_gate_cli;
 #[path = "cli/compute_cli.rs"]
 mod compute_cli;
 #[path = "cli/engine_cli.rs"]
@@ -11,3 +18,5 @@ mod invocation_gate_cli;
 mod logs_cli;
 #[path = "cli/up_auto_restart.rs"]
 mod up_auto_restart;
+#[path = "cli/up_sign_in.rs"]
+mod up_sign_in;

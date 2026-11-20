@@ -9,9 +9,13 @@
 //! `~/.local/share/openresearch`.
 
 mod acp;
+mod costs;
+mod env;
 pub(crate) mod search;
 mod telemetry;
-pub(crate) use telemetry::{InvocationIdentity, TokenUsage};
+pub(crate) use costs::{BilledRun, Per, Quote};
+pub(crate) use env::ProjectEnvVar;
+pub(crate) use telemetry::{Cost, InvocationIdentity, SampleCost, TokenUsage};
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -19,7 +23,7 @@ use std::time::Duration;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{anyhow, Result};
+use crate::error::{anyhow, Context, Result};
 use crate::local::autonomy::Autonomy;
 use crate::local::model::{LocalExperiment, LocalProject};
 use crate::workspace_state::{GlobalWorkspaceState, WorkspaceState};
@@ -92,13 +96,14 @@ pub(crate) fn open_lifecycle_lock_at(
     path: &std::path::Path,
 ) -> Result<fd_lock::RwLock<std::fs::File>> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::paths::create_dir_all(parent)?;
     }
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(path)?;
+        .open(path)
+        .with_context(|| format!("Could not open {}", path.display()))?;
     Ok(fd_lock::RwLock::new(file))
 }
 
@@ -165,23 +170,8 @@ pub(crate) fn acquire_data_dir_read_lock() -> Result<DataDirMoveLock> {
     acquire_data_dir_lock(data_dir_move_lock_path(), false)
 }
 
-/// Read an env var as a path, treating unset **and empty** the same (an empty
-/// `export ORX_DATA_DIR=` is a shell footgun that must not resolve to `""`).
-fn env_path(key: &str) -> Option<PathBuf> {
-    crate::local::shell_env::var(key)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-}
-
-/// `$ORX_DATA_DIR`. Under test only a fixture in the temp dir counts: one
-/// inherited from the developer's shell points at their real data.
 fn data_dir_override() -> Option<PathBuf> {
-    let dir = env_path("ORX_DATA_DIR")?;
-    #[cfg(test)]
-    if !dir.starts_with(std::env::temp_dir()) {
-        return None;
-    }
-    Some(dir)
+    crate::config::env_path("ORX_DATA_DIR")
 }
 
 /// `$XDG_DATA_HOME/openresearch` else `~/.local/share/openresearch` — the tail
@@ -190,8 +180,8 @@ fn xdg_default_data_dir() -> PathBuf {
     #[cfg(test)]
     let base = crate::config::test_home().join(".local").join("share");
     #[cfg(not(test))]
-    let base = env_path("XDG_DATA_HOME").unwrap_or_else(|| {
-        dirs::home_dir()
+    let base = crate::config::env_path("XDG_DATA_HOME").unwrap_or_else(|| {
+        crate::config::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".local")
             .join("share")
@@ -233,26 +223,38 @@ pub fn data_dir_source() -> DataDirSource {
     if crate::config::settings_data_dir().is_some() {
         return DataDirSource::Config;
     }
-    if env_path("XDG_DATA_HOME").is_some() {
+    if crate::config::env_path("XDG_DATA_HOME").is_some() {
         return DataDirSource::Xdg;
     }
     DataDirSource::Default
 }
 
-/// Compact human-readable byte size (e.g. `1.2 KB`, `3.4 MB`). Shared by the
-/// artifacts listing and the data-dir move so the two don't drift.
+/// Binary size in IEC units, to three significant figures: `512 B`, `3.97 GiB`,
+/// `64 MiB`. The dashboard's `fmtBytes` prints the same.
 pub fn human_bytes(n: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    if n < 1024 {
-        return format!("{n} B");
-    }
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut size = n as f64;
     let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
+    // 1023.5 rather than 1024, so a size that rounds up reads `1 MiB`, not `1024 KiB`.
+    while size >= 1023.5 && unit < UNITS.len() - 1 {
         size /= 1024.0;
         unit += 1;
     }
-    format!("{:.1} {}", size, UNITS[unit])
+
+    let digits = if unit == 0 || size >= 100.0 {
+        0
+    } else if size >= 10.0 {
+        1
+    } else {
+        2
+    };
+    let number = format!("{size:.digits$}");
+    let number = if digits > 0 {
+        number.trim_end_matches('0').trim_end_matches('.')
+    } else {
+        &number
+    };
+    format!("{number} {}", UNITS[unit])
 }
 
 pub fn log_path(data_dir: &Path, run_id: &str) -> PathBuf {
@@ -363,6 +365,8 @@ pub struct EngineRunState {
     pub started_at: Option<i64>,
     pub contact: Contact,
     pub cancel_unconfirmed: Option<Vec<u32>>,
+    /// What the backend last said the run is waiting for; only while submitting or starting.
+    pub waiting_reason: Option<String>,
     pub spec_digest: Option<String>,
     pub submission_attempt: u32,
     pub submission_fence: Option<SubmissionFence>,
@@ -527,6 +531,66 @@ impl std::fmt::Display for RunStatus {
     }
 }
 
+/// What quitting `orx up` does to a pending run.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum AfterQuit {
+    /// Already finished; only its result has not reached a chat.
+    Reports,
+    /// Its machine or service finishes it and keeps the outcome.
+    Continues,
+    /// Runs on this machine, or only the engine stops its sandbox or collects its outcome, so the app won't quit.
+    NeedsApp,
+}
+
+/// A chat with a turn in flight.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PendingAgent {
+    pub project_id: String,
+    pub project: Option<String>,
+    pub session_id: String,
+    /// The chat a side chat branched from, which is where it opens.
+    pub side_parent_id: Option<String>,
+    pub harness: String,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PendingRun {
+    pub project_id: String,
+    pub project: Option<String>,
+    pub experiment_id: String,
+    pub run_id: String,
+    /// The chat its result goes to.
+    pub session_id: Option<String>,
+    /// The experiment's title, as the dashboard names it.
+    pub name: String,
+    /// The backend kind, such as `modal_job`.
+    pub backend: Option<String>,
+    pub after_quit: AfterQuit,
+}
+
+/// Chats with a turn in flight, and runs unfinished or with a result no chat has received.
+#[derive(Debug, Default, PartialEq, Serialize)]
+pub(crate) struct PendingWork {
+    pub agents: Vec<PendingAgent>,
+    pub runs: Vec<PendingRun>,
+}
+
+impl PendingWork {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn blocks_quit(&self) -> bool {
+        self.runs
+            .iter()
+            .any(|run| run.after_quit == AfterQuit::NeedsApp)
+    }
+}
+
 /// Whether a stored run status string denotes a finished run. An unrecognized
 /// string is treated as non-terminal (the conservative choice: it keeps a run
 /// visible as active rather than silently dropping it from "in flight" views).
@@ -586,17 +650,16 @@ pub struct ReadyChatSubscription {
 const CHAT_SUBSCRIPTION_CLAIM_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Each subscription with its target's latest turn and whether the target is
-/// idle after it: done, and with nothing queued unless a stop held the queue.
+/// idle after it: done, with nothing queued.
 const LATEST_SUBSCRIBED_TURNS: &str = "subscribed AS (
     SELECT s.subscriber_session_id, s.target_session_id, s.paused, s.told_turn_id,
            s.told_prompt_id, s.claim_token, s.claimed_at, s.created_at,
            t.id AS turn_id, t.state,
            t.assistant_message_id, t.updated_at,
-           t.state = 'interrupted'
-               OR (t.state IN ('completed', 'failed') AND NOT EXISTS (
-                   SELECT 1 FROM chat_queued_messages q
-                   WHERE q.session_id = s.target_session_id
-               )) AS idle
+           t.state IN ('completed', 'failed', 'interrupted') AND NOT EXISTS (
+               SELECT 1 FROM chat_queued_messages q
+               WHERE q.session_id = s.target_session_id
+           ) AS idle
     FROM chat_subscriptions s
     LEFT JOIN chat_turns t ON t.id = (
         SELECT id FROM chat_turns WHERE session_id = s.target_session_id
@@ -608,6 +671,20 @@ latest AS (
 )";
 
 pub(crate) const CHAT_TURN_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Delete turn leases not renewed within the TTL, except `held`, the claim tokens of this
+/// process's running turns: a stall or sleep leaves them stale but their turns alive.
+fn expire_turn_leases(conn: &Connection, held: &[String]) -> Result<()> {
+    conn.execute(
+        "DELETE FROM chat_turn_leases
+         WHERE heartbeat_at < ?1 AND claim_token NOT IN (SELECT value FROM json_each(?2))",
+        params![
+            expired_before(CHAT_TURN_LEASE_TTL),
+            serde_json::to_string(held)?
+        ],
+    )?;
+    Ok(())
+}
 
 /// Heartbeats and claims older than this belong to an owner that is gone.
 fn expired_before(ttl: std::time::Duration) -> i64 {
@@ -720,10 +797,12 @@ const SHARED_SSH_LOCK: (&str, &str) = ("run-logs", ".supervisor.shared-ssh.lock"
 /// The kept end of an engine run's log too large to keep whole.
 const TAIL_LOG: (&str, &str) = ("run-logs", ".tail.log");
 /// Per-run files as (data-dir root, name suffix); the supervisor lock goes last so it excludes until the end.
-const RUN_ARTIFACTS: [(&str, &str); 18] = [
+const RUN_ARTIFACTS: [(&str, &str); 20] = [
     ("local-runs", ""),
     ("run-logs", ".log"),
     ("run-logs", ".spool.log"),
+    ("run-logs", ".spool.json"),
+    ("run-logs", ".spool.json.part"),
     ("run-logs", ".log.part"),
     ("run-logs", ".log.part.json"),
     TAIL_LOG,
@@ -839,6 +918,27 @@ const REMOTE_CLEANUP_MAX_RETRY_MS: i64 = 24 * 60 * 60 * 1000;
 /// Just past the source cache's idle window, so tars a pass had to skip are removable.
 const SOURCE_SWEEP_DELAY_MS: i64 = (crate::jobs::ssh::cleanup::SOURCE_IDLE_MINUTES + 1) * 60 * 1000;
 
+fn check_reader_floor(conn: &Connection) -> Result<()> {
+    let has_floor: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_metadata')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_floor {
+        let floor: Option<i64> = conn
+            .query_row(
+                "SELECT value FROM store_metadata WHERE key = 'min_reader_version'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(floor) = floor.filter(|floor| *floor > 1) {
+            return Err(anyhow!("This database requires a newer OpenResearch reader (min_reader_version {}). Update orx before opening it.", floor));
+        }
+    }
+    Ok(())
+}
+
 pub struct Store {
     conn: Connection,
     data_dir: PathBuf,
@@ -846,6 +946,10 @@ pub struct Store {
 }
 
 impl Store {
+    pub(crate) fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     pub(crate) fn relocate_project_paths(&self, paths: &[(String, String)]) -> Result<()> {
         let tx = self.begin()?;
         for (old, new) in paths {
@@ -864,12 +968,6 @@ impl Store {
         Self::open_at_with_move_lock(data_dir(), data_dir_move_lock_path(), BUSY_TIMEOUT)
     }
 
-    /// Open like `open`, but cap SQLite's lock wait — `orx exp wait` shrinks
-    /// this to its deadline so one blocked open can't overshoot it.
-    pub fn open_with_busy_timeout(busy_timeout: Duration) -> Result<Self> {
-        Self::open_at_with_move_lock(data_dir(), data_dir_move_lock_path(), busy_timeout)
-    }
-
     /// Open a store rooted at an explicit directory, bypassing `data_dir()`
     /// resolution.
     pub fn open_at(dir: PathBuf) -> Result<Self> {
@@ -877,41 +975,81 @@ impl Store {
         Self::open_at_with_move_lock(dir, move_lock_path, BUSY_TIMEOUT)
     }
 
+    /// Opens the store for a command that only reads it. Where the store cannot be
+    /// written, as in a sandboxed agent, it opens read-only and applies no schema;
+    /// elsewhere it opens as `open` does, so a newer reader still finds its columns.
+    pub fn open_for_reading() -> Result<Self> {
+        Self::open_for_reading_within(BUSY_TIMEOUT)
+    }
+
+    /// Open like `open_for_reading`, but cap SQLite's lock wait — `orx exp wait`
+    /// shrinks this to its deadline so one blocked open can't overshoot it.
+    pub fn open_for_reading_within(busy_timeout: Duration) -> Result<Self> {
+        let dir = data_dir();
+        let db = dir.join("orx.db");
+        let exists = db
+            .try_exists()
+            .with_context(|| format!("Could not read {}", db.display()))?;
+        let writable =
+            || Self::open_at_with_move_lock(data_dir(), data_dir_move_lock_path(), busy_timeout);
+        if !exists {
+            return writable();
+        }
+        // SQLite opens a file it may not write read-only.
+        let conn = Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .with_context(|| format!("Could not open {}", db.display()))?;
+        if !conn.is_readonly(rusqlite::DatabaseName::Main)? {
+            drop(conn);
+            return writable();
+        }
+        check_reader_floor(&conn)?;
+        conn.pragma_update(None, "busy_timeout", busy_timeout.as_millis() as u64)?;
+        Ok(Self {
+            conn,
+            data_dir: dir,
+            data_dir_move_lock_path: data_dir_move_lock_path(),
+        })
+    }
+
     fn open_at_with_move_lock(
         dir: PathBuf,
         data_dir_move_lock_path: PathBuf,
         busy_timeout: Duration,
     ) -> Result<Self> {
-        std::fs::create_dir_all(&dir)?;
+        crate::paths::create_dir_all(&dir)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             // SQLite and its sidecars contain scoped rental capabilities.
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         }
-        std::fs::create_dir_all(dir.join("run-logs"))
-            .map_err(|e| anyhow!("Could not create {}: {}", dir.display(), e))?;
+        crate::paths::create_dir_all(&dir.join("run-logs"))?;
         let conn = Connection::open(dir.join("orx.db"))?;
-        let has_floor: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_metadata')",
-            [],
-            |row| row.get(0),
-        )?;
-        if has_floor {
-            let floor: Option<i64> = conn
-                .query_row(
-                    "SELECT value FROM store_metadata WHERE key = 'min_reader_version'",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(floor) = floor.filter(|floor| *floor > 1) {
-                return Err(anyhow!("This database requires a newer OpenResearch reader (min_reader_version {}). Update orx before opening it.", floor));
+        conn.busy_timeout(busy_timeout)?;
+        check_reader_floor(&conn)?;
+        // WAL conversion can return SQLITE_BUSY without invoking SQLite's busy handler.
+        let wal_start = std::time::Instant::now();
+        let mut delay = Duration::from_millis(1);
+        while let Err(error) = conn.pragma_update(None, "journal_mode", "WAL") {
+            let remaining = busy_timeout.saturating_sub(wal_start.elapsed());
+            if remaining.is_zero()
+                || error.sqlite_error_code() != Some(rusqlite::ErrorCode::DatabaseBusy)
+            {
+                return Err(error).with_context(|| {
+                    format!(
+                        "Could not prepare the database at {}. Try again.",
+                        dir.join("orx.db").display()
+                    )
+                });
             }
+            std::thread::sleep(delay.min(remaining));
+            conn.busy_timeout(busy_timeout.saturating_sub(wal_start.elapsed()))?;
+            delay = (delay * 2).min(Duration::from_millis(50));
         }
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "busy_timeout", busy_timeout.as_millis() as u64)?;
-        conn.execute_batch(
+        conn.busy_timeout(busy_timeout)?;
+        let schema =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        schema.execute_batch(
             "CREATE TABLE IF NOT EXISTS store_metadata (
                 key TEXT PRIMARY KEY,
                 value INTEGER NOT NULL
@@ -1150,6 +1288,12 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_chat_subscriptions_target
                 ON chat_subscriptions(target_session_id);
+            CREATE TABLE IF NOT EXISTS chat_project_moves (
+                session_id   TEXT PRIMARY KEY,
+                name         TEXT NOT NULL,
+                path         TEXT NOT NULL,
+                requested_at INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS chat_turn_leases (
                 chat_session_id TEXT PRIMARY KEY,
                 claim_token     TEXT NOT NULL,
@@ -1206,6 +1350,18 @@ impl Store {
                 launch_json TEXT NOT NULL,
                 configuration_json TEXT NOT NULL DEFAULT '[]'
             );
+            CREATE TABLE IF NOT EXISTS project_env_vars (
+                project_id  TEXT NOT NULL,
+                key         TEXT NOT NULL,
+                value       TEXT NOT NULL,
+                description TEXT,
+                created_at  INTEGER NOT NULL,
+                PRIMARY KEY (project_id, key)
+            );
+            CREATE TABLE IF NOT EXISTS env_var_descriptions (
+                key         TEXT PRIMARY KEY,
+                description TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS ui_state (
                 id                       INTEGER PRIMARY KEY CHECK (id = 1),
                 onboarding_completed     INTEGER NOT NULL DEFAULT 0,
@@ -1239,6 +1395,7 @@ impl Store {
             "ALTER TABLE local_projects ADD COLUMN paper_id TEXT",
             "ALTER TABLE local_projects ADD COLUMN github_sync_enabled INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE local_projects ADD COLUMN workspace_state_json TEXT",
+            "ALTER TABLE local_projects ADD COLUMN icon_json TEXT",
             "ALTER TABLE local_experiments ADD COLUMN chat_session_id TEXT",
             "ALTER TABLE local_experiments ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE ssh_host_tests ADD COLUMN tools_found INTEGER NOT NULL DEFAULT 0",
@@ -1253,6 +1410,8 @@ impl Store {
             "ALTER TABLE chat_messages ADD COLUMN base_native_session_id TEXT",
             "ALTER TABLE chat_messages ADD COLUMN result_native_session_id TEXT",
             "ALTER TABLE chat_messages ADD COLUMN native_harness TEXT",
+            "ALTER TABLE chat_messages ADD COLUMN result_native_message_id TEXT",
+            "ALTER TABLE chat_sessions ADD COLUMN native_fork_at TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN active_leaf_id TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN parent_session_id TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN goal TEXT",
@@ -1274,11 +1433,31 @@ impl Store {
             "ALTER TABLE runs ADD COLUMN launch_spec TEXT",
             "ALTER TABLE runs ADD COLUMN notify_cursor TEXT",
             "ALTER TABLE runs ADD COLUMN started_at INTEGER",
+            "ALTER TABLE ui_state ADD COLUMN opencode_free_models INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE ui_state ADD COLUMN opencode_review_model TEXT",
+            "ALTER TABLE chat_sessions ADD COLUMN profile_id TEXT",
+            "ALTER TABLE ui_state ADD COLUMN preferred_profile TEXT",
+            "ALTER TABLE ui_state ADD COLUMN favorite_models TEXT",
+            "ALTER TABLE ui_state ADD COLUMN hidden_models TEXT",
+            "ALTER TABLE ui_state ADD COLUMN hidden_agents TEXT",
+            "ALTER TABLE ui_state ADD COLUMN model_section_order TEXT",
+            "ALTER TABLE ui_state ADD COLUMN collapsed_model_sections TEXT",
+            "ALTER TABLE ui_state ADD COLUMN model_sightings TEXT",
+            "ALTER TABLE runs ADD COLUMN waiting_reason TEXT",
+            "ALTER TABLE runs ADD COLUMN price_json TEXT",
+            "ALTER TABLE chat_usage_samples ADD COLUMN cost_micros INTEGER",
+            "ALTER TABLE chat_usage_samples ADD COLUMN cost_currency TEXT",
+            "ALTER TABLE chat_usage_samples ADD COLUMN recorded_at INTEGER",
+            "ALTER TABLE ui_state ADD COLUMN seen_nudges TEXT",
         ] {
-            let _ = conn.execute(ddl, []);
+            let _ = schema.execute(ddl, []);
         }
-        conn.execute_batch(
-            "CREATE TRIGGER IF NOT EXISTS delete_run_outbox AFTER DELETE ON runs BEGIN
+        schema.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_chat_usage_samples_recorded
+                 ON chat_usage_samples(recorded_at);
+             CREATE INDEX IF NOT EXISTS idx_chat_usage_executions_turn
+                 ON chat_usage_executions(turn_id);
+             CREATE TRIGGER IF NOT EXISTS delete_run_outbox AFTER DELETE ON runs BEGIN
                  DELETE FROM run_notices WHERE run_id = OLD.id;
                  DELETE FROM run_subscriptions WHERE run_id = OLD.id;
              END;
@@ -1288,17 +1467,20 @@ impl Store {
              END;",
         )?;
         // Covers the periodic native-id scan so it never reads the large parts_json.
-        conn.execute_batch(
+        schema.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_native_ids
              ON chat_messages(base_native_session_id, result_native_session_id, session_id);",
         )?;
-        conn.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_log_collection AFTER DELETE ON runs BEGIN DELETE FROM log_collections WHERE run_id = OLD.id; END;")?;
-        conn.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_chat_steer_receipts AFTER DELETE ON chat_sessions BEGIN DELETE FROM chat_steer_receipts WHERE session_id = OLD.id; END;")?;
-        conn.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_chat_invocation_identities AFTER DELETE ON chat_sessions BEGIN DELETE FROM native_invocation_identities WHERE session_id = OLD.id; END;")?;
-        conn.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_acp_session AFTER DELETE ON chat_sessions BEGIN DELETE FROM acp_sessions WHERE session_id = OLD.id; END;")?;
-        conn.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_chat_subscriptions AFTER DELETE ON chat_sessions BEGIN DELETE FROM chat_subscriptions WHERE subscriber_session_id = OLD.id OR target_session_id = OLD.id; END;")?;
+        schema.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_project_env_vars AFTER DELETE ON local_projects BEGIN DELETE FROM project_env_vars WHERE project_id = OLD.id; END;")?;
+        schema.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_log_collection AFTER DELETE ON runs BEGIN DELETE FROM log_collections WHERE run_id = OLD.id; END;")?;
+        schema.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_chat_steer_receipts AFTER DELETE ON chat_sessions BEGIN DELETE FROM chat_steer_receipts WHERE session_id = OLD.id; END;")?;
+        schema.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_chat_project_move AFTER DELETE ON chat_sessions BEGIN DELETE FROM chat_project_moves WHERE session_id = OLD.id; END;")?;
+        schema.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_chat_invocation_identities AFTER DELETE ON chat_sessions BEGIN DELETE FROM native_invocation_identities WHERE session_id = OLD.id; END;")?;
+        schema.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_acp_session AFTER DELETE ON chat_sessions BEGIN DELETE FROM acp_sessions WHERE session_id = OLD.id; END;")?;
+        schema.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_chat_subscriptions AFTER DELETE ON chat_sessions BEGIN DELETE FROM chat_subscriptions WHERE subscriber_session_id = OLD.id OR target_session_id = OLD.id; END;")?;
         // A delegate that outlives its delegator, in a worktree of its own, stands as the user's.
-        conn.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_chat_delegates AFTER DELETE ON chat_sessions BEGIN DELETE FROM chat_delegates WHERE session_id = OLD.id OR parent_session_id = OLD.id; END;")?;
+        schema.execute_batch("CREATE TRIGGER IF NOT EXISTS delete_chat_delegates AFTER DELETE ON chat_sessions BEGIN DELETE FROM chat_delegates WHERE session_id = OLD.id OR parent_session_id = OLD.id; END;")?;
+        schema.commit()?;
         conn.execute(
             "DELETE FROM native_invocation_identities WHERE session_id IS NULL AND created_at < ?1",
             [now_ms() - 7 * 24 * 60 * 60 * 1000],
@@ -1366,7 +1548,7 @@ impl Store {
         );
         let _ = conn.execute(
             "UPDATE chat_sessions
-             SET plan_mode = 1, permission_mode = 'default'
+             SET plan_mode = 1, permission_mode = 'auto-approve'
              WHERE harness = 'opencode' AND permission_mode = 'plan'",
             [],
         );
@@ -1379,11 +1561,11 @@ impl Store {
             ("codex", "bypass", "full-access"),
             ("codex", "accept-edits", "ask"),
             ("codex", "acceptEdits", "ask"),
-            ("opencode", "auto", "default"),
+            ("opencode", "default", "auto-approve"),
             ("opencode", "bypass", "auto-approve"),
-            ("opencode", "ask", "default"),
-            ("opencode", "accept-edits", "default"),
-            ("opencode", "acceptEdits", "default"),
+            ("opencode", "ask", "auto-approve"),
+            ("opencode", "accept-edits", "auto-approve"),
+            ("opencode", "acceptEdits", "auto-approve"),
         ] {
             let _ = conn.execute(
                 "UPDATE chat_sessions SET permission_mode = ?3
@@ -1406,10 +1588,10 @@ impl Store {
             [],
         );
         let _ = conn.execute(
-            "UPDATE chat_sessions SET permission_mode = 'default'
+            "UPDATE chat_sessions SET permission_mode = 'auto-approve'
              WHERE harness = 'opencode'
                AND (permission_mode IS NULL OR permission_mode NOT IN
-                    ('default', 'auto-approve'))",
+                    ('manual', 'auto', 'auto-approve'))",
             [],
         );
         // Seed before normalizing preferences: on the first open of an older
@@ -1438,7 +1620,7 @@ impl Store {
             [],
         );
         let _ = conn.execute(
-            "UPDATE ui_state SET preferred_permission_mode = 'default'
+            "UPDATE ui_state SET preferred_permission_mode = 'auto-approve'
              WHERE preferred_harness = 'opencode' AND preferred_permission_mode = 'plan'",
             [],
         );
@@ -1454,7 +1636,7 @@ impl Store {
             ("claude-code", "bypass", "bypassPermissions"),
             ("codex", "auto", "approve-for-me"),
             ("codex", "bypass", "full-access"),
-            ("opencode", "auto", "default"),
+            ("opencode", "default", "auto-approve"),
             ("opencode", "bypass", "auto-approve"),
         ] {
             let _ = conn.execute(
@@ -1477,9 +1659,9 @@ impl Store {
             [],
         );
         let _ = conn.execute(
-            "UPDATE ui_state SET preferred_permission_mode = 'default'
+            "UPDATE ui_state SET preferred_permission_mode = 'auto-approve'
              WHERE preferred_harness = 'opencode'
-               AND preferred_permission_mode NOT IN ('default', 'auto-approve')",
+               AND preferred_permission_mode NOT IN ('manual', 'auto', 'auto-approve')",
             [],
         );
         // NOTE: `reasoning_level` deliberately has NO migration for issue #123,
@@ -1530,20 +1712,31 @@ impl Store {
             "SELECT onboarding_completed, tour_completed, preferred_harness,
                     preferred_model, preferred_service_tier,
                     preferred_permission_mode, preferred_reasoning_level, workspace_state_json,
-                    preferred_autonomy, nested_delegation
+                    preferred_autonomy, nested_delegation, opencode_free_models, preferred_profile,
+                    favorite_models, hidden_models, model_section_order,
+                    collapsed_model_sections, model_sightings, hidden_agents, seen_nudges,
+                    opencode_review_model
              FROM ui_state WHERE id = 1",
             [],
             |row| {
+                let profile: Option<String> = row.get(11)?;
                 let harness = row.get::<_, Option<String>>(2)?;
                 let model = row.get::<_, Option<String>>(3)?;
                 let service_tier = row.get::<_, Option<String>>(4)?;
                 let permission_mode = row.get::<_, Option<String>>(5)?;
                 let reasoning_level = row.get::<_, Option<String>>(6)?;
                 let workspace_json = row.get::<_, Option<String>>(7)?;
+                let list = |index| -> rusqlite::Result<Vec<String>> {
+                    Ok(row
+                        .get::<_, Option<String>>(index)?
+                        .and_then(|json| serde_json::from_str(&json).ok())
+                        .unwrap_or_default())
+                };
                 Ok(StoredUiState {
                     onboarding_completed: row.get(0)?,
                     tour_completed: row.get(1)?,
                     preferred_agent: harness.map(|harness| StoredAgentSelection {
+                        profile,
                         harness,
                         model,
                         service_tier,
@@ -1558,6 +1751,17 @@ impl Store {
                         .as_deref()
                         .and_then(Autonomy::from_id),
                     nested_delegation: row.get(9)?,
+                    opencode_free_models: row.get(10)?,
+                    opencode_review_model: row.get(19)?,
+                    favorite_models: list(12)?,
+                    hidden_models: list(13)?,
+                    hidden_agents: list(17)?,
+                    model_section_order: list(14)?,
+                    collapsed_model_sections: list(15)?,
+                    model_sightings: row
+                        .get::<_, Option<String>>(16)?
+                        .and_then(|json| serde_json::from_str(&json).ok()),
+                    seen_nudges: list(18)?,
                 })
             },
         )?)
@@ -1617,6 +1821,31 @@ impl Store {
         Ok(())
     }
 
+    /// Store one of the picker's JSON columns; `column` is always a literal.
+    pub fn set_ui_json(&self, column: &'static str, value: &impl Serialize) -> Result<()> {
+        self.conn.execute(
+            &format!("UPDATE ui_state SET {column} = ?1 WHERE id = 1"),
+            params![serde_json::to_string(value)?],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_opencode_review_model(&self, model: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE ui_state SET opencode_review_model = ?1 WHERE id = 1",
+            params![model],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_opencode_free_models(&self, offered: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE ui_state SET opencode_free_models = ?1 WHERE id = 1",
+            params![offered],
+        )?;
+        Ok(())
+    }
+
     pub fn set_preferred_autonomy(&self, autonomy: Autonomy) -> Result<()> {
         self.conn.execute(
             "UPDATE ui_state SET preferred_autonomy = ?1 WHERE id = 1",
@@ -1630,7 +1859,7 @@ impl Store {
             "UPDATE ui_state
              SET preferred_harness = ?1, preferred_model = ?2,
                  preferred_service_tier = ?3,
-                 preferred_permission_mode = ?4, preferred_reasoning_level = ?5
+                 preferred_permission_mode = ?4, preferred_reasoning_level = ?5, preferred_profile = ?6
              WHERE id = 1",
             params![
                 selection.harness,
@@ -1638,6 +1867,7 @@ impl Store {
                 selection.service_tier,
                 selection.permission_mode,
                 selection.reasoning_level,
+                selection.profile,
             ],
         )?;
         Ok(())
@@ -1750,29 +1980,72 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    pub(crate) fn engine_runs_block_idle(&self) -> Result<bool> {
-        let mut statement = self.conn.prepare("SELECT status FROM runs")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        for status in rows {
-            let status = status?;
+    /// What quitting would interrupt or leave unreported, given the chats with a turn in this process.
+    pub(crate) fn pending_work(&self, working: &[String]) -> Result<PendingWork> {
+        let mut statement = self.conn.prepare(
+            "SELECT s.project_id, p.name, s.id, s.side_parent_session_id, s.harness, NULLIF(TRIM(s.title), '')
+             FROM chat_sessions s LEFT JOIN local_projects p ON p.id = s.project_id
+             WHERE s.id IN (SELECT value FROM json_each(?1))
+             ORDER BY s.updated_at DESC",
+        )?;
+        let agents = statement
+            .query_map([serde_json::to_string(working)?], |row| {
+                Ok(PendingAgent {
+                    project_id: row.get(0)?,
+                    project: row.get(1)?,
+                    session_id: row.get(2)?,
+                    side_parent_id: row.get(3)?,
+                    harness: row.get(4)?,
+                    title: row.get(5)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+
+        // A run under a detached supervisor is finished by it, whatever its backend.
+        let mut statement = self.conn.prepare(
+            "SELECT r.status, r.project_id, p.name, r.experiment_id, r.id,
+                    COALESCE(r.chat_session_id, e.chat_session_id),
+                    COALESCE(NULLIF(e.title, ''), e.slug, r.id),
+                    COALESCE(json_extract(r.launch_spec, '$.kind'),
+                             json_extract(r.backend_json, '$.handle.descriptor.kind'),
+                             json_extract(r.backend_json, '$.kind')),
+                    r.launch_spec IS NOT NULL
+                        AND json_extract(r.backend_json, '$.handle.type') IS NOT 'Legacy',
+                    EXISTS(SELECT 1 FROM run_notices n WHERE n.run_id = r.id
+                           AND n.delivered_at IS NULL AND n.retired_at IS NULL)
+             FROM runs r
+             LEFT JOIN local_experiments e ON e.id = r.experiment_id
+             LEFT JOIN local_projects p ON p.id = r.project_id
+             ORDER BY r.created_at",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut runs = Vec::new();
+        while let Some(row) = rows.next()? {
+            let status: String = row.get(0)?;
+            let backend: Option<String> = row.get(7)?;
+            let engine_owned: bool = row.get(8)?;
+            let unreported: bool = row.get(9)?;
             let phase = crate::engine::Phase::parse(&status)
                 .ok_or_else(|| anyhow!("Unknown run status: {status}"))?;
-            if !phase.is_terminal() {
-                return Ok(true);
-            }
+            let after_quit = match (phase.is_terminal(), backend.as_deref(), engine_owned) {
+                (true, _, _) if unreported => AfterQuit::Reports,
+                (true, _, _) => continue,
+                (false, Some("local_job" | "tinker_job"), _)
+                | (false, Some("vercel_job" | "openresearch_job"), true) => AfterQuit::NeedsApp,
+                (false, _, _) => AfterQuit::Continues,
+            };
+            runs.push(PendingRun {
+                project_id: row.get(1)?,
+                project: row.get(2)?,
+                experiment_id: row.get(3)?,
+                run_id: row.get(4)?,
+                session_id: row.get(5)?,
+                name: row.get(6)?,
+                backend,
+                after_quit,
+            });
         }
-        Ok(false)
-    }
-
-    pub(crate) fn engine_idle_blocked(&self) -> Result<bool> {
-        if self.engine_runs_block_idle()? {
-            return Ok(true);
-        }
-        Ok(self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM run_notices WHERE delivered_at IS NULL AND retired_at IS NULL)
-                OR EXISTS(SELECT 1 FROM chat_turns WHERE state IN ('preparing','retrying','running'))",
-            [], |row| row.get(0),
-        )?)
+        Ok(PendingWork { agents, runs })
     }
 
     /// Runs or local processes that prevent moving their working directory.
@@ -2148,16 +2421,21 @@ impl Store {
         )?)
     }
 
-    pub fn claim_chat_turn(&self, chat_session_id: &str, token: &str) -> Result<bool> {
+    pub fn claim_chat_turn(
+        &self,
+        chat_session_id: &str,
+        token: &str,
+        held: &[String],
+    ) -> Result<bool> {
         self.clear_stale_data_dir_move_lease()?;
+        expire_turn_leases(&self.conn, held)?;
         self.conn.execute(
             "DELETE FROM chat_turn_leases
-             WHERE heartbeat_at < ?1
-                OR NOT EXISTS (
-                    SELECT 1 FROM chat_sessions
-                    WHERE chat_sessions.id = chat_turn_leases.chat_session_id
-                )",
-            params![expired_before(CHAT_TURN_LEASE_TTL)],
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM chat_sessions
+                 WHERE chat_sessions.id = chat_turn_leases.chat_session_id
+             )",
+            [],
         )?;
         let claimed = self.conn.execute(
             "INSERT OR IGNORE INTO chat_turn_leases
@@ -2187,11 +2465,8 @@ impl Store {
         Ok(())
     }
 
-    pub fn claim_data_dir_move(&self, token: &str) -> Result<bool> {
-        self.conn.execute(
-            "DELETE FROM chat_turn_leases WHERE heartbeat_at < ?1",
-            params![expired_before(CHAT_TURN_LEASE_TTL)],
-        )?;
+    pub fn claim_data_dir_move(&self, token: &str, held: &[String]) -> Result<bool> {
+        expire_turn_leases(&self.conn, held)?;
         self.clear_stale_data_dir_move_lease()?;
         let claimed = self.conn.execute(
             "INSERT OR IGNORE INTO data_dir_move_lease (id, claim_token, heartbeat_at)
@@ -2271,6 +2546,15 @@ impl Store {
     /// Update only the run's backend descriptor — for a supervisor learning
     /// more about its job mid-flight (e.g. the openresearch box's SSH
     /// endpoint) without clobbering status/markdown/cancel state.
+    /// The descriptor an orx 0.2 launch wrote beside the store in case SQLite refused it.
+    pub fn submission_handle(&self, run_id: &str) -> Result<Option<String>> {
+        match std::fs::read_to_string(self.run_artifact_path(SUBMISSION_HANDLE, run_id)) {
+            Ok(json) => Ok(Some(json)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn set_backend_json(&self, run_id: &str, backend_json: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE runs SET backend_json = ?2, updated_at = ?3 WHERE id = ?1",
@@ -2293,7 +2577,7 @@ impl Store {
     ) -> Result<bool> {
         let tx = self.begin()?;
         let inserted = tx.execute(
-            &format!("INSERT OR IGNORE INTO local_projects ({PROJECT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
+            &format!("INSERT OR IGNORE INTO local_projects ({PROJECT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"),
             params![
                 project.id,
                 project.name,
@@ -2307,6 +2591,7 @@ impl Store {
                 project.paper_id,
                 project.created_at,
                 project.updated_at,
+                project.icon.as_ref().map(|icon| icon.to_string()),
             ],
         )?;
         if inserted == 0 {
@@ -2361,8 +2646,8 @@ impl Store {
                                             title_source, model, service_tier, permission_mode, plan_mode,
                                             plan_reset_pending, reasoning_level,
                                             archived, context_usage_json, bootstrap_context,
-                                            active_leaf_id, created_at, updated_at, side_parent_session_id, side_parent_leaf_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                                            active_leaf_id, created_at, updated_at, side_parent_session_id, side_parent_leaf_id, profile_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                 params![
                     session.id,
                     session.project_id,
@@ -2384,6 +2669,7 @@ impl Store {
                     session.updated_at,
                     session.side_parent_session_id,
                     session.side_parent_leaf_id,
+                    session.profile_id,
                 ],
             )?;
             if let Some(state) = self.acp_launch_for_session(session)? {
@@ -2417,15 +2703,7 @@ impl Store {
     }
 
     pub fn create_local_project(&self, p: &LocalProject) -> Result<()> {
-        self.conn.execute(
-            &format!("INSERT INTO local_projects ({PROJECT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"),
-            params![
-                p.id, p.name, p.slug, p.github_owner, p.github_repo,
-                p.github_sync_enabled, p.baseline_branch, p.repo_path, p.run_command, p.paper_id,
-                p.created_at, p.updated_at,
-            ],
-        )?;
-        Ok(())
+        insert_local_project(&self.conn, p)
     }
 
     pub fn get_local_project(&self, id: &str) -> Result<Option<LocalProject>> {
@@ -3153,6 +3431,15 @@ impl Store {
         Ok(())
     }
 
+    /// A chat without a project becomes a project when the user names it.
+    pub fn restamp_local_project_created(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE local_projects SET created_at = ?2 WHERE id = ?1",
+            params![id, now_ms()],
+        )?;
+        Ok(())
+    }
+
     /// Bump updated_at only — records a visit for the recency sort and fires
     /// the SSE project.updated diff.
     pub fn touch_local_project(&self, id: &str) -> Result<()> {
@@ -3168,7 +3455,7 @@ impl Store {
         self.conn.execute(
             "UPDATE local_projects SET name = ?2, slug = ?3, github_owner = ?4, github_repo = ?5,
                     github_sync_enabled = ?6, baseline_branch = ?7, repo_path = ?8,
-                    run_command = ?9, paper_id = ?10, updated_at = ?11
+                    run_command = ?9, paper_id = ?10, updated_at = ?11, icon_json = ?12
              WHERE id = ?1",
             params![
                 p.id,
@@ -3182,6 +3469,7 @@ impl Store {
                 p.run_command,
                 p.paper_id,
                 now_ms(),
+                p.icon.as_ref().map(|icon| icon.to_string()),
             ],
         )?;
         Ok(())
@@ -3332,8 +3620,8 @@ impl Store {
             "INSERT INTO chat_sessions (id, project_id, harness, native_session_id, title, title_source, model,
                                         service_tier, permission_mode, plan_mode, plan_reset_pending, reasoning_level, archived, bootstrap_context,
                                         active_leaf_id, created_at, updated_at, autonomy,
-                                        side_parent_session_id, side_parent_leaf_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                                        side_parent_session_id, side_parent_leaf_id, profile_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 s.id,
                 s.project_id,
@@ -3355,6 +3643,7 @@ impl Store {
                 s.autonomy,
                 s.side_parent_session_id,
                 s.side_parent_leaf_id,
+                s.profile_id,
             ],
         )?;
         if let Some(state) = acp_state {
@@ -3410,11 +3699,25 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    pub fn chat_session_ids_for_agent(
+        &self,
+        harness: &str,
+        executable: &str,
+    ) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT c.id FROM chat_sessions c LEFT JOIN acp_sessions a ON a.session_id = c.id
+             WHERE c.harness IN (?1, ?2)
+                OR (c.harness LIKE 'acp:%' AND json_extract(a.launch_json, '$.executable') = ?2)",
+        )?;
+        let rows = stmt.query_map(params![harness, executable], |row| row.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Every project's sessions for the composer's `/resume` picker, capped so a
     /// long-lived install cannot turn one dialog open into a multi-megabyte read.
     pub fn list_all_chat_sessions(&self) -> Result<Vec<StoredChatSession>> {
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT {CHAT_SESSION_COLS} FROM chat_sessions WHERE side_parent_session_id IS NULL
+            "SELECT {CHAT_SESSION_COLS} FROM chat_sessions WHERE {TOP_LEVEL_CHATS}
              ORDER BY updated_at DESC LIMIT 500"
         ))?;
         let rows = stmt.query_map([], row_to_chat_session)?;
@@ -3428,7 +3731,7 @@ impl Store {
     ) -> Result<Vec<StoredChatSession>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {CHAT_SESSION_COLS} FROM chat_sessions
-             WHERE side_parent_session_id IS NULL AND (?1 IS NULL OR archived = ?1)
+             WHERE {TOP_LEVEL_CHATS} AND (?1 IS NULL OR archived = ?1)
                AND (?2 IS NULL OR updated_at < ?2 OR (updated_at = ?2 AND id < ?3))
              ORDER BY updated_at DESC, id DESC LIMIT 51"
         ))?;
@@ -3440,6 +3743,31 @@ impl Store {
             ],
             row_to_chat_session,
         )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Top-level chats with an experiment run in flight, wherever they fall in the sidebar's paging.
+    /// Top-level chats still at work: with an experiment running, or among `live`,
+    /// the chats whose agent or delegates the server sees working.
+    pub fn sidebar_chat_sessions_at_work(
+        &self,
+        archived: Option<bool>,
+        live: &[&str],
+    ) -> Result<Vec<StoredChatSession>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {CHAT_SESSION_COLS} FROM chat_sessions
+             WHERE {TOP_LEVEL_CHATS} AND (?1 IS NULL OR archived = ?1)
+               AND (id IN (
+                 SELECT chat_session_id FROM runs
+                 WHERE status IN ('submitting', 'starting', 'running')
+                 UNION SELECT s.chat_session_id FROM run_subscriptions s
+                 JOIN runs r ON r.id = s.run_id
+                 WHERE r.status IN ('submitting', 'starting', 'running')
+               ) OR id IN (SELECT value FROM json_each(?2)))
+             ORDER BY updated_at DESC, id DESC"
+        ))?;
+        let live = serde_json::to_string(live)?;
+        let rows = stmt.query_map(params![archived, live], row_to_chat_session)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -3476,14 +3804,32 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Each agent and account (`profile_id`) a chat on this machine ran a turn on. Seeded
+    /// chats, such as the demo's, never ran one. An agent a chat switched away from counts as
+    /// its own install, since a switch records the agent of its earlier messages but no account.
+    pub fn chat_agents_used(&self) -> Result<Vec<(String, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT harness, profile_id FROM chat_sessions AS s
+             WHERE native_session_id IS NOT NULL
+                OR EXISTS (SELECT 1 FROM chat_turns WHERE session_id = s.id)
+             UNION
+             SELECT m.native_harness, NULL FROM chat_messages AS m
+             JOIN chat_sessions AS s ON s.id = m.session_id
+             WHERE m.native_harness IS NOT NULL AND m.native_harness != s.harness",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Project totals include archived sessions so the agent count reflects
     /// every agent that has worked on the project, not only the visible rail.
     pub fn list_project_activity_summaries(&self) -> Result<Vec<ProjectActivitySummary>> {
         let mut stmt = self.conn.prepare(
-            "WITH agent_counts AS (
+            &format!(
+                "WITH agent_counts AS (
                  SELECT project_id, COUNT(*) AS total_agents
                  FROM chat_sessions
-                 WHERE side_parent_session_id IS NULL
+                 WHERE {TOP_LEVEL_CHATS}
                  GROUP BY project_id
              ),
              experiment_counts AS (
@@ -3530,7 +3876,8 @@ impl Store {
              LEFT JOIN running_experiment_counts
                ON running_experiment_counts.project_id = local_projects.id
              LEFT JOIN latest_messages ON latest_messages.project_id = local_projects.id
-             JOIN latest_activity ON latest_activity.project_id = local_projects.id",
+             JOIN latest_activity ON latest_activity.project_id = local_projects.id"
+            ),
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(ProjectActivitySummary {
@@ -3546,7 +3893,7 @@ impl Store {
     }
 
     /// Hold through ownership lookup, native purge and local row deletion, across dashboard processes.
-    pub fn lock_native_deletion(&self) -> Result<std::fs::File> {
+    pub fn lock_native_deletion(&self) -> Result<crate::file_lock::FileLock> {
         let path = self
             .conn
             .path()
@@ -3562,7 +3909,7 @@ impl Store {
                 "Could not lock native chat deletion; retry when other deletions finish: {error}"
             )
         })?;
-        Ok(lock)
+        Ok(crate::file_lock::FileLock::new(lock))
     }
 
     pub fn native_sessions_for_deletion(
@@ -3611,6 +3958,65 @@ impl Store {
             }
         }
         Ok((deleting, retained))
+    }
+
+    /// A new project the user asked a chat to move into once it is idle.
+    pub fn set_chat_project_move(&self, session_id: &str, name: &str, path: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO chat_project_moves (session_id, name, path, requested_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, name, path, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn chat_project_move(&self, session_id: &str) -> Result<Option<(String, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT name, path FROM chat_project_moves WHERE session_id = ?1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn chat_project_move_sessions(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT session_id FROM chat_project_moves")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Removes the waiting move, returning it: whoever takes it owns it.
+    pub fn take_chat_project_move(&self, session_id: &str) -> Result<Option<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("DELETE FROM chat_project_moves WHERE session_id = ?1 RETURNING name, path")?;
+        // Stepped to the end, so the delete has committed before the row is returned.
+        let rows = stmt
+            .query_map(params![session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().next())
+    }
+
+    /// Creates `p` and moves chats, with their transcripts, into it at once.
+    pub fn create_local_project_for_chats(
+        &self,
+        p: &LocalProject,
+        session_ids: &[String],
+    ) -> Result<()> {
+        let tx = self.begin_immediate()?;
+        insert_local_project(&tx, p)?;
+        for id in session_ids {
+            tx.execute(
+                "UPDATE chat_sessions SET project_id = ?2 WHERE id = ?1",
+                params![id, p.id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn delete_chat_session(&self, id: &str) -> Result<()> {
@@ -3679,7 +4085,7 @@ impl Store {
     }
 
     /// Keeps any dashboard from starting a data-dir move until dropped; `None` while a move holds or claims it.
-    fn hold_off_data_dir_move(&self) -> Result<Option<std::fs::File>> {
+    fn hold_off_data_dir_move(&self) -> Result<Option<crate::file_lock::FileLock>> {
         if self.data_dir_move_claimed()? {
             return Ok(None);
         }
@@ -3690,6 +4096,7 @@ impl Store {
             Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
+        let hold = crate::file_lock::FileLock::new(hold);
         Ok((!self.data_dir_move_lease_exists()?).then_some(hold))
     }
 
@@ -3778,11 +4185,24 @@ impl Store {
     }
 
     /// `None` clears it, which a fork of the session's very first turn needs:
-    /// that turn ran with no harness session to resume from.
+    /// that turn ran with no harness session to resume from. Either way the
+    /// next start resumes it whole, not at a fork point.
     pub fn set_chat_session_native_id(&self, id: &str, native_id: Option<&str>) -> Result<()> {
+        self.set_chat_session_native_fork(id, native_id, None)
+    }
+
+    /// Points the session at the native session its next start resumes and,
+    /// for Claude, the message within it that start branches from.
+    pub fn set_chat_session_native_fork(
+        &self,
+        id: &str,
+        native_id: Option<&str>,
+        fork_at: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
-            "UPDATE chat_sessions SET native_session_id = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id, native_id, now_ms()],
+            "UPDATE chat_sessions SET native_session_id = ?2, native_fork_at = ?3, updated_at = ?4
+             WHERE id = ?1",
+            params![id, native_id, fork_at, now_ms()],
         )?;
         Ok(())
     }
@@ -3792,6 +4212,7 @@ impl Store {
         id: &str,
         agent: &StoredAgentSelection,
         native_id: Option<&str>,
+        fork_at: Option<&str>,
         marker: &StoredChatMessage,
         plan_mode: bool,
     ) -> Result<()> {
@@ -3812,7 +4233,7 @@ impl Store {
              context_usage_json = NULL, active_leaf_id = ?8,
              plan_mode = ?9,
              plan_reset_pending = (?2 = 'codex' AND ?7 IS NOT NULL AND NOT ?9),
-             updated_at = ?10 WHERE id = ?1",
+             updated_at = ?10, native_fork_at = ?11, profile_id = ?12 WHERE id = ?1",
             params![
                 id,
                 agent.harness,
@@ -3823,7 +4244,9 @@ impl Store {
                 native_id,
                 marker.id,
                 plan_mode,
-                now_ms()
+                now_ms(),
+                fork_at,
+                agent.profile,
             ],
         )?;
         tx.commit()?;
@@ -4607,23 +5030,24 @@ impl Store {
     pub fn reconcile_unfinished_chat_turns(&self) -> Result<Vec<StoredChatTurn>> {
         // Sub-agent usage outliving its parent turn: its native connection died with the server.
         self.finalize_usage_turns("codex-late:", "cancelled")?;
-        self.reconcile_unfinished_chat_turns_inner(true)
+        self.reconcile_unfinished_chat_turns_inner(true, &[])
     }
 
-    pub fn reconcile_expired_unfinished_chat_turns(&self) -> Result<Vec<StoredChatTurn>> {
-        self.reconcile_unfinished_chat_turns_inner(false)
+    pub fn reconcile_expired_unfinished_chat_turns(
+        &self,
+        held: &[String],
+    ) -> Result<Vec<StoredChatTurn>> {
+        self.reconcile_unfinished_chat_turns_inner(false, held)
     }
 
     fn reconcile_unfinished_chat_turns_inner(
         &self,
         include_existing_failures: bool,
+        held: &[String],
     ) -> Result<Vec<StoredChatTurn>> {
         let now = now_ms();
         let transaction = self.conn.unchecked_transaction()?;
-        transaction.execute(
-            "DELETE FROM chat_turn_leases WHERE heartbeat_at < ?1",
-            params![expired_before(CHAT_TURN_LEASE_TTL)],
-        )?;
+        expire_turn_leases(&transaction, held)?;
         let newly_reconciled = {
             let mut statement = transaction.prepare(
                 "SELECT id FROM chat_turns
@@ -4699,7 +5123,8 @@ impl Store {
         let mut stmt = self.conn.prepare(
             // rowid tiebreak: a user message and its reply can share a millisecond.
             "SELECT id, session_id, role, parts_json, created_at, parent_id,
-                    base_native_session_id, result_native_session_id, completed_at, native_harness
+                    base_native_session_id, result_native_session_id, completed_at, native_harness,
+                    result_native_message_id
              FROM chat_messages
              WHERE session_id = ?1 AND created_at >= ?2 ORDER BY created_at ASC, rowid ASC",
         )?;
@@ -4715,6 +5140,7 @@ impl Store {
                 base_native_session_id: row.get(6)?,
                 result_native_session_id: row.get(7)?,
                 native_harness: row.get(9)?,
+                result_native_message_id: row.get(10)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -4748,7 +5174,8 @@ impl Store {
             .conn
             .query_row(
                 "SELECT id, session_id, role, parts_json, created_at, parent_id,
-                        base_native_session_id, result_native_session_id, completed_at, native_harness
+                        base_native_session_id, result_native_session_id, completed_at, native_harness,
+                        result_native_message_id
                  FROM chat_messages WHERE id = ?1",
                 params![id],
                 |row| {
@@ -4763,6 +5190,7 @@ impl Store {
                         base_native_session_id: row.get(6)?,
                         result_native_session_id: row.get(7)?,
                         native_harness: row.get(9)?,
+                        result_native_message_id: row.get(10)?,
                     })
                 },
             )
@@ -4928,10 +5356,15 @@ pub struct SshHostTest {
 /// session/rollout id (set after the first turn for CLIs that mint it lazily).
 #[derive(Debug, Clone)]
 pub struct StoredChatSession {
+    pub profile_id: Option<String>,
     pub id: String,
     pub project_id: String,
     pub harness: String,
     pub native_session_id: Option<String>,
+    /// Claude message within `native_session_id` the next start branches
+    /// from, as a new native session. Set by a fork switch, cleared by any
+    /// other write of the native id, the new session's first among them.
+    pub native_fork_at: Option<String>,
     pub title: Option<String>,
     /// Who wrote `title`: `"fallback"` (first-line placeholder), `"generated"`
     /// (harness auto-title), `"user"` (explicitly chosen — a rename, or the
@@ -4979,6 +5412,7 @@ pub struct StoredChatSession {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct StoredAgentSelection {
+    pub profile: Option<String>,
     pub harness: String,
     pub model: Option<String>,
     pub service_tier: Option<String>,
@@ -4997,6 +5431,22 @@ pub struct StoredUiState {
     /// Whether delegates may delegate in turn unless a `delegate` call says
     /// otherwise. Off: only chats the user started delegate.
     pub nested_delegation: bool,
+    /// Whether OpenCode's free models are offered beside the user's own.
+    pub opencode_free_models: bool,
+    /// The `provider/model` that reviews OpenCode's Auto requests; none means the chat's own.
+    pub opencode_review_model: Option<String>,
+    /// The model families the picker lists first, by the key the picker gives each.
+    pub favorite_models: Vec<String>,
+    /// Models turned off in the picker and for delegates: a canonical id, plus `:free` for its free tier.
+    pub hidden_models: Vec<String>,
+    pub hidden_agents: Vec<String>,
+    /// The picker's section ids in the user's order.
+    pub model_section_order: Vec<String>,
+    pub collapsed_model_sections: Vec<String>,
+    /// The picker's own record of models it has seen, opaque to the server.
+    pub model_sightings: Option<serde_json::Value>,
+    /// The ids of model feed nudges the user dismissed.
+    pub seen_nudges: Vec<String>,
 }
 
 /// Normalized transcript entry; `parts_json` is the wire-format parts array
@@ -5020,6 +5470,9 @@ pub struct StoredChatMessage {
     /// Selecting a branch restores it, so the next message continues the branch
     /// on screen rather than whichever fork ran most recently.
     pub result_native_session_id: Option<String>,
+    /// Claude message this turn ended at within `result_native_session_id`,
+    /// where a fork of the branch past it branches the native session.
+    pub result_native_message_id: Option<String>,
     /// The harness that owns both native session ids on this message.
     pub native_harness: Option<String>,
 }
@@ -5031,15 +5484,18 @@ fn upsert_chat_message_with(conn: &Connection, m: &StoredChatMessage) -> Result<
         // the tree.
         "INSERT INTO chat_messages
                  (id, session_id, role, parts_json, created_at, parent_id,
-                  base_native_session_id, result_native_session_id, completed_at, native_harness)
+                  base_native_session_id, result_native_session_id, completed_at, native_harness,
+                  result_native_message_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
                      COALESCE(?10, (SELECT harness FROM chat_sessions WHERE id = ?2
-                         AND (?7 IS NOT NULL OR ?8 IS NOT NULL))))
+                         AND (?7 IS NOT NULL OR ?8 IS NOT NULL))), ?11)
              ON CONFLICT(id) DO UPDATE SET
                  parts_json = excluded.parts_json,
                  completed_at = COALESCE(excluded.completed_at, completed_at),
                  result_native_session_id = COALESCE(
                      excluded.result_native_session_id, result_native_session_id),
+                 result_native_message_id = COALESCE(
+                     excluded.result_native_message_id, result_native_message_id),
                  native_harness = COALESCE(excluded.native_harness, native_harness)",
         params![
             m.id,
@@ -5051,7 +5507,8 @@ fn upsert_chat_message_with(conn: &Connection, m: &StoredChatMessage) -> Result<
             m.base_native_session_id,
             m.result_native_session_id,
             m.completed_at,
-            m.native_harness
+            m.native_harness,
+            m.result_native_message_id
         ],
     )?;
     Ok(())
@@ -5127,10 +5584,14 @@ fn row_to_chat_turn(
     })
 }
 
+/// The chats the user started or kept: neither a side chat nor a delegate.
+const TOP_LEVEL_CHATS: &str = "side_parent_session_id IS NULL
+     AND id NOT IN (SELECT session_id FROM chat_delegates)";
+
 const CHAT_SESSION_COLS: &str = "id, project_id, harness, native_session_id, title, model, service_tier, \
      permission_mode, plan_mode, plan_reset_pending, reasoning_level, archived, context_usage_json, \
      created_at, updated_at, title_source, bootstrap_context, active_leaf_id, \
-     goal, autonomy, side_parent_session_id, side_parent_leaf_id";
+     goal, autonomy, side_parent_session_id, side_parent_leaf_id, native_fork_at, profile_id";
 
 fn row_to_chat_session(
     row: &rusqlite::Row<'_>,
@@ -5158,6 +5619,8 @@ fn row_to_chat_session(
         autonomy: row.get(19)?,
         side_parent_session_id: row.get(20)?,
         side_parent_leaf_id: row.get(21)?,
+        native_fork_at: row.get(22)?,
+        profile_id: row.get(23)?,
     })
 }
 
@@ -5266,6 +5729,17 @@ impl Store {
         Ok(())
     }
 
+    /// Forgets every root's connection state and the auth state of a host no run uses.
+    pub(crate) fn forget_engine_host(&self, alias: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM engine_hosts WHERE alias = ?1", params![alias])?;
+        self.conn.execute(
+            "DELETE FROM engine_host_auth WHERE alias = ?1",
+            params![alias],
+        )?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn seed_engine_host(
         &self,
@@ -5319,7 +5793,8 @@ impl Store {
             .conn
             .query_row(
                 "SELECT contact, spec_digest, submission_attempt, submission_fence,
-                        cancel_accepted_at, launch_spec, notify_cursor, cancel_unconfirmed, started_at
+                        cancel_accepted_at, launch_spec, notify_cursor, cancel_unconfirmed, started_at,
+                        CASE WHEN status IN ('submitting', 'starting') THEN waiting_reason END
                  FROM runs WHERE id = ?1",
                 [run_id],
                 |row| {
@@ -5333,6 +5808,7 @@ impl Store {
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, Option<String>>(7)?,
                         row.get::<_, Option<i64>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
                     ))
                 },
             )
@@ -5347,6 +5823,7 @@ impl Store {
             notify,
             cancel_unconfirmed,
             started_at,
+            waiting_reason,
         )) = row
         else {
             return Ok(None);
@@ -5355,6 +5832,7 @@ impl Store {
             started_at,
             contact: json(contact)?.unwrap_or(Contact::Live),
             cancel_unconfirmed: json(cancel_unconfirmed)?,
+            waiting_reason,
             spec_digest,
             submission_attempt,
             submission_fence: json(fence)?,
@@ -5979,7 +6457,20 @@ const SELECT_RUN: &str = "SELECT id, experiment_id, project_id, status, backend_
                                  chat_session_id, cancel_reason FROM runs";
 
 const PROJECT_COLS: &str = "id, name, slug, github_owner, github_repo, github_sync_enabled, \
-                            baseline_branch, repo_path, run_command, paper_id, created_at, updated_at";
+                            baseline_branch, repo_path, run_command, paper_id, created_at, updated_at, icon_json";
+
+/// The one insert of a project row, so every column `PROJECT_COLS` names gets its value.
+fn insert_local_project(conn: &rusqlite::Connection, p: &LocalProject) -> Result<()> {
+    conn.execute(
+        &format!("INSERT INTO local_projects ({PROJECT_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"),
+        params![
+            p.id, p.name, p.slug, p.github_owner, p.github_repo,
+            p.github_sync_enabled, p.baseline_branch, p.repo_path, p.run_command, p.paper_id,
+            p.created_at, p.updated_at, p.icon.as_ref().map(|icon| icon.to_string()),
+        ],
+    )?;
+    Ok(())
+}
 
 const EXPERIMENT_COLS: &str = "id, project_id, parent_experiment_id, slug, branch_name, \
                                title, description, run_command, agent_status, created_at, \
@@ -6069,8 +6560,132 @@ fn real_path_under<'a>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn open_busy_timeout_applies_before_schema_reads() {
+        if !crate::config::in_test_child(&[]) {
+            return;
+        }
+
+        drop(Store::open().unwrap());
+        let locked = Connection::open(data_dir().join("orx.db")).unwrap();
+        locked
+            .execute_batch(
+                "PRAGMA locking_mode = EXCLUSIVE;
+                 BEGIN EXCLUSIVE;
+                 UPDATE store_metadata SET value = value;",
+            )
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        let error = Store::open_for_reading_within(Duration::ZERO)
+            .err()
+            .expect("the other connection holds the database exclusively");
+        let elapsed = start.elapsed();
+        assert_eq!(
+            error
+                .downcast_ref::<rusqlite::Error>()
+                .unwrap()
+                .sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    }
+
+    #[test]
+    fn wal_setup_honors_the_lock_timeout() {
+        if !crate::config::in_test_child(&[]) {
+            return;
+        }
+
+        std::fs::create_dir_all(data_dir()).unwrap();
+        let locked = Connection::open(data_dir().join("orx.db")).unwrap();
+        locked
+            .execute_batch(
+                "CREATE TABLE preserved (value TEXT);
+                 INSERT INTO preserved VALUES ('kept');
+                 BEGIN;
+                 SELECT * FROM preserved;",
+            )
+            .unwrap();
+
+        for timeout in [Duration::ZERO, Duration::from_millis(50)] {
+            let start = std::time::Instant::now();
+            let error = Store::open_for_reading_within(timeout)
+                .err()
+                .expect("the reader blocks the journal mode change");
+            let elapsed = start.elapsed();
+            assert_eq!(
+                error
+                    .downcast_ref::<rusqlite::Error>()
+                    .unwrap()
+                    .sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy)
+            );
+            assert!(elapsed >= timeout, "{elapsed:?}");
+            assert!(elapsed < timeout + Duration::from_secs(1), "{elapsed:?}");
+        }
+
+        locked.execute_batch("ROLLBACK").unwrap();
+        let store = Store::open().unwrap();
+        let mode: String = store
+            .conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+    }
+
+    #[test]
+    fn schema_setup_rolls_back_when_a_later_statement_fails() {
+        let dir = crate::local::git::TemporaryDirectory::new("orx-schema-rollback").unwrap();
+        let conn = Connection::open(dir.path().join("orx.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE preserved (value TEXT);
+             INSERT INTO preserved VALUES ('kept');
+             CREATE VIEW runs AS SELECT 'id' AS id;",
+        )
+        .unwrap();
+
+        assert!(Store::open_at(dir.path().to_path_buf()).is_err());
+        let schema_created: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'store_metadata')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!schema_created);
+
+        conn.execute_batch("DROP VIEW runs").unwrap();
+        let store = Store::open_at(dir.path().to_path_buf()).unwrap();
+        let preserved: String = store
+            .conn
+            .query_row("SELECT value FROM preserved", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(preserved, "kept");
+    }
+
+    #[test]
+    fn concurrent_opens_apply_the_schema_without_partial_state() {
+        let dir = crate::local::git::TemporaryDirectory::new("orx-schema-concurrent").unwrap();
+        let ready = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        ready.wait();
+                        let store = Store::open_at(dir.path().to_path_buf()).unwrap();
+                        assert!(!store.ui_state().unwrap().onboarding_completed);
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+    }
 
     #[test]
     fn min_reader_version_refuses_before_migrations_on_every_open() {
@@ -6627,6 +7242,7 @@ mod tests {
                     started_at: None,
                     contact: Contact::Live,
                     cancel_unconfirmed: None,
+                    waiting_reason: None,
                     spec_digest: None,
                     submission_attempt: 1,
                     submission_fence: None,
@@ -6837,6 +7453,41 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// A run 0.2.26 wrote has no waiting reason, and a reason 0.2.26 left behind on a run it
+    /// moved past starting never shows.
+    #[test]
+    fn runs_from_0_2_26_read_without_a_waiting_reason() {
+        let dir = std::env::temp_dir().join(format!("orx-store-0226-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = Connection::open(dir.join("orx.db")).unwrap();
+        old.execute_batch(include_str!("../tests/contracts/store-0.2.26-runs.sql"))
+            .unwrap();
+        drop(old);
+        let store = Store::open_at(dir.clone()).unwrap();
+
+        let state = store.engine_run_state("starting").unwrap().unwrap();
+        assert_eq!(state.waiting_reason, None);
+        assert_eq!(state.contact, Contact::Live);
+        assert_eq!(state.launch.unwrap().kind, "k8s_job");
+        let run = store.get_run("starting").unwrap().unwrap();
+        let view = crate::plane::Run::from_store(&store, &run).unwrap();
+        assert_eq!(view.display_status(), "starting");
+        assert_eq!(view.waiting_detail(), None);
+
+        store
+            .conn
+            .execute(
+                "UPDATE runs SET waiting_reason = 'Pulling image' WHERE id = 'running'",
+                [],
+            )
+            .unwrap();
+        let state = store.engine_run_state("running").unwrap().unwrap();
+        assert_eq!(state.waiting_reason, None);
+        assert_eq!(state.started_at, Some(250));
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn engine_contact_and_submission_fence_survive_reopen() {
         let (dir, store) = engine_fixture();
@@ -6996,13 +7647,192 @@ mod tests {
     }
 
     #[test]
+    fn pending_runs_say_what_quitting_does_to_them() {
+        let dir = std::env::temp_dir().join(format!("orx-pending-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let engine = |kind: &str| Some(serde_json::json!({ "kind": kind }).to_string());
+        let handle = r#"{"kind":"engine","handle":{"type":"Local","dir":"/run"}}"#;
+        let runs = [
+            (
+                "a",
+                "running",
+                handle,
+                engine("local_job"),
+                AfterQuit::NeedsApp,
+            ),
+            (
+                "b",
+                "running",
+                handle,
+                engine("tinker_job"),
+                AfterQuit::NeedsApp,
+            ),
+            (
+                "c",
+                "starting",
+                handle,
+                engine("vercel_job"),
+                AfterQuit::NeedsApp,
+            ),
+            (
+                "d",
+                "running",
+                handle,
+                engine("openresearch_job"),
+                AfterQuit::NeedsApp,
+            ),
+            (
+                "e",
+                "submitting",
+                r#"{"kind":"engine"}"#,
+                engine("hf_job"),
+                AfterQuit::Continues,
+            ),
+            (
+                "f",
+                "running",
+                handle,
+                engine("ssh_job"),
+                AfterQuit::Continues,
+            ),
+            // Detached supervisors from 0.2.x outlive the app and finish these themselves.
+            (
+                "g",
+                "running",
+                r#"{"kind":"vercel_job","jobId":"box"}"#,
+                None,
+                AfterQuit::Continues,
+            ),
+            (
+                "h",
+                "running",
+                r#"{"kind":"engine","handle":{"type":"Legacy","descriptor":{"kind":"openresearch_job"}}}"#,
+                engine("openresearch_job"),
+                AfterQuit::Continues,
+            ),
+            (
+                "i",
+                "running",
+                r#"{"kind":"local_job","jobId":"1"}"#,
+                None,
+                AfterQuit::NeedsApp,
+            ),
+        ];
+        for (index, (id, status, backend, launch, _)) in runs.iter().enumerate() {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO runs (id, experiment_id, project_id, status, backend_json, launch_spec, created_at, updated_at)
+                     VALUES (?1, 'experiment', 'project', ?2, ?3, ?4, ?5, 1)",
+                    params![id, status, backend, launch, index as i64],
+                )
+                .unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "INSERT INTO runs (id, experiment_id, project_id, status, backend_json, created_at, updated_at)
+                 VALUES ('finished', 'experiment', 'project', 'done', '{\"kind\":\"engine\"}', 99, 1)",
+                [],
+            )
+            .unwrap();
+
+        let pending = store.pending_work(&[]).unwrap();
+        assert!(pending.agents.is_empty());
+        assert!(pending.blocks_quit());
+        let fates = pending
+            .runs
+            .into_iter()
+            .map(|run| (run.run_id, run.after_quit));
+        let expected = runs
+            .into_iter()
+            .map(|(id, .., fate)| (id.to_string(), fate));
+        assert!(fates.eq(expected));
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pending_work_names_each_chat_and_run_and_where_it_opens() {
+        let dir = std::env::temp_dir().join(format!("orx-pending-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO local_projects (id, name, slug, github_owner, github_repo, repo_path, created_at, updated_at)
+                 VALUES ('project', 'Scaling laws', 'scaling', '', '', '/repo', 1, 1);
+                 INSERT INTO chat_sessions (id, project_id, harness, title, created_at, updated_at)
+                 VALUES ('chat', 'project', 'codex', 'Tune the schedule', 1, 1),
+                        ('side', 'project', 'claude-code', '  ', 1, 2),
+                        ('idle', 'project', 'codex', 'Done', 1, 3);
+                 UPDATE chat_sessions SET side_parent_session_id = 'chat' WHERE id = 'side';
+                 INSERT INTO local_experiments (id, project_id, slug, branch_name, title, run_command,
+                                                created_at, updated_at, chat_session_id)
+                 VALUES ('experiment', 'project', 'lr-sweep', 'b', '', 'python train.py', 1, 1, 'chat');
+                 INSERT INTO runs (id, experiment_id, project_id, status, backend_json, created_at, updated_at)
+                 VALUES ('run', 'experiment', 'project', 'running', '{\"kind\":\"modal_job\"}', 1, 1);",
+            )
+            .unwrap();
+
+        let working = ["chat".to_string(), "side".to_string()];
+        let pending = store.pending_work(&working).unwrap();
+        assert_eq!(
+            pending.agents,
+            [
+                PendingAgent {
+                    project_id: "project".into(),
+                    project: Some("Scaling laws".into()),
+                    session_id: "side".into(),
+                    side_parent_id: Some("chat".into()),
+                    harness: "claude-code".into(),
+                    title: None,
+                },
+                PendingAgent {
+                    project_id: "project".into(),
+                    project: Some("Scaling laws".into()),
+                    session_id: "chat".into(),
+                    side_parent_id: None,
+                    harness: "codex".into(),
+                    title: Some("Tune the schedule".into()),
+                },
+            ]
+        );
+        assert_eq!(
+            pending.runs,
+            [PendingRun {
+                project_id: "project".into(),
+                project: Some("Scaling laws".into()),
+                experiment_id: "experiment".into(),
+                run_id: "run".into(),
+                session_id: Some("chat".into()),
+                name: "lr-sweep".into(),
+                backend: Some("modal_job".into()),
+                after_quit: AfterQuit::Continues,
+            }]
+        );
+        assert!(!pending.blocks_quit());
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_retired_notice_batch_does_not_block_idle_and_is_reported_on_its_run() {
         let dir = std::env::temp_dir().join(format!("orx-retired-{}", uuid::Uuid::new_v4()));
         let store = Store::open_at(dir.clone()).unwrap();
         store
+            .conn
+            .execute(
+                "INSERT INTO runs (id, experiment_id, project_id, status, backend_json, created_at, updated_at)
+                 VALUES ('run', 'experiment', 'project', 'done', '{\"kind\":\"engine\"}', 1, 1)",
+                [],
+            )
+            .unwrap();
+        store
             .insert_run_notice("run", "owner", TERMINAL, TERMINAL, "done", 1)
             .unwrap();
-        assert!(store.engine_idle_blocked().unwrap());
+        let pending = store.pending_work(&[]).unwrap();
+        assert_eq!(pending.runs[0].after_quit, AfterQuit::Reports);
+        assert!(!pending.blocks_quit());
         assert_eq!(store.run_notice_error("run").unwrap(), None);
         let batch = store.run_notice_batch_at("owner", 10).unwrap();
         store
@@ -7014,7 +7844,7 @@ mod tests {
                 20,
             )
             .unwrap();
-        assert!(!store.engine_idle_blocked().unwrap());
+        assert!(store.pending_work(&[]).unwrap().is_empty());
         assert_eq!(
             store.run_notice_error("run").unwrap().as_deref(),
             Some("harness removed")
@@ -8384,7 +9214,8 @@ mod tests {
         assert!(run_dir.join("repo/output").is_file());
         survivor.kill().unwrap();
         survivor.wait().unwrap();
-        store.cleanup_orphaned_run_artifacts().unwrap();
+        let pass = store.cleanup_orphaned_run_artifacts().unwrap();
+        assert!(pass.kept.is_empty() && !pass.more, "{:?}", pass.kept);
         assert!(!run_dir.exists());
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
@@ -8550,7 +9381,7 @@ mod tests {
         drop(staging);
 
         let moving = store.acquire_data_dir_move_lock().unwrap();
-        assert!(store.claim_data_dir_move("move").unwrap());
+        assert!(store.claim_data_dir_move("move", &[]).unwrap());
         refuse("being moved");
         store.release_data_dir_move("move").unwrap();
         drop(moving);
@@ -8624,6 +9455,7 @@ mod tests {
                     parent_id: None,
                     base_native_session_id: None,
                     result_native_session_id: None,
+                    result_native_message_id: None,
                     native_harness: None,
                 })
                 .unwrap();
@@ -8670,6 +9502,7 @@ mod tests {
                 parent_id: None,
                 base_native_session_id: None,
                 result_native_session_id: None,
+                result_native_message_id: None,
                 native_harness: None,
             })
             .unwrap();
@@ -8683,7 +9516,7 @@ mod tests {
         std::fs::write(attachments.join("att-3__unsent.png"), "bytes").unwrap();
 
         let moving = store.acquire_data_dir_move_lock().unwrap();
-        assert!(store.claim_data_dir_move("move").unwrap());
+        assert!(store.claim_data_dir_move("move", &[]).unwrap());
         store.cleanup_orphaned_chat_attachments().unwrap();
         assert!(attachments.join("att-2__orphan.png").exists());
         store.release_data_dir_move("move").unwrap();
@@ -8785,9 +9618,16 @@ mod tests {
 
     #[test]
     fn human_bytes_scales() {
-        assert_eq!(human_bytes(512), "512 B");
-        assert_eq!(human_bytes(2048), "2.0 KB");
-        assert_eq!(human_bytes(5 * 1024 * 1024), "5.0 MB");
+        const KIB: u64 = 1024;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1536), "1.5 KiB");
+        assert_eq!(human_bytes(50 * 1024 * KIB), "50 MiB");
+        assert_eq!(human_bytes(GIB), "1 GiB");
+        assert_eq!(human_bytes(GIB * 397 / 100), "3.97 GiB");
+        assert_eq!(human_bytes(GIB * 39 / 10), "3.9 GiB");
+        assert_eq!(human_bytes(1023 * KIB + 1000), "1 MiB");
     }
 
     #[test]
@@ -8839,6 +9679,7 @@ mod tests {
                     repo_path: dir.join(id).to_string_lossy().into_owned(),
                     run_command: None,
                     paper_id: None,
+                    icon: None,
                     created_at: 1,
                     updated_at: 2,
                 })
@@ -8900,6 +9741,7 @@ mod tests {
         store.set_onboarding_completed(true).unwrap();
         store
             .set_preferred_agent(&StoredAgentSelection {
+                profile: None,
                 harness: "codex".into(),
                 model: None,
                 service_tier: None,
@@ -8945,10 +9787,20 @@ mod tests {
                 workspace: None,
                 preferred_autonomy: None,
                 nested_delegation: false,
+                opencode_free_models: true,
+                opencode_review_model: None,
+                favorite_models: Vec::new(),
+                hidden_models: Vec::new(),
+                hidden_agents: Vec::new(),
+                model_section_order: Vec::new(),
+                collapsed_model_sections: Vec::new(),
+                model_sightings: None,
+                seen_nudges: Vec::new(),
             }
         );
 
         let selection = StoredAgentSelection {
+            profile: None,
             harness: "codex".into(),
             model: Some("gpt-5.6".into()),
             service_tier: Some("priority".into()),
@@ -8959,6 +9811,32 @@ mod tests {
         store.set_tour_completed(true).unwrap();
         store.set_preferred_agent(&selection).unwrap();
         store.set_preferred_autonomy(Autonomy::Copilot).unwrap();
+        store
+            .set_opencode_review_model(Some("openai/gpt-6-mini"))
+            .unwrap();
+        store
+            .set_ui_json("favorite_models", &["claude opus", "gpt sol"])
+            .unwrap();
+        store
+            .set_ui_json("hidden_models", &["gpt-6", "deepseek-r1:free"])
+            .unwrap();
+        store.set_ui_json("hidden_agents", &["codex"]).unwrap();
+        assert_eq!(
+            serde_json::to_value(store.ui_state().unwrap()).unwrap()["hiddenAgents"],
+            serde_json::json!(["codex"])
+        );
+        store
+            .set_ui_json("model_section_order", &["openai", "anthropic"])
+            .unwrap();
+        store
+            .set_ui_json("collapsed_model_sections", &["openai"])
+            .unwrap();
+        store
+            .set_ui_json("model_sightings", &serde_json::json!({"seen": ["gpt-6"]}))
+            .unwrap();
+        store
+            .set_ui_json("seen_nudges", &["2026-11-12-c081d9e1"])
+            .unwrap();
 
         assert_eq!(
             store.ui_state().unwrap(),
@@ -8969,7 +9847,60 @@ mod tests {
                 workspace: None,
                 preferred_autonomy: Some(Autonomy::Copilot),
                 nested_delegation: false,
+                opencode_free_models: true,
+                opencode_review_model: Some("openai/gpt-6-mini".into()),
+                favorite_models: vec!["claude opus".into(), "gpt sol".into()],
+                hidden_models: vec!["gpt-6".into(), "deepseek-r1:free".into()],
+                hidden_agents: vec!["codex".into()],
+                model_section_order: vec!["openai".into(), "anthropic".into()],
+                collapsed_model_sections: vec!["openai".into()],
+                model_sightings: Some(serde_json::json!({"seen": ["gpt-6"]})),
+                seen_nudges: vec!["2026-11-12-c081d9e1".into()],
             }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_icon_survives_updates_that_predate_it() {
+        let dir = std::env::temp_dir().join(format!("orx-store-icon-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        let mut project = LocalProject {
+            id: "project".into(),
+            name: "Project".into(),
+            slug: "project".into(),
+            github_owner: String::new(),
+            github_repo: String::new(),
+            github_sync_enabled: false,
+            baseline_branch: "main".into(),
+            repo_path: dir.join("project").to_string_lossy().into_owned(),
+            run_command: None,
+            paper_id: None,
+            icon: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        store.create_local_project(&project).unwrap();
+        project.icon = Some(serde_json::json!({ "file": "assets/logo.png", "color": "teal" }));
+        store.update_local_project(&project).unwrap();
+
+        // The update an older orx runs names only the columns it knows.
+        store
+            .conn
+            .execute(
+                "UPDATE local_projects SET name = 'Renamed' WHERE id = 'project'",
+                [],
+            )
+            .unwrap();
+        let read = store.get_local_project("project").unwrap().unwrap();
+        assert_eq!(read.name, "Renamed");
+        assert_eq!(read.icon, project.icon);
+
+        project.icon = None;
+        store.update_local_project(&project).unwrap();
+        assert_eq!(
+            store.get_local_project("project").unwrap().unwrap().icon,
+            None
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -8991,6 +9922,7 @@ mod tests {
                 repo_path: dir.join("project").to_string_lossy().into_owned(),
                 run_command: None,
                 paper_id: None,
+                icon: None,
                 created_at: 1,
                 updated_at: 1,
             })
@@ -9017,6 +9949,87 @@ mod tests {
     }
 
     #[test]
+    fn chat_profile_and_preferred_profile_roundtrip_and_switch() {
+        let temp = crate::local::git::TemporaryDirectory::new("orx-profiles-test").unwrap();
+        let store = Store::open_at(temp.path().to_path_buf()).unwrap();
+        let mut session = chat_session_fixture("profile-chat");
+        session.profile_id = Some("claude-012345abcd".into());
+        session.native_session_id = Some("native-context".into());
+        store.create_chat_session(&session).unwrap();
+        let saved = store.get_chat_session(&session.id).unwrap().unwrap();
+        assert_eq!(saved.profile_id, session.profile_id);
+        assert_eq!(
+            crate::local::chat::session_json_with(Some(&store), &saved, false)["profile"],
+            "claude-012345abcd"
+        );
+        let mut selection = StoredAgentSelection {
+            profile: Some("claude-abcdefghij".into()),
+            harness: "claude-code".into(),
+            model: None,
+            service_tier: None,
+            permission_mode: None,
+            reasoning_level: None,
+        };
+        store.set_preferred_agent(&selection).unwrap();
+        assert_eq!(
+            store.ui_state().unwrap().preferred_agent,
+            Some(selection.clone())
+        );
+        let mut marker = StoredChatMessage {
+            id: "profile-switch".into(),
+            session_id: session.id.clone(),
+            role: "assistant".into(),
+            parts_json: "[]".into(),
+            created_at: now_ms(),
+            completed_at: Some(now_ms()),
+            parent_id: None,
+            base_native_session_id: session.native_session_id.clone(),
+            result_native_session_id: None,
+            result_native_message_id: None,
+            native_harness: Some(session.harness.clone()),
+        };
+        marker.parent_id = session.active_leaf_id.clone();
+        store
+            .switch_chat_agent(
+                &session.id,
+                &selection,
+                session.native_session_id.as_deref(),
+                Some("native-point"),
+                &marker,
+                false,
+            )
+            .unwrap();
+        let switched = store.get_chat_session(&session.id).unwrap().unwrap();
+        assert_eq!(switched.profile_id, selection.profile);
+        assert_eq!(switched.native_session_id, session.native_session_id);
+        assert_eq!(switched.native_fork_at.as_deref(), Some("native-point"));
+        selection.harness = "codex".into();
+        selection.profile = Some("codex-012345abcd".into());
+        marker.id = "cross-agent-switch".into();
+        marker.parent_id = Some("profile-switch".into());
+        store
+            .switch_chat_agent(&session.id, &selection, None, None, &marker, false)
+            .unwrap();
+        let switched = store.get_chat_session(&session.id).unwrap().unwrap();
+        assert_eq!(switched.profile_id, selection.profile);
+        assert!(switched.native_session_id.is_none());
+        assert_eq!(
+            switched.active_leaf_id.as_deref(),
+            Some("cross-agent-switch")
+        );
+        drop(store);
+        assert_eq!(
+            Store::open_at(temp.path().to_path_buf())
+                .unwrap()
+                .get_chat_session(&session.id)
+                .unwrap()
+                .unwrap()
+                .profile_id,
+            selection.profile
+        );
+    }
+
+    #[test]
     fn permission_and_plan_migration_preserves_each_harness_native_contract() {
         let dir =
             std::env::temp_dir().join(format!("orx-store-plan-migrate-{}", uuid::Uuid::new_v4()));
@@ -9031,8 +10044,12 @@ mod tests {
                 ("codex_bypass", "codex", "bypass"),
                 ("codex_invalid", "codex", "retired-mode"),
                 ("open_plan", "opencode", "plan"),
+                ("open_default", "opencode", "default"),
+                ("open_ask", "opencode", "ask"),
+                ("open_manual", "opencode", "manual"),
                 ("open_auto", "opencode", "auto"),
                 ("open_bypass", "opencode", "bypass"),
+                ("open_invalid", "opencode", "retired-mode"),
             ] {
                 let mut session = chat_session_fixture(id);
                 session.harness = harness.into();
@@ -9052,9 +10069,13 @@ mod tests {
         assert_eq!(state("codex_auto"), ("approve-for-me".into(), false));
         assert_eq!(state("codex_bypass"), ("full-access".into(), false));
         assert_eq!(state("codex_invalid"), ("approve-for-me".into(), false));
-        assert_eq!(state("open_plan"), ("default".into(), true));
-        assert_eq!(state("open_auto"), ("default".into(), false));
+        assert_eq!(state("open_plan"), ("auto-approve".into(), true));
+        assert_eq!(state("open_default"), ("auto-approve".into(), false));
+        assert_eq!(state("open_ask"), ("auto-approve".into(), false));
+        assert_eq!(state("open_manual"), ("manual".into(), false));
+        assert_eq!(state("open_auto"), ("auto".into(), false));
         assert_eq!(state("open_bypass"), ("auto-approve".into(), false));
+        assert_eq!(state("open_invalid"), ("auto-approve".into(), false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9078,6 +10099,7 @@ mod tests {
                 parent_id: None,
                 base_native_session_id: None,
                 result_native_session_id: None,
+                result_native_message_id: None,
                 native_harness: None,
             })
             .unwrap();
@@ -9130,6 +10152,7 @@ mod tests {
                 parent_id: None,
                 base_native_session_id: None,
                 result_native_session_id: Some("old-thread".into()),
+                result_native_message_id: None,
                 native_harness: None,
             })
             .unwrap();
@@ -9160,6 +10183,7 @@ mod tests {
             parent_id: None,
             base_native_session_id: None,
             result_native_session_id: None,
+            result_native_message_id: None,
             native_harness: None,
         };
         assert_eq!(
@@ -9290,7 +10314,7 @@ mod tests {
         let mut turn = chat_turn_fixture("running", "client-running");
         turn.state = "running".into();
         store.admit_chat_turn(None, &turn).unwrap();
-        assert!(store.claim_chat_turn("chat_1", "owner").unwrap());
+        assert!(store.claim_chat_turn("chat_1", "owner", &[]).unwrap());
 
         assert!(store.reconcile_unfinished_chat_turns().unwrap().is_empty());
         assert_eq!(
@@ -9311,13 +10335,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             store
-                .reconcile_expired_unfinished_chat_turns()
+                .reconcile_expired_unfinished_chat_turns(&[])
                 .unwrap()
                 .len(),
             1
         );
         assert!(store
-            .reconcile_expired_unfinished_chat_turns()
+            .reconcile_expired_unfinished_chat_turns(&[])
             .unwrap()
             .is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -9340,6 +10364,7 @@ mod tests {
             parent_id: None,
             base_native_session_id: None,
             result_native_session_id: None,
+            result_native_message_id: None,
             native_harness: None,
         };
         store.upsert_chat_message(&message).unwrap();
@@ -9385,6 +10410,7 @@ mod tests {
                     parent_id: None,
                     base_native_session_id: None,
                     result_native_session_id: None,
+                    result_native_message_id: None,
                     native_harness: None,
                 })
                 .unwrap();
@@ -9452,6 +10478,7 @@ mod tests {
             parent_id: None,
             base_native_session_id: None,
             result_native_session_id: None,
+            result_native_message_id: None,
             native_harness: None,
         };
         store.admit_chat_turn(Some(&user), &turn).unwrap();
@@ -9542,6 +10569,7 @@ mod tests {
             parent_id: None,
             base_native_session_id: None,
             result_native_session_id: None,
+            result_native_message_id: None,
             native_harness: None,
         };
         assert!(store
@@ -9590,6 +10618,7 @@ mod tests {
             parent_id: None,
             base_native_session_id: Some("native_1".into()),
             result_native_session_id: None,
+            result_native_message_id: None,
             native_harness: None,
         };
         store.admit_chat_turn(Some(&user), &turn).unwrap();
@@ -9603,6 +10632,7 @@ mod tests {
             parent_id: Some(user.id.clone()),
             base_native_session_id: Some("native_1".into()),
             result_native_session_id: None,
+            result_native_message_id: None,
             native_harness: None,
         };
         assert!(store
@@ -9796,6 +10826,7 @@ mod tests {
             parent_id: None,
             base_native_session_id: None,
             result_native_session_id: None,
+            result_native_message_id: None,
             native_harness: None,
         };
         assert_eq!(
@@ -9917,16 +10948,7 @@ mod tests {
             if std::env::var(CHILD_PHASE).unwrap() == "blocked" {
                 assert!(store.lock_native_deletion().is_err());
             } else {
-                // A released lock lingers in children the parent's other tests forked, until
-                // they exec.
-                let deadline = std::time::Instant::now() + Duration::from_secs(10);
-                let _lock = loop {
-                    match store.lock_native_deletion() {
-                        Ok(lock) => break lock,
-                        Err(error) => assert!(std::time::Instant::now() < deadline, "{error}"),
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                };
+                let _lock = store.lock_native_deletion().unwrap();
                 let (deleting, retained) = store
                     .native_sessions_for_deletion(&["second".into()], &["opencode", "claude-code"])
                     .unwrap();
@@ -9971,12 +10993,32 @@ mod tests {
         assert!(store.get_chat_session("second").unwrap().is_none());
     }
 
-    fn chat_session_fixture(id: &str) -> StoredChatSession {
+    pub(crate) fn local_project_fixture(id: &str) -> LocalProject {
+        LocalProject {
+            id: id.into(),
+            name: id.into(),
+            slug: id.into(),
+            github_owner: String::new(),
+            github_repo: String::new(),
+            github_sync_enabled: false,
+            baseline_branch: "main".into(),
+            repo_path: std::env::temp_dir().join(id).to_string_lossy().into_owned(),
+            run_command: None,
+            paper_id: None,
+            icon: None,
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    pub(crate) fn chat_session_fixture(id: &str) -> StoredChatSession {
         StoredChatSession {
+            profile_id: None,
             id: id.into(),
             project_id: "proj_1".into(),
             harness: "claude-code".into(),
             native_session_id: None,
+            native_fork_at: None,
             title: None,
             title_source: None,
             model: None,
@@ -9999,11 +11041,56 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_counts_as_used_only_once_a_chat_ran_a_turn_on_it() {
+        let dir = std::env::temp_dir().join(format!("orx-agents-used-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        // Seeded like the demo's: messages, but no turn and no native session.
+        store
+            .create_chat_session(&chat_session_fixture("seeded"))
+            .unwrap();
+        let mut resumed = chat_session_fixture("resumed");
+        resumed.harness = "codex".into();
+        resumed.native_session_id = Some("thread-1".into());
+        store.create_chat_session(&resumed).unwrap();
+        let mut account = chat_session_fixture("account");
+        account.profile_id = Some("claude-work".into());
+        store.create_chat_session(&account).unwrap();
+        store.conn.execute("INSERT INTO chat_turns (id, session_id, assistant_message_id, client_turn_id, request_hash, prepared_input, settings_json, state, delivery_state, created_at, updated_at) VALUES ('turn', 'account', 'assistant', 'ct', 'hash', 'task', '{}', 'failed', 'not_sent', 1, 1)", []).unwrap();
+        // Ran on Cursor, then switched to Codex: the switch stamps Cursor on its messages.
+        let mut switched = chat_session_fixture("switched");
+        switched.harness = "codex".into();
+        store.create_chat_session(&switched).unwrap();
+        store.conn.execute("INSERT INTO chat_messages (id, session_id, role, parts_json, created_at, native_harness) VALUES ('earlier', 'switched', 'user', '[]', 1, 'cursor')", []).unwrap();
+
+        let mut used = store.chat_agents_used().unwrap();
+        used.sort();
+        assert_eq!(
+            used,
+            [
+                ("claude-code".to_string(), Some("claude-work".to_string())),
+                ("codex".to_string(), None),
+                ("cursor".to_string(), None),
+            ]
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn acp_first_turn_repairs_missing_state_without_redirecting_native_sessions() {
+        if !crate::config::in_test_child(&[]) {
+            return;
+        }
+
+        let preset = crate::local::acp::presets().remove(0).launch;
+        let mut saved = preset.clone();
+        saved.id = format!("acp:{}", uuid::Uuid::new_v4());
+        crate::local::acp::save(saved, true).unwrap();
+
         let dir = std::env::temp_dir().join(format!("orx-acp-repair-{}", uuid::Uuid::new_v4()));
         let store = Store::open_at(dir.clone()).unwrap();
         let mut session = chat_session_fixture("legacy-demo");
-        session.harness = crate::local::acp::presets()[0].launch.id.clone();
+        session.harness = preset.id;
         store.create_chat_session(&session).unwrap();
         store
             .conn
@@ -10117,6 +11204,7 @@ mod tests {
                     completed_at: None,
                     base_native_session_id: None,
                     result_native_session_id: None,
+                    result_native_message_id: None,
                     native_harness: None,
                 })
                 .unwrap();
@@ -10227,6 +11315,43 @@ mod tests {
     }
 
     #[test]
+    fn a_delegate_stays_out_of_the_sidebar_until_kept_or_orphaned() {
+        let dir = std::env::temp_dir().join(format!("orx-store-delegate-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        for id in ["chat_parent", "chat_kept", "chat_orphan"] {
+            store
+                .create_chat_session(&chat_session_fixture(id))
+                .unwrap();
+        }
+        store
+            .record_chat_delegate("chat_kept", "chat_parent", false)
+            .unwrap();
+        store
+            .record_chat_delegate("chat_orphan", "chat_parent", false)
+            .unwrap();
+        let sidebar = |store: &Store| -> Vec<String> {
+            let mut ids: Vec<_> = store
+                .list_sidebar_chat_sessions(None, None)
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        assert_eq!(sidebar(&store), ["chat_parent"]);
+        assert_eq!(store.list_all_chat_sessions().unwrap().len(), 1);
+
+        store.remove_chat_delegate("chat_kept").unwrap();
+        assert_eq!(sidebar(&store), ["chat_kept", "chat_parent"]);
+
+        store.delete_chat_session("chat_parent").unwrap();
+        assert_eq!(sidebar(&store), ["chat_kept", "chat_orphan"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn side_chats_stay_out_of_history_and_share_their_parents_worktree() {
         let dir = std::env::temp_dir().join(format!("orx-store-sidechat-{}", uuid::Uuid::new_v4()));
         let store = Store::open_at(dir.clone()).unwrap();
@@ -10331,6 +11456,62 @@ mod tests {
             store.list_sidebar_chat_sessions(None, None).unwrap()[0].id,
             "chat_064"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sidebar_finds_chats_with_runs_in_flight_by_owner_or_subscription() {
+        let dir =
+            std::env::temp_dir().join(format!("orx-store-sidebar-runs-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        for id in ["owner", "subscriber", "finished", "archived", "idle"] {
+            let mut session = chat_session_fixture(id);
+            session.archived = id == "archived";
+            store.create_chat_session(&session).unwrap();
+        }
+        store
+            .upsert_run(&run_fixture("run_owned", "running", Some("owner")))
+            .unwrap();
+        store
+            .upsert_run(&run_fixture("run_shared", "starting", None))
+            .unwrap();
+        store.subscribe_run("run_shared", "subscriber", 1).unwrap();
+        store
+            .upsert_run(&run_fixture("run_done", "done", Some("finished")))
+            .unwrap();
+        store
+            .upsert_run(&run_fixture("run_archived", "starting", Some("archived")))
+            .unwrap();
+
+        let ids = |archived| {
+            let mut ids: Vec<String> = store
+                .sidebar_chat_sessions_at_work(archived, &[])
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(ids(Some(false)), ["owner", "subscriber"]);
+        assert_eq!(ids(Some(true)), ["archived"]);
+        assert_eq!(ids(None), ["archived", "owner", "subscriber"]);
+
+        // A chat the server sees working counts too, once and only if it is top-level.
+        store
+            .create_chat_session(&chat_session_fixture("delegate"))
+            .unwrap();
+        store
+            .record_chat_delegate("delegate", "idle", false)
+            .unwrap();
+        let live: Vec<String> = store
+            .sidebar_chat_sessions_at_work(Some(false), &["idle", "owner", "delegate"])
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        assert_eq!(live.len(), 3, "{live:?}");
+        assert!(live.contains(&"idle".to_string()) && !live.contains(&"delegate".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10498,7 +11679,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn run_fixture(id: &str, status: &str, chat_session_id: Option<&str>) -> StoredRun {
+    pub(crate) fn run_fixture(id: &str, status: &str, chat_session_id: Option<&str>) -> StoredRun {
         StoredRun {
             id: id.into(),
             experiment_id: "exp_1".into(),
@@ -11112,23 +12293,23 @@ mod tests {
             .unwrap();
         let second = Store::open_at(dir.clone()).unwrap();
 
-        assert!(first.claim_chat_turn("chat_A", "token_A").unwrap());
-        assert!(!second.claim_chat_turn("chat_A", "token_B").unwrap());
+        assert!(first.claim_chat_turn("chat_A", "token_A", &[]).unwrap());
+        assert!(!second.claim_chat_turn("chat_A", "token_B", &[]).unwrap());
         assert!(!second.renew_chat_turn("chat_A", "token_B").unwrap());
-        assert!(!second.claim_data_dir_move("move_A").unwrap());
+        assert!(!second.claim_data_dir_move("move_A", &[]).unwrap());
         second.release_chat_turn("chat_A", "token_B").unwrap();
-        assert!(!second.claim_chat_turn("chat_A", "token_B").unwrap());
+        assert!(!second.claim_chat_turn("chat_A", "token_B", &[]).unwrap());
         first.release_chat_turn("chat_A", "token_A").unwrap();
         let move_lock = first.acquire_data_dir_move_lock().unwrap();
-        assert!(first.claim_data_dir_move("move_A").unwrap());
-        assert!(!second.claim_chat_turn("chat_A", "token_B").unwrap());
+        assert!(first.claim_data_dir_move("move_A", &[]).unwrap());
+        assert!(!second.claim_chat_turn("chat_A", "token_B", &[]).unwrap());
         second.release_data_dir_move("move_B").unwrap();
-        assert!(!second.claim_chat_turn("chat_A", "token_B").unwrap());
+        assert!(!second.claim_chat_turn("chat_A", "token_B", &[]).unwrap());
         drop(move_lock);
         let service_lock =
             acquire_data_dir_lock(first.data_dir_move_lock_path.clone(), false).unwrap();
         assert!(first.acquire_data_dir_move_lock().is_err());
-        assert!(second.claim_chat_turn("chat_A", "token_B").unwrap());
+        assert!(second.claim_chat_turn("chat_A", "token_B", &[]).unwrap());
 
         drop(service_lock);
         drop(second);
@@ -11230,6 +12411,7 @@ mod tests {
                     repo_path: dir.join(id).to_string_lossy().into_owned(),
                     run_command: None,
                     paper_id: None,
+                    icon: None,
                     created_at: 1,
                     updated_at: 1,
                 })
@@ -11347,6 +12529,7 @@ mod tests {
                 repo_path: dir.join("project").to_string_lossy().into_owned(),
                 run_command: None,
                 paper_id: None,
+                icon: None,
                 created_at: 1,
                 updated_at: 1,
             })
@@ -11374,6 +12557,7 @@ mod tests {
                     parent_id: None,
                     base_native_session_id: None,
                     result_native_session_id: None,
+                    result_native_message_id: None,
                     native_harness: None,
                 })
                 .unwrap();

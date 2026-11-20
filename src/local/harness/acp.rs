@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
@@ -8,22 +8,40 @@ use agent_client_protocol::schema::v1::{
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::{Harness, HarnessInfo, ResumeAction, TurnFailure, TurnOutcome, TurnResult};
+use super::options::OptionChoice;
+use super::{
+    Harness, HarnessInfo, HarnessOptions, ResumeAction, TurnFailure, TurnOutcome, TurnResult,
+};
 use crate::error::{anyhow, Result};
 use crate::local::acp::{
-    host::{Client, Event},
+    host::{Client, Event, Stop},
     Definition,
 };
 use crate::local::chat::{
     DeliveryState, NativePermissionChoice, PromptAnswer, ResumeCtx, TurnCtx, WirePart, WirePrompt,
 };
-use crate::store::Store;
+use crate::store::{Store, TokenUsage};
 
 mod auth;
 
 pub(crate) const SESSION_SKILLS_DIR: &str = ".agents/skills";
 
 static DISCOVERY_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+pub fn approval_options() -> HarnessOptions {
+    HarnessOptions {
+        permission_modes: vec![
+            OptionChoice::described("ask", "Ask", "Ask before actions that need approval"),
+            OptionChoice::described(
+                "auto-approve",
+                "Full access",
+                "Approve each request without asking, except ones that can only be allowed permanently",
+            ),
+        ],
+        default_permission_mode: Some("ask"),
+        ..HarnessOptions::none()
+    }
+}
 
 pub struct Acp(pub Definition);
 
@@ -33,6 +51,10 @@ impl Acp {
         info.bin_path = crate::local::acp::executable_path(&self.0.executable)
             .map(|path| path.to_string_lossy().into_owned());
         info.installed = info.bin_path.is_some();
+        info.managed = info
+            .bin_path
+            .as_deref()
+            .is_some_and(|bin| super::managed::version_of(std::path::Path::new(bin)).is_some());
         if let Some(preset) = crate::local::acp::presets().into_iter().find(|preset| {
             preset.launch.id == self.0.id
                 || (std::path::Path::new(&self.0.executable)
@@ -47,10 +69,10 @@ impl Acp {
                 "pi-acp" => crate::local::acp::executable_path("pi").is_some(),
                 "zcode-acp-server" => {
                     crate::local::acp::executable_path("zcode").is_some()
-                        || dirs::home_dir()
+                        || crate::config::home_dir()
                             .is_some_and(|home| home.join("Applications/ZCode.app").is_dir())
                         || std::path::Path::new("/Applications/ZCode.app").is_dir()
-                        || dirs::data_local_dir()
+                        || crate::config::data_local_dir()
                             .is_some_and(|home| home.join("Programs/ZCode/ZCode.exe").is_file())
                 }
                 _ => false,
@@ -74,6 +96,10 @@ impl Harness for Acp {
         true
     }
 
+    fn options(&self) -> HarnessOptions {
+        approval_options()
+    }
+
     fn session_skills_dir(&self) -> Option<&'static str> {
         Some(SESSION_SKILLS_DIR)
     }
@@ -83,6 +109,7 @@ impl Harness for Acp {
     }
 
     async fn detect(&self) -> Option<HarnessInfo> {
+        super::managed::select(&self.0.id).await;
         let mut info = self.detection();
         if info.adapter_missing {
             auth::detect(&self.0, &mut info).await;
@@ -96,13 +123,20 @@ impl Harness for Acp {
             Ok(connection) => {
                 info.installed = true;
                 info.agent_ready = true;
-                info.version = connection["agentInfo"]["version"]
-                    .as_str()
-                    .map(str::to_owned);
-                info.models.push(super::ModelInfo::new("default"));
+                info.version = info
+                    .bin_path
+                    .as_deref()
+                    .and_then(|bin| super::managed::version_of(std::path::Path::new(bin)))
+                    .map(|version| version.to_string())
+                    .or_else(|| {
+                        connection["agentInfo"]["version"]
+                            .as_str()
+                            .map(str::to_owned)
+                    });
                 auth::detect(&self.0, &mut info).await;
                 match crate::local::acp::discover_models(&self.0).await {
                     Ok(configuration) => {
+                        info.configured_model = current_model(&configuration).map(str::to_owned);
                         let models = advertised_models(&configuration);
                         if !models.is_empty() {
                             info.models = models;
@@ -146,16 +180,83 @@ impl Harness for Acp {
         ctx.host.acp.answer(&ctx.session_id, id, selected).await?;
         Ok(ResumeAction::Handled { plan_mode: None })
     }
+
+    async fn one_shot(&self, request: super::OneShot<'_>) -> Result<String> {
+        crate::local::acp::one_shot(&self.0, request).await
+    }
 }
 
-fn advertised_models(configuration: &Value) -> Vec<super::ModelInfo> {
-    fn choices(options: &Value, models: &mut Vec<super::ModelInfo>) {
+#[cfg(test)]
+#[test]
+fn deepseek_model_routes_are_deduplicated() {
+    let names = [
+        "deepseek-v4-flash",
+        "DeepSeek-V4.1-Flash",
+        "DeepSeek-V4-Pro",
+        "DeepSeek-V4.1-Flash",
+        "DeepSeek-V4-Pro",
+    ];
+    let options: Vec<Value> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| serde_json::json!({"value": i.to_string(), "name": name}))
+        .collect();
+    let models = advertised_models(
+        &serde_json::json!({"configOptions":[{"category":"model","type":"select","options":options}]}),
+    );
+    assert_eq!(models.len(), 3);
+    assert_eq!(models[1].id, "1");
+}
+
+#[test]
+fn current_models_are_native_and_missing_catalogs_stay_empty() {
+    let legacy = serde_json::json!({"models":{"currentModelId":"opus","availableModels":[{"modelId":"opus","name":"Opus"}]}});
+    assert_eq!(current_model(&legacy), Some("opus"));
+    let options = serde_json::json!({"configOptions":[{"category":"model","type":"select","currentValue":"42","options":[{"value":"42","name":"Custom"}]}]});
+    assert_eq!(current_model(&options), Some("42"));
+    assert_eq!(advertised_models(&options)[0].id, "42");
+    assert!(advertised_models(&serde_json::json!({})).is_empty());
+    assert!(advertised_models(
+        &serde_json::json!({"models":{"availableModels":[{"modelId":"default","name":"Default"}]}})
+    )
+    .is_empty());
+}
+
+pub(crate) fn current_model(configuration: &Value) -> Option<&str> {
+    configuration["configOptions"]
+        .as_array()
+        .and_then(|options| options.iter().find(|o| o["category"] == "model"))
+        .and_then(|o| o["currentValue"].as_str())
+        .or_else(|| configuration["models"]["currentModelId"].as_str())
+        .filter(|id| crate::local::harness::concrete_model(id))
+}
+
+pub(crate) fn advertised_models(configuration: &Value) -> Vec<super::ModelInfo> {
+    fn choices(options: &Value, models: &mut Vec<super::ModelInfo>, current: Option<&str>) {
         for option in options.as_array().into_iter().flatten() {
             if option["options"].is_array() {
-                choices(&option["options"], models);
+                choices(&option["options"], models, current);
             } else if let (Some(id), Some(name)) =
                 (option["value"].as_str(), option["name"].as_str())
             {
+                if !crate::local::harness::concrete_model(id) {
+                    continue;
+                }
+                let normalized = |name: &str| {
+                    name.chars()
+                        .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
+                        .flat_map(char::to_lowercase)
+                        .collect::<String>()
+                };
+                if let Some(model) = models.iter_mut().find(|model| {
+                    normalized(model.display_name.as_deref().unwrap_or(&model.id))
+                        == normalized(name)
+                }) {
+                    if Some(id) == current {
+                        model.id = id.to_string();
+                    }
+                    continue;
+                }
                 models.push(
                     super::ModelInfo::new(id)
                         .with_label(Some(name), option["description"].as_str()),
@@ -169,7 +270,11 @@ fn advertised_models(configuration: &Value) -> Vec<super::ModelInfo> {
             .iter()
             .filter(|option| option["category"] == "model" && option["type"] == "select")
         {
-            choices(&option["options"], &mut models);
+            choices(
+                &option["options"],
+                &mut models,
+                current_model(configuration),
+            );
         }
         return models;
     }
@@ -178,8 +283,12 @@ fn advertised_models(configuration: &Value) -> Vec<super::ModelInfo> {
         .into_iter()
         .flatten()
         .filter_map(|model| {
+            let id = model["modelId"].as_str()?;
+            if !crate::local::harness::concrete_model(id) {
+                return None;
+            }
             Some(
-                super::ModelInfo::new(model["modelId"].as_str()?)
+                super::ModelInfo::new(id)
                     .with_label(model["name"].as_str(), model["description"].as_str()),
             )
         })
@@ -234,24 +343,85 @@ async fn run_turn(ctx: &mut TurnCtx, definition: &Definition) -> Result<()> {
         crate::local::chat::handoff::position_for(&store, &session)?.switched
     };
 
-    ctx.host.resolve_stale_prompts(&ctx.session_id, true)?;
     let project = ctx.project.clone();
     let session_id = ctx.session_id.clone();
     let (cwd, _) = tokio::task::spawn_blocking(move || {
         crate::local::opencode::ensure_playbook(&project, &session_id, Some(SESSION_SKILLS_DIR))
     })
     .await??;
+    let session = open_session(ctx, definition, &cwd, true).await?;
+    if let Some(model) = ctx
+        .model
+        .as_deref()
+        .filter(|model| apply_model && crate::local::harness::concrete_model(model))
+    {
+        let configuration = Store::open()?
+            .acp_session_state(&ctx.session_id)?
+            .ok_or_else(|| anyhow!("ACP session no longer exists"))?
+            .configuration;
+        let option = configuration["configOptions"]
+            .as_array()
+            .and_then(|options| {
+                options
+                    .iter()
+                    .find(|option| option["category"] == "model" && option["type"] == "select")
+            });
+        let (id, current) = match option {
+            Some(option) => (option["id"].as_str(), option["currentValue"].as_str()),
+            None if !configuration["configOptions"].is_array() => (
+                Some("model"),
+                configuration["models"]["currentModelId"].as_str(),
+            ),
+            None => (None, None),
+        };
+        let id =
+            id.ok_or_else(|| anyhow!("The selected model is no longer advertised by this agent"))?;
+        if current != Some(model) {
+            session.client.configure(&ctx.session_id, id, model).await?;
+            ctx.host
+                .emit_session(Store::open()?.get_chat_session(&ctx.session_id)?)
+                .await;
+        }
+    }
+    prompt_session(ctx, &session).await?;
+    Ok(())
+}
+
+/// The chat's agent with its native session open, and the prompt to send it.
+pub(crate) struct OpenSession {
+    pub client: Arc<Client>,
+    pub native_id: String,
+    pub prompt: String,
+    /// Whether the native session existed before this turn.
+    pub restored: bool,
+}
+
+/// Starts or reuses the chat's agent in `cwd` and restores or creates its native
+/// session. `persist_configuration` keeps the agent's advertised options with the
+/// chat, which user-defined ACP harnesses expose in the composer.
+pub(crate) async fn open_session(
+    ctx: &mut TurnCtx,
+    definition: &Definition,
+    cwd: &std::path::Path,
+    persist_configuration: bool,
+) -> Result<OpenSession> {
+    ctx.host.resolve_stale_prompts(&ctx.session_id, true)?;
     let host = ctx.host.acp.clone();
-    let mut client = host.get(&ctx.session_id, definition, &cwd).await?;
+    let mut client = host.get(&ctx.session_id, definition, cwd).await?;
     if client.native_id().is_some() && client.native_id() != ctx.native_session_id {
         host.stop(&ctx.session_id).await;
-        client = host.get(&ctx.session_id, definition, &cwd).await?;
+        client = host.get(&ctx.session_id, definition, cwd).await?;
     }
     let mut prompt = ctx.text.clone();
+    let mut restored = false;
     if client.native_id().is_none() {
-        let saved_configuration = Store::open()?
-            .acp_session_state(&ctx.session_id)?
-            .map(|state| state.configuration);
+        let saved_configuration = if persist_configuration {
+            Store::open()?
+                .acp_session_state(&ctx.session_id)?
+                .map(|state| state.configuration)
+        } else {
+            None
+        };
         let mut created = false;
         let mut configuration = None;
         if let Some(native_id) = ctx.native_session_id.clone() {
@@ -268,7 +438,7 @@ async fn run_turn(ctx: &mut TurnCtx, definition: &Definition) -> Result<()> {
                 match client
                     .restore(
                         &native_id,
-                        &cwd,
+                        cwd,
                         orx_mcp_servers(&ctx.session_id, ctx.host.up_port())?,
                     )
                     .await
@@ -298,7 +468,7 @@ async fn run_turn(ctx: &mut TurnCtx, definition: &Definition) -> Result<()> {
             let response = client
                 .request(
                     "session/new",
-                    NewSessionRequest::new(&cwd)
+                    NewSessionRequest::new(cwd)
                         .mcp_servers(orx_mcp_servers(&ctx.session_id, ctx.host.up_port())?),
                 )
                 .await?;
@@ -313,7 +483,8 @@ async fn run_turn(ctx: &mut TurnCtx, definition: &Definition) -> Result<()> {
                 crate::local::opencode::PLAYBOOK_REL
             );
         }
-        if let Some(configuration) = configuration {
+        restored = !created;
+        if let Some(configuration) = configuration.filter(|_| persist_configuration) {
             Store::open()?.set_acp_configuration(&ctx.session_id, &configuration)?;
             if created {
                 if let Some(saved) = saved_configuration {
@@ -331,39 +502,18 @@ async fn run_turn(ctx: &mut TurnCtx, definition: &Definition) -> Result<()> {
         .native_id()
         .ok_or_else(|| anyhow!("ACP session was not initialized"))?;
     ctx.persist_native_session_id(&native_id)?;
-    if let Some(model) = ctx
-        .model
-        .as_deref()
-        .filter(|model| apply_model && *model != "default")
-    {
-        let configuration = Store::open()?
-            .acp_session_state(&ctx.session_id)?
-            .ok_or_else(|| anyhow!("ACP session no longer exists"))?
-            .configuration;
-        let option = configuration["configOptions"]
-            .as_array()
-            .and_then(|options| {
-                options
-                    .iter()
-                    .find(|option| option["category"] == "model" && option["type"] == "select")
-            });
-        let (id, current) = match option {
-            Some(option) => (option["id"].as_str(), option["currentValue"].as_str()),
-            None if !configuration["configOptions"].is_array() => (
-                Some("model"),
-                configuration["models"]["currentModelId"].as_str(),
-            ),
-            None => (None, None),
-        };
-        let id =
-            id.ok_or_else(|| anyhow!("The selected model is no longer advertised by this agent"))?;
-        if current != Some(model) {
-            client.configure(&ctx.session_id, id, model).await?;
-            ctx.host
-                .emit_session(Store::open()?.get_chat_session(&ctx.session_id)?)
-                .await;
-        }
-    }
+    Ok(OpenSession {
+        client,
+        native_id,
+        prompt,
+        restored,
+    })
+}
+
+/// Sends the session's prompt and folds the agent's updates into the turn until
+/// it answers; returns the prompt response.
+pub(crate) async fn prompt_session(ctx: &mut TurnCtx, session: &OpenSession) -> Result<Value> {
+    let client = &session.client;
     let mut events = client.begin_turn();
     let _active = ActiveTurn {
         client: client.clone(),
@@ -374,47 +524,201 @@ async fn run_turn(ctx: &mut TurnCtx, definition: &Definition) -> Result<()> {
     let response = client.request(
         "session/prompt",
         PromptRequest::new(
-            native_id,
-            vec![ContentBlock::Text(TextContent::new(prompt))],
+            session.native_id.clone(),
+            vec![ContentBlock::Text(TextContent::new(session.prompt.clone()))],
         ),
     );
     tokio::pin!(response);
     let mut tools = ToolUpdates::default();
+    let mut approved_permissions = HashSet::new();
     let mut watchdog = tokio::time::interval(std::time::Duration::from_secs(5));
     let mut deadline = tokio::time::Instant::now() + super::TURN_WATCHDOG;
-    loop {
+    let result = loop {
         tokio::select! {
-            _ = ctx.flush_due() => { let _ = ctx.flush(); }
-            _ = watchdog.tick() => {
-                if client.awaiting_permission() {
-                    deadline = tokio::time::Instant::now() + super::TURN_WATCHDOG;
-                } else if tokio::time::Instant::now() >= deadline {
-                    return Err(anyhow!("ACP turn exceeded the response timeout"));
-                }
-            }
+            // A completed turn cancels late permissions before any automatic decision.
+            biased;
             result = &mut response => {
                 let result = result?;
-                while let Ok(event) = events.try_recv() { apply_event(ctx, event, &mut tools)?; }
+                while let Ok(event) = events.try_recv() {
+                    if !matches!(&event, Event::Permission { id, .. } if approved_permissions.remove(id)) {
+                        apply_event(ctx, event, &mut tools)?;
+                    }
+                }
                 ctx.persist_delivery(DeliveryState::Accepted)?;
+                if let (Some(execution), Some(samples)) = (
+                    ctx.usage_execution_id(),
+                    prompt_token_usage(&client.initialized["agentInfo"], &result, session.restored),
+                ) {
+                    if let Err(error) = Store::open().and_then(|store| {
+                        store.record_acp_prompt_usage(execution, &ctx.harness, &samples)
+                    }) {
+                        eprintln!("orx up: could not persist ACP token usage: {error}");
+                    }
+                }
+                if let (Some(execution), Some(cost)) = (ctx.usage_execution_id(), &tools.session_cost) {
+                    if let Err(error) = Store::open().and_then(|store| {
+                        store.record_acp_cost(execution, &ctx.harness, &session.native_id, cost, session.restored)
+                    }) {
+                        eprintln!("orx up: could not persist ACP cost: {error}");
+                    }
+                }
                 if result["stopReason"] == "cancelled" { return Err(anyhow!("Agent turn was cancelled")); }
-                break;
+                break result;
+            }
+            _ = ctx.flush_due() => { let _ = ctx.flush(); }
+            _ = watchdog.tick() => {
+                approved_permissions.extend(approve_permissions(ctx, client)?);
+                // A command the agent runs reports nothing until it exits, however long it takes.
+                if client.awaiting_permission() || tools.command_running() {
+                    deadline = tokio::time::Instant::now() + super::TURN_WATCHDOG;
+                } else if tokio::time::Instant::now() >= deadline {
+                    let silence = format!(
+                        "stopped responding for {} minutes",
+                        super::TURN_WATCHDOG.as_secs() / 60
+                    );
+                    return Err(anyhow!(client.end(Stop::Failure(silence)).await));
+                }
             }
             event = events.recv() => {
-                let event = event.ok_or_else(|| anyhow!("ACP process exited during the turn; the prompt was not replayed"))?;
+                let Some(event) = event else {
+                    return Err(client.connection_error().await);
+                };
                 deadline = tokio::time::Instant::now() + super::TURN_WATCHDOG;
                 ctx.mark_delivery(DeliveryState::Accepted);
+                approved_permissions.extend(approve_permissions(ctx, client)?);
+                if matches!(&event, Event::Permission { id, .. } if approved_permissions.remove(id)) {
+                    continue;
+                }
                 apply_event(ctx, event, &mut tools)?;
             }
         }
-    }
+    };
     ctx.flush()?;
-    Ok(())
+    Ok(result)
+}
+
+fn approve_permissions(ctx: &mut TurnCtx, client: &Client) -> Result<Vec<String>> {
+    if !ctx.harness.starts_with("acp:") || !client.awaiting_permission() {
+        return Ok(Vec::new());
+    }
+    let session = Store::open()?
+        .get_chat_session(&ctx.session_id)?
+        .ok_or_else(|| anyhow!("chat session not found"))?;
+    if session.harness != ctx.harness || session.permission_mode.as_deref() != Some("auto-approve")
+    {
+        return Ok(Vec::new());
+    }
+    let approved = client.approve_pending()?;
+    let mut changed = false;
+    for part in &mut ctx.assistant.parts {
+        if let Some(prompt) = part.prompt.as_mut() {
+            if let Some((_, choice)) = approved
+                .iter()
+                .find(|(id, _)| prompt.native_id.as_ref() == Some(id))
+            {
+                prompt.resolved = true;
+                prompt.approved = Some(true);
+                prompt.answers = vec![choice.clone()];
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        ctx.flush()?;
+    }
+    Ok(approved.into_iter().map(|(id, _)| id).collect())
+}
+
+/// Native counters with input made inclusive of cache; `None` unless they add up to `totalTokens`.
+fn native_counters(usage: &Value, cache_read: &str, reasoning: Option<u64>) -> Option<TokenUsage> {
+    let cache_read = usage[cache_read].as_u64();
+    let cache_write = usage["cachedWriteTokens"].as_u64();
+    let tokens = TokenUsage {
+        input_tokens: Some(
+            usage["inputTokens"]
+                .as_u64()?
+                .checked_add(cache_read.unwrap_or(0))?
+                .checked_add(cache_write.unwrap_or(0))?,
+        ),
+        output_tokens: Some(usage["outputTokens"].as_u64()?),
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
+        reasoning_tokens: reasoning,
+    };
+    (tokens.total()? == usage["totalTokens"].as_u64()? && tokens.validate().is_ok())
+        .then_some(tokens)
+}
+
+/// A prompt response's samples: the native model label, its counters, and whether they cover
+/// every request the turn made.
+fn prompt_token_usage(
+    agent: &Value,
+    result: &Value,
+    restored: bool,
+) -> Option<Vec<(Option<String>, TokenUsage, bool)>> {
+    // ACP agents disagree about whether prompt counters describe a turn or the session.
+    let claude = match (agent["name"].as_str()?, agent["version"].as_str()?) {
+        ("@agentclientprotocol/codex-acp", "2.6.0") => false,
+        ("@agentclientprotocol/claude-agent-acp", "0.101.0") => true,
+        _ => return None,
+    };
+    let usage = &result["usage"];
+    let main = native_counters(usage, "cachedReadTokens", usage["thoughtTokens"].as_u64())?;
+    if !claude {
+        return Some(vec![(None, main, true)]);
+    }
+    // Claude counts its main loop in `usage`; its per-model rows also count sub-agents and
+    // compaction, so they replace it. Their reasoning counter is a constant zero, not a measure.
+    let native = result["_meta"]["quota"]["model_usage"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let rows: Vec<_> = native
+        .iter()
+        .filter_map(|row| {
+            let tokens = native_counters(&row["token_count"], "cachedInputTokens", None)?;
+            Some((row["model"].as_str().map(str::to_owned), tokens))
+        })
+        .collect();
+    let covers = |counter: fn(&TokenUsage) -> Option<u64>| {
+        rows.iter()
+            .try_fold(0u64, |sum, (_, row)| sum.checked_add(counter(row)?))
+            >= counter(&main)
+    };
+    let cover_main = !rows.is_empty()
+        && covers(|tokens| tokens.input_tokens)
+        && covers(|tokens| tokens.output_tokens)
+        && covers(|tokens| tokens.cache_read_tokens)
+        && covers(|tokens| tokens.cache_write_tokens);
+    if !cover_main {
+        return Some(vec![(None, main, false)]);
+    }
+    // A restored session's first rows are its main loop alone.
+    let complete = !restored && rows.len() == native.len();
+    Some(
+        rows.into_iter()
+            .map(|(model, tokens)| (model, tokens, complete))
+            .collect(),
+    )
 }
 
 #[derive(Default)]
 struct ToolUpdates {
     calls: HashMap<String, Value>,
     terminals: HashMap<String, String>,
+    /// Tool activity since the last text, which the next text follows as a new part.
+    text_break: bool,
+    /// The session's running cost from the agent's latest `usage_update`.
+    session_cost: Option<crate::store::Cost>,
+}
+
+impl ToolUpdates {
+    fn command_running(&self) -> bool {
+        // A call left `pending` never started; an approval it waits on holds the watchdog itself.
+        self.calls
+            .values()
+            .any(|tool| tool["kind"] == "execute" && tool["status"] == "in_progress")
+    }
 }
 
 fn apply_event(ctx: &mut TurnCtx, event: Event, tools: &mut ToolUpdates) -> Result<()> {
@@ -475,8 +779,13 @@ fn apply_event(ctx: &mut TurnCtx, event: Event, tools: &mut ToolUpdates) -> Resu
                         .assistant
                         .parts
                         .last()
-                        .filter(|part| part.kind == part_kind && part.id.starts_with("acp-chunk-"))
+                        .filter(|part| {
+                            !tools.text_break
+                                && part.kind == part_kind
+                                && part.id.starts_with("acp-chunk-")
+                        })
                         .map(|part| part.id.clone());
+                    tools.text_break = false;
                     let id = id.unwrap_or_else(|| format!("acp-chunk-{}", uuid::Uuid::new_v4()));
                     if !ctx.assistant.parts.iter().any(|part| part.id == id) {
                         ctx.upsert_part(if kind == "agent_thought_chunk" {
@@ -489,6 +798,7 @@ fn apply_event(ctx: &mut TurnCtx, event: Event, tools: &mut ToolUpdates) -> Resu
                 }
             }
             Some("tool_call" | "tool_call_update") => {
+                tools.text_break = true;
                 if let Some(id) = update["toolCallId"].as_str() {
                     let tool = tools
                         .calls
@@ -517,10 +827,14 @@ fn apply_event(ctx: &mut TurnCtx, event: Event, tools: &mut ToolUpdates) -> Resu
                 }
             }
             Some("usage_update") => {
+                if let Some(cost) = usage_cost(&update["cost"]) {
+                    tools.session_cost = Some(cost);
+                }
                 if let Some(used_tokens) = update["used"].as_u64() {
                     ctx.report_usage(crate::local::chat::ContextUsage {
                         used_tokens,
                         context_window: update["size"].as_u64(),
+                        ..Default::default()
                     });
                 }
             }
@@ -529,6 +843,11 @@ fn apply_event(ctx: &mut TurnCtx, event: Event, tools: &mut ToolUpdates) -> Resu
     }
     ctx.maybe_flush();
     Ok(())
+}
+
+/// ACP's `{amount, currency}`, the session's cumulative cost.
+fn usage_cost(cost: &Value) -> Option<crate::store::Cost> {
+    crate::store::Cost::of(cost["amount"].as_f64()?, cost["currency"].as_str()?)
 }
 
 fn permission_input(tool: &Value) -> Option<Value> {
@@ -549,24 +868,36 @@ fn render_tool(ctx: &mut TurnCtx, id: &str, tool: &Value, terminals: &HashMap<St
         Some("failed") => "error",
         _ => "running",
     };
-    let mut part = WirePart::tool(
-        format!("acp-tool-{id}"),
-        match tool["title"].as_str() {
-            Some("subagent" | "task" | "Agent" | "Task") => "task",
-            Some("SubagentHandback") => "SubagentHandback",
-            _ => match tool["kind"].as_str() {
+    let raw_input = tool.get("rawInput");
+    let antigravity = ctx.harness == "antigravity";
+    let native = tool["name"].as_str().filter(|_| antigravity);
+    let (name, input) = match (tool["title"].as_str(), native) {
+        (Some("subagent" | "task" | "Agent" | "Task"), _) => ("task".into(), raw_input.cloned()),
+        (Some("SubagentHandback"), _) => ("SubagentHandback".into(), raw_input.cloned()),
+        // agy sends its own tool name and argument names, as in its transcripts.
+        (_, Some(native)) => super::antigravity::normalize_tool(native, raw_input),
+        _ => (
+            match tool["kind"].as_str() {
                 Some("execute") => "bash",
                 Some(kind) => kind,
                 None => "tool",
-            },
-        },
-        status,
-        None,
-    );
+            }
+            .into(),
+            raw_input.cloned(),
+        ),
+    };
+    let mut part = WirePart::tool(format!("acp-tool-{id}"), name, status, None);
     if let Some(state) = part.state.as_mut() {
-        state.title = tool["title"].as_str().map(str::to_owned);
-        state.input = tool.get("rawInput").cloned();
-        state.output = tool_output(tool, terminals);
+        // agy titles an MCP call with no more than its tool's name.
+        state.title = tool["title"]
+            .as_str()
+            .filter(|title| native.is_none_or(|native| !title.contains(native)))
+            .map(str::to_owned);
+        state.input = input;
+        state.output = match tool_output(tool, terminals) {
+            Some(output) if antigravity => Some(super::antigravity::without_hook_notice(&output)),
+            output => output,
+        };
     }
     ctx.upsert_part(part);
 }
@@ -613,6 +944,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn codex_acp_counts_each_prompt_with_inclusive_input() {
+        let agent = json!({"name": "@agentclientprotocol/codex-acp", "version": "2.6.0"});
+        let result = json!({"usage": {
+            "totalTokens": 29958, "inputTokens": 210, "outputTokens": 308,
+            "cachedReadTokens": 29440, "cachedWriteTokens": 0, "thoughtTokens": 201,
+        }});
+        let samples = prompt_token_usage(&agent, &result, true).unwrap();
+        let [(None, tokens, true)] = samples.as_slice() else {
+            panic!("expected one complete unattributed sample: {samples:?}");
+        };
+        assert_eq!(tokens.input_tokens, Some(29650));
+        assert_eq!(tokens.reasoning_tokens, Some(201));
+        assert!(prompt_token_usage(&agent, &Value::Null, false).is_none());
+        let mut inconsistent = result;
+        inconsistent["usage"]["totalTokens"] = json!(308);
+        assert!(prompt_token_usage(&agent, &inconsistent, false).is_none());
+    }
+
+    /// Claude's per-model rows count more than its main-loop `usage` (here a second model), so
+    /// they are the samples; the main loop stands in, unattributed and partial, without them.
+    #[test]
+    fn claude_acp_counts_each_executed_model_or_falls_back_to_its_main_loop() {
+        let agent = json!({"name": "@agentclientprotocol/claude-agent-acp", "version": "0.101.0"});
+        let row = |model: &str, input: u64, read: u64, write: u64, output: u64| {
+            json!({"model": model, "token_count": {
+                "totalTokens": input + read + write + output, "inputTokens": input,
+                "cachedInputTokens": read, "cachedWriteTokens": write, "outputTokens": output,
+                "reasoningOutputTokens": 0,
+            }})
+        };
+        let fable = row("claude-fable-5-1", 2, 11384, 28946, 127);
+        let mut result = json!({
+            "usage": {
+                "totalTokens": 40459, "inputTokens": 2, "outputTokens": 127,
+                "cachedReadTokens": 11384, "cachedWriteTokens": 28946,
+            },
+            "_meta": {"quota": {"model_usage": [row("claude-haiku-5-5", 1215, 0, 0, 20), fable]}},
+        });
+        let summary =
+            |result: &Value, restored: bool| -> Vec<(Option<String>, Option<u64>, bool)> {
+                prompt_token_usage(&agent, result, restored)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(model, tokens, complete)| {
+                        assert_eq!(tokens.reasoning_tokens, None);
+                        (model, tokens.total(), complete)
+                    })
+                    .collect()
+            };
+        let models = |complete: bool| {
+            [
+                (Some("claude-haiku-5-5".to_string()), Some(1235), complete),
+                (Some("claude-fable-5-1".to_string()), Some(40459), complete),
+            ]
+        };
+        assert_eq!(summary(&result, false), models(true));
+        assert_eq!(summary(&result, true), models(false));
+        // A row that does not add up is dropped; the rest still cover the main loop, in part.
+        result["_meta"]["quota"]["model_usage"][0]["token_count"]["totalTokens"] = json!(1);
+        assert_eq!(summary(&result, false), [models(false)[1].clone()]);
+        let main_loop = [(None::<String>, Some(40459u64), false)];
+        for rows in [
+            json!([row("claude-haiku-5-5", 1215, 0, 0, 20)]),
+            Value::Null,
+        ] {
+            result["_meta"]["quota"]["model_usage"] = rows;
+            assert_eq!(summary(&result, false), main_loop);
+        }
+        let newer = json!({"name": "@agentclientprotocol/claude-agent-acp", "version": "0.102.0"});
+        assert!(prompt_token_usage(&newer, &result, false).is_none());
+    }
+
+    #[test]
     fn model_catalog_preserves_native_ids_labels_and_order() {
         let modern = json!({"configOptions": [{"category":"model", "type":"select", "options":[
             {"name":"Provider", "options":[{"value":"opaque/a", "name":"Model A"}]},
@@ -636,6 +1040,89 @@ mod tests {
             &json!({"configOptions":[], "models":{"availableModels":[{"modelId":"legacy"}]}})
         )
         .is_empty());
+    }
+
+    #[test]
+    fn usage_updates_keep_the_sessions_latest_cost() {
+        let mut ctx = TurnCtx::test_stub();
+        let mut tools = ToolUpdates::default();
+        for update in [
+            json!({"sessionUpdate": "usage_update", "used": 900, "size": 200000,
+                   "cost": {"amount": 0.42, "currency": "usd"}}),
+            json!({"sessionUpdate": "usage_update", "used": 1200, "size": 200000}),
+            json!({"sessionUpdate": "usage_update", "used": 1300,
+                   "cost": {"amount": "lots", "currency": "USD"}}),
+        ] {
+            apply_event(&mut ctx, Event::Update(update), &mut tools).unwrap();
+        }
+        let cost = tools.session_cost.unwrap();
+        assert_eq!((cost.micros, cost.currency.as_str()), (420_000, "USD"));
+        assert_eq!(ctx.context_usage.unwrap().used_tokens, 1300);
+        assert!(usage_cost(&json!({"amount": 1, "currency": ""})).is_none());
+        assert!(usage_cost(&json!({"amount": -1, "currency": "EUR"})).is_none());
+        assert_eq!(
+            usage_cost(&json!({"amount": 2.5, "currency": "EUR"})).unwrap(),
+            crate::store::Cost {
+                micros: 2_500_000,
+                currency: "EUR".into()
+            }
+        );
+    }
+
+    #[test]
+    fn text_after_tool_activity_starts_a_new_part() {
+        let mut ctx = TurnCtx::test_stub();
+        let mut tools = ToolUpdates::default();
+        let chunk = |text: &str| {
+            Event::Update(
+                json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}),
+            )
+        };
+        for event in [
+            chunk("Started it "),
+            chunk("in the background."),
+            Event::Update(
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": "c", "kind": "execute", "status": "completed"}),
+            ),
+            chunk("DONE"),
+        ] {
+            apply_event(&mut ctx, event, &mut tools).unwrap();
+        }
+        let texts: Vec<_> = ctx
+            .assistant
+            .parts
+            .iter()
+            .filter(|part| part.kind == "text")
+            .filter_map(|part| part.text.as_deref())
+            .collect();
+        assert_eq!(texts, ["Started it in the background.", "DONE"]);
+    }
+
+    #[test]
+    fn a_running_command_holds_off_the_silence_watchdog() {
+        let mut tools = ToolUpdates::default();
+        tools.calls.insert(
+            "read".into(),
+            json!({"kind": "read", "status": "in_progress"}),
+        );
+        assert!(!tools.command_running());
+        tools.calls.insert(
+            "cmd".into(),
+            json!({"kind": "execute", "status": "in_progress"}),
+        );
+        assert!(tools.command_running());
+        tools.calls.insert(
+            "cmd".into(),
+            json!({"kind": "execute", "status": "completed"}),
+        );
+        assert!(!tools.command_running());
+        tools.calls.insert(
+            "cmd".into(),
+            json!({"kind": "execute", "status": "pending"}),
+        );
+        assert!(!tools.command_running());
+        tools.calls.insert("cmd".into(), json!({"kind": "execute"}));
+        assert!(!tools.command_running());
     }
 
     #[test]
@@ -672,6 +1159,59 @@ mod tests {
             None
         );
     }
+    #[test]
+    fn antigravity_tools_render_as_in_its_transcripts() {
+        let call = |id: &str, name: &str, kind: &str, input: Value| {
+            Event::Update(json!({
+                "sessionUpdate": "tool_call", "toolCallId": id, "name": name, "kind": kind,
+                "title": "agy's title", "status": "completed", "rawInput": input,
+            }))
+        };
+        let events = || {
+            [
+                call(
+                    "c",
+                    "run_command",
+                    "execute",
+                    json!({"CommandLine": "orx exp run"}),
+                ),
+                call(
+                    "e",
+                    "edit_file",
+                    "edit",
+                    json!({"Path": "/w/a.py", "Target": "x", "Replacement": "y"}),
+                ),
+                call("s", "search_web", "search", json!({"query": "acp"})),
+                call("t", "invoke_subagent", "other", json!({"Role": "Tester"})),
+            ]
+        };
+        let render = |harness: &str| {
+            let mut ctx = TurnCtx::test_stub();
+            ctx.harness = harness.into();
+            let mut tools = ToolUpdates::default();
+            for event in events() {
+                apply_event(&mut ctx, event, &mut tools).unwrap();
+            }
+            ctx.assistant.parts
+        };
+        let parts = render("antigravity");
+        let tools: Vec<_> = parts
+            .iter()
+            .filter_map(|part| part.tool.as_deref())
+            .collect();
+        assert_eq!(tools, ["Bash", "Edit", "WebSearch", "task"]);
+        let input = |index: usize| parts[index].state.as_ref().unwrap().input.clone().unwrap();
+        assert_eq!(input(0)["command"], "orx exp run");
+        assert_eq!(input(1)["file_path"], "/w/a.py");
+        assert_eq!(input(1)["old_string"], "x");
+        assert_eq!(input(3)["description"], "Tester");
+        let other: Vec<_> = render("gemini")
+            .into_iter()
+            .filter_map(|part| part.tool)
+            .collect();
+        assert_eq!(other, ["bash", "edit", "search", "other"]);
+    }
+
     #[test]
     fn native_tool_content_and_diffs_are_readable() {
         assert_eq!(tool_output(&json!({"content": [{"type":"content", "content":{"type":"text", "text":"result"}}, {"type":"diff", "path":"file", "oldText":"old\n", "newText":"new\n"}]}), &HashMap::new()).unwrap(), "result\n--- file\n+++ file\n-old\n+new\n");

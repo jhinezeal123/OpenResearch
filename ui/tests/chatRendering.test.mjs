@@ -329,22 +329,27 @@ test("provider switches preserve the answers on both sides as separate transcrip
   assert.equal(splitResponseParts(groups[2], false).answer[0].text, "Continued answer");
 });
 
-test("a continuation retains the previous answer until a new answer arrives", async () => {
-  const { splitResponseParts } = await import("../src/chatRendering.ts");
-  const oldAnswer = { id: "old-answer", type: "text", phase: "final_answer", text: "Run launched" };
-  const progress = { id: "progress", type: "text", phase: "commentary", text: "Checking the result" };
-  const newAnswer = { id: "new-answer", type: "text", phase: "final_answer", text: "Run repaired" };
-  const first = { ...message(oldAnswer), id: "first", completedAt: 10 };
-  const continuation = { ...message(progress), id: "continuation", createdAt: 100 };
-  const waiting = splitResponseParts([first, continuation], true);
-  assert.deepEqual(waiting.answer, [oldAnswer]);
-  assert.deepEqual(waiting.work, [{ id: "continuation", parts: [progress] }]);
-  const updated = splitResponseParts([first, { ...continuation, parts: [progress, newAnswer] }], true);
-  assert.deepEqual(updated.answer, [newAnswer]);
-  assert.deepEqual(updated.work, [
-    { id: "first", parts: [oldAnswer] },
-    { id: "continuation", parts: [progress] },
-  ]);
+test("an automatic follow-up leaves both answers visible outside the tool activity", async () => {
+  const { groupResponseMessages } = await import("../src/chatRendering.ts");
+  const tool = { id: "cancel", type: "tool", tool: "bash", state: { status: "completed" } };
+  const answer = { id: "answer", type: "text", phase: "final_answer", text: "The run is cancelled. Here are the findings." };
+  const noticeReply = { id: "notice", type: "text", phase: "final_answer", text: "The run notice confirms the cancellation." };
+  const first = { ...message(tool, answer), id: "first", completedAt: 10 };
+  const followUp = { ...message(), id: "follow-up", createdAt: 20 };
+  const original = groupResponseMessages([first]);
+  const streaming = groupResponseMessages([first, followUp], original);
+  assert.equal(streaming[0], original[0]);
+  const finished = { ...followUp, completedAt: 30, parts: [noticeReply] };
+  const responses = groupResponseMessages([first, finished]).map((group) => splitResponseParts(group, false));
+  assert.deepEqual(responses.map((response) => response.answer), [[answer], [noticeReply]]);
+  assert.deepEqual(responses[0].work, [{ id: "first", parts: [tool] }]);
+});
+
+test("a trailing answer in an older transcript also ends its response group", async () => {
+  const { groupResponseMessages } = await import("../src/chatRendering.ts");
+  const first = { ...message({ id: "answer", type: "text", text: "Run launched" }), id: "first" };
+  const followUp = { ...message({ id: "update", type: "text", text: "Run finished" }), id: "follow-up" };
+  assert.deepEqual(groupResponseMessages([first, followUp]), [[first], [followUp]]);
 });
 
 test("a message the user wrote into a continuation stays visible with its reply", async () => {
@@ -369,6 +374,16 @@ test("continuation prompts stay outside collapsed activity", async () => {
   const first = message({ id: "answer", type: "text", phase: "final_answer", text: "Started" });
   const prompt = { id: "question", type: "prompt", prompt: { kind: "question", resolved: false } };
   assert.deepEqual(splitResponseParts([first, { ...message(prompt), id: "next" }], true).answer, [prompt]);
+});
+
+test("an inline approval leaves the work and answer split intact", () => {
+  const tool = { id: "read", type: "tool", tool: "Read" };
+  const answer = { id: "answer", type: "text", phase: "final_answer", text: "The results so far" };
+  const approval = { id: "approval", type: "prompt", prompt: { kind: "permission", resolved: false } };
+  const withoutApproval = splitResponseParts([message(tool, answer)], true);
+  const pending = splitResponseParts([message(tool, answer, approval)], true);
+  assert.deepEqual(pending.work, withoutApproval.work);
+  assert.deepEqual(pending.answer, [answer, approval]);
 });
 
 test("every event for an agent resolves to its combined live transcript", async () => {
@@ -469,6 +484,18 @@ test("answered questions stay visible when Claude continues with a final respons
   ], false);
   assert.deepEqual(response.answer, [color, shape, final]);
   assert.deepEqual(response.work, [{ id: "last", parts: [tool] }]);
+});
+
+test("questions answered together stay in the order asked while the turn resumes", async () => {
+  const { splitResponseParts } = await import("../src/chatRendering.ts");
+  const question = (id) => ({ id, type: "prompt", prompt: { kind: "question", resolved: true, question: `${id}?`, answers: ["Yes"] } });
+  const [color, shape, size] = ["color", "shape", "size"].map(question);
+  const response = splitResponseParts([
+    { ...message(color), id: "first" },
+    { ...message(shape), id: "second" },
+    { ...message(size), id: "last" },
+  ], true);
+  assert.deepEqual(response.answer, [color, shape, size]);
 });
 
 test("explicitly skipped questions stay visible without treating stale cleanup as a skip", async () => {

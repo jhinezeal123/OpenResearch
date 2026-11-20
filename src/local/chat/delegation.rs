@@ -155,8 +155,6 @@ pub fn delegate_permission(parent: &StoredChatSession, harness_id: &str) -> Resu
         })
 }
 
-/// A delegate's chat: a side chat of its delegator, unless it gets a
-/// worktree of its own and stands as a chat in the sidebar.
 /// The id of a chat an agent starts. Given the agent's `clientRequestId` it
 /// is fixed, so a retry finds the chat the first attempt started.
 pub fn started_chat_id(parent: &StoredChatSession, request: Option<&str>) -> String {
@@ -178,6 +176,8 @@ pub fn request_key(caller: &str, request: &str) -> uuid::Uuid {
     )
 }
 
+/// A delegate's chat: a side chat of its delegator, unless it gets a worktree
+/// of its own. Either way it stays out of the sidebar while it is a delegate.
 pub fn delegate_session(
     id: String,
     parent: &StoredChatSession,
@@ -189,10 +189,16 @@ pub fn delegate_session(
 ) -> StoredChatSession {
     let now = now_ms();
     StoredChatSession {
+        profile_id: route.profile.clone().or_else(|| {
+            (route.harness == parent.harness)
+                .then(|| parent.profile_id.clone())
+                .flatten()
+        }),
         id,
         project_id: parent.project_id.clone(),
         harness: route.harness.clone(),
         native_session_id: None,
+        native_fork_at: None,
         title_source: title.is_some().then(|| "user".to_string()),
         title,
         model: Some(route.model.clone()),
@@ -390,10 +396,28 @@ impl PendingPrompt {
             &self.prompt.kind
         }
     }
+
+    /// What the user must do in the chat, as in "waits for the user to …".
+    pub fn awaits(&self) -> String {
+        if self.kind() == "env" {
+            let names: Vec<String> = self
+                .prompt
+                .variables
+                .iter()
+                .map(|var| format!("`{}`", var.name))
+                .collect();
+            return format!("set {}", names.join(", "));
+        }
+        format!(
+            "approve {}",
+            self.prompt.tool.as_deref().unwrap_or("a step")
+        )
+    }
 }
 
-/// Claude's approval bridge puts each card in an assistant message of its own
-/// beside the turn's, so every message since the turn began is searched.
+/// The oldest open card. Claude's approval bridge puts each card in an
+/// assistant message of its own beside the turn's, so every message since the
+/// turn began is searched.
 pub fn pending_prompt(store: &Store, session_id: &str) -> Result<Option<PendingPrompt>> {
     let Some(turn) = store.latest_chat_turn(session_id)? else {
         return Ok(None);
@@ -402,7 +426,7 @@ pub fn pending_prompt(store: &Store, session_id: &str) -> Result<Option<PendingP
     messages
         .retain(|message| message.role == "assistant" && message.id != turn.assistant_message_id);
     messages.extend(store.get_chat_message(&turn.assistant_message_id)?);
-    Ok(messages.iter().rev().find_map(|message| {
+    Ok(messages.iter().find_map(|message| {
         stored_to_wire(message).parts.into_iter().find_map(|part| {
             let prompt = part.prompt.filter(|prompt| !prompt.resolved)?;
             Some(PendingPrompt {
@@ -457,9 +481,9 @@ pub fn status(
             question_text(&target.id, &model, pending)
         }
         (Some(pending), _, _) => format!(
-            "Chat `{}` ({model}) waits for the user to approve {} in that chat.",
+            "Chat `{}` ({model}) waits for the user to {} in that chat.",
             target.id,
-            pending.prompt.tool.as_deref().unwrap_or("a step")
+            pending.awaits()
         ),
         (None, true, _) => format!("Chat `{}` ({model}) is working.", target.id),
         (None, false, Some(turn)) => {
@@ -613,8 +637,8 @@ pub fn session_links(store: &Store, session: &StoredChatSession) -> Result<Value
 }
 
 /// The user keeps a delegate for themselves: it stops telling the chat that
-/// started it, and stands as that chat's side chat, or on its own when it has
-/// its own worktree. The delegator's agent can still read it.
+/// started it, and stands as that chat's side chat, or as a chat in the sidebar
+/// when it has its own worktree. The delegator's agent can still read it.
 pub fn release_delegate(store: &Store, id: &str) -> Result<Option<StoredChatSession>> {
     let Some(session) = store.get_chat_session(id)? else {
         return Ok(None);
@@ -683,8 +707,37 @@ mod tests {
     use crate::local::chat::news::{chat_news, News};
     use crate::store::StoredChatTurn;
 
+    #[test]
+    fn delegates_inherit_the_profile_or_use_the_explicit_route_profile() {
+        let mut parent = chat("claude-code", "auto");
+        parent.profile_id = Some("claude-012345abcd".into());
+        let mut route = Route {
+            profile: None,
+            name: "claude-code".into(),
+            harness: "claude-code".into(),
+            model: "sonnet".into(),
+            free: false,
+            efforts: Vec::new(),
+        };
+        let child = delegate_session("child".into(), &parent, &route, None, None, None, false);
+        assert_eq!(child.profile_id, parent.profile_id);
+        route.profile = Some("claude-abcdefghij".into());
+        assert_eq!(
+            delegate_session("child".into(), &parent, &route, None, None, None, false).profile_id,
+            route.profile
+        );
+        route.harness = "codex".into();
+        route.profile = None;
+        assert!(
+            delegate_session("child".into(), &parent, &route, None, None, None, false)
+                .profile_id
+                .is_none()
+        );
+    }
+
     fn chat(harness: &str, permission_mode: &str) -> StoredChatSession {
         let route = Route {
+            profile: None,
             name: harness.into(),
             harness: harness.into(),
             model: "m".into(),
@@ -692,10 +745,12 @@ mod tests {
             efforts: Vec::new(),
         };
         let root = StoredChatSession {
+            profile_id: None,
             id: "chat_root".into(),
             project_id: "proj".into(),
             harness: harness.into(),
             native_session_id: None,
+            native_fork_at: None,
             title: None,
             title_source: None,
             model: None,
@@ -731,10 +786,16 @@ mod tests {
         for (parent, mode, child, expected) in [
             ("claude-code", "acceptEdits", "codex", "ask"),
             ("claude-code", "auto", "codex", "approve-for-me"),
-            ("claude-code", "auto", "opencode", "auto-approve"),
+            ("claude-code", "auto", "opencode", "auto"),
+            (
+                "claude-code",
+                "bypassPermissions",
+                "opencode",
+                "auto-approve",
+            ),
             ("claude-code", "plan", "codex", "ask"),
             ("codex", "full-access", "claude-code", "bypassPermissions"),
-            ("opencode", "default", "claude-code", "manual"),
+            ("opencode", "manual", "claude-code", "manual"),
         ] {
             let got = delegate_permission(&chat(parent, mode), child).unwrap();
             assert_eq!(got.as_deref(), Some(expected), "{parent} {mode} → {child}");
@@ -767,6 +828,7 @@ mod tests {
                 parent_id: None,
                 base_native_session_id: None,
                 result_native_session_id: None,
+                result_native_message_id: None,
                 native_harness: None,
             })
             .unwrap();
@@ -815,7 +877,7 @@ mod tests {
     fn a_released_delegate_stops_telling_its_parent_and_stands_alone() {
         let dir = std::env::temp_dir().join(format!("orx-release-{}", uuid::Uuid::new_v4()));
         let store = Store::open_at(dir.clone()).unwrap();
-        let child = chat("opencode", "default");
+        let child = chat("opencode", "manual");
         let mut parent = child.clone();
         parent.id = "chat_root".into();
         parent.side_parent_session_id = None;
@@ -841,7 +903,7 @@ mod tests {
     fn a_question_is_news_before_the_turn_that_asked_it() {
         let dir = std::env::temp_dir().join(format!("orx-news-{}", uuid::Uuid::new_v4()));
         let store = Store::open_at(dir.clone()).unwrap();
-        let child = chat("opencode", "default");
+        let child = chat("opencode", "manual");
         let mut parent = child.clone();
         parent.id = "chat_root".into();
         parent.side_parent_session_id = None;
@@ -914,33 +976,37 @@ mod tests {
         assert!(kinds().is_empty(), "a told question waits for its answer");
         question(true);
         assert_eq!(kinds(), ["answer"]);
-        let mut card = WirePart::text("perm", "");
-        card.kind = "prompt".into();
-        card.prompt = Some(WirePrompt {
-            kind: "question".into(),
-            question: Some("Which dataset?".into()),
-            ..Default::default()
-        });
-        store
-            .upsert_chat_message(&StoredChatMessage {
-                id: "msg_perm".into(),
-                session_id: child.id.clone(),
-                role: "assistant".into(),
-                parts_json: serde_json::to_string(&[card]).unwrap(),
-                created_at: 2,
-                completed_at: None,
-                parent_id: None,
-                base_native_session_id: None,
-                result_native_session_id: None,
-                native_harness: None,
-            })
-            .unwrap();
+        // Claude's bridge asks from messages of its own, a batch all at once.
+        for (created_at, id) in [(2, "perm"), (3, "perm_next")] {
+            let mut card = WirePart::text(id, "");
+            card.kind = "prompt".into();
+            card.prompt = Some(WirePrompt {
+                kind: "question".into(),
+                question: Some("Which dataset?".into()),
+                ..Default::default()
+            });
+            store
+                .upsert_chat_message(&StoredChatMessage {
+                    id: format!("msg_{id}"),
+                    session_id: child.id.clone(),
+                    role: "assistant".into(),
+                    parts_json: serde_json::to_string(&[card]).unwrap(),
+                    created_at,
+                    completed_at: None,
+                    parent_id: None,
+                    base_native_session_id: None,
+                    result_native_session_id: None,
+                    result_native_message_id: None,
+                    native_harness: None,
+                })
+                .unwrap();
+        }
         assert_eq!(
             pending_prompt(&store, &child.id)
                 .unwrap()
                 .map(|pending| pending.id),
             Some("perm".into()),
-            "Claude's bridge asks from a message of its own"
+            "the questions of a batch are asked in order"
         );
         let plan_exit = WirePrompt {
             kind: "question".into(),

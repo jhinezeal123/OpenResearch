@@ -33,7 +33,8 @@ import {
 import { createPortal } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 
-import { fmtBytes, type CitedMessage, type HarnessId, type SkillInfo } from "../api";
+import { type CitedMessage, type HarnessId, type SkillInfo } from "../api";
+import { fmtBytes } from "../i18n";
 import { CITED_ID, refLabel } from "../agentMessages";
 import { commandDisplayName } from "../composerCommands";
 import type { ComposerAttachment } from "../composerStash";
@@ -44,6 +45,7 @@ import { WorkspaceDomContext } from "../WorkspaceDom";
 import { FileTypeIcon } from "./FileTypeIcon";
 import { HarnessLogo } from "./HarnessLogo";
 import { LitSourceLogo } from "./LitSourceLogo";
+import { ResizeHandle } from "./ResizeHandle";
 import { CommandIcon, SkillPreviewCard } from "./SkillChips";
 
 /** What the draft's tokens resolve to; a token that resolves to nothing stays text. */
@@ -270,15 +272,14 @@ function chips(source: () => ChipSource): Extension {
   return [pointerSelection, Prec.high(field), Prec.high(keymap.of([{ key: "Backspace", run: deleteChipBehindSpace }]))];
 }
 
-/** Natural height stops at eight lines, then the editor scrolls. */
 const composerTheme = EditorView.theme({
-  "&": { color: "var(--text)", maxHeight: "calc(12em + 2 * var(--editor-pad-y))" },
+  "&": { color: "var(--text)", padding: "var(--editor-pad-y) 0" },
   "&.cm-focused": { outline: "none" },
   ".cm-scroller": { fontFamily: "inherit", lineHeight: "1.5", overflow: "auto" },
   // WebKit can retain an empty horizontal scrollbar gutter after the draft shrinks.
   ".cm-scroller::-webkit-scrollbar": { height: "0" },
   // `minWidth` lets WebKit shrink the content below the placeholder's one-line width.
-  ".cm-content": { padding: "var(--editor-pad-y) 0", caretColor: "var(--text)", minWidth: "0" },
+  ".cm-content": { padding: "0", caretColor: "var(--text)", minWidth: "0" },
   ".cm-line": { padding: "0 var(--editor-pad-x)" },
   // One line however narrow the box, so an empty draft keeps the one-line height.
   ".cm-placeholder": { color: "var(--muted)", maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
@@ -294,6 +295,11 @@ const markdownSource = markdown({
   extensions: { remove: ["HTMLBlock", "HTMLTag"] },
 });
 
+/** Read-only refuses every change, including the editor's own commands that skip the `readOnly` facet. */
+function readOnlyExtension(readOnly: boolean): Extension {
+  return readOnly ? [EditorState.readOnly.of(true), EditorState.changeFilter.of(() => false)] : [];
+}
+
 function modeExtension(plain: boolean): Extension {
   return plain ? EditorView.editorAttributes.of({ class: "cm-plain" }) : [markdownSource, livePreview];
 }
@@ -305,7 +311,6 @@ function isComposing(event: KeyboardEvent): boolean {
 
 /** One 24px line plus the 10px padding above and below; a shorter box would scroll an empty draft. */
 const MIN_HEIGHT = 44;
-const KEYBOARD_STEP = 24;
 
 function storedHeight(key: string): number | null {
   try {
@@ -316,10 +321,12 @@ function storedHeight(key: string): number | null {
   }
 }
 
-/** Dragged heights stop short of crowding out the transcript. */
+/** The draft grows, and can be dragged, up to this height, then scrolls inside the box. */
 function maxHeight(dom: HTMLElement): number {
   const pane = dom.closest<HTMLElement>(".chat-pane");
-  return Math.max(MIN_HEIGHT, Math.min(window.innerHeight * 0.6, (pane?.clientHeight ?? window.innerHeight) - 220));
+  const composer = dom.closest<HTMLElement>(".composer");
+  const chrome = composer ? composer.offsetHeight - dom.offsetHeight : 0;
+  return Math.max(MIN_HEIGHT, ((pane?.clientHeight ?? window.innerHeight) - chrome) * 0.8);
 }
 
 export interface ComposerEditorHandle {
@@ -346,6 +353,7 @@ export function ComposerEditor({
   onPaste,
   placeholder,
   plain,
+  readOnly,
   chipSource,
   projectId,
   describedBy,
@@ -367,6 +375,8 @@ export function ComposerEditor({
   placeholder: string;
   /** Shell commands: monospace, no markdown or chips. */
   plain: boolean;
+  /** Keeps focus and the text but takes no edits, as while the text is being sent. */
+  readOnly: boolean;
   chipSource: ChipSource;
   projectId: string;
   describedBy?: string;
@@ -377,9 +387,9 @@ export function ComposerEditor({
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
-  const latest = useRef({ onChange, onKeyDown, onSubmit, onFiles, onPaste, chipSource, plain, placeholder, describedBy });
-  latest.current = { onChange, onKeyDown, onSubmit, onFiles, onPaste, chipSource, plain, placeholder, describedBy };
-  const [compartments] = useState(() => ({ mode: new Compartment(), placeholder: new Compartment(), aria: new Compartment() }));
+  const latest = useRef({ onChange, onKeyDown, onSubmit, onFiles, onPaste, chipSource, plain, readOnly, placeholder, describedBy });
+  latest.current = { onChange, onKeyDown, onSubmit, onFiles, onPaste, chipSource, plain, readOnly, placeholder, describedBy };
+  const [compartments] = useState(() => ({ mode: new Compartment(), readOnly: new Compartment(), placeholder: new Compartment(), aria: new Compartment() }));
   const [hovered, setHovered] = useState<HTMLElement | null>(null);
   const previewId = useId();
   /** A height the user dragged to; null keeps the natural height. */
@@ -426,6 +436,7 @@ export function ComposerEditor({
           },
         })),
         compartments.mode.of(modeExtension(latest.current.plain)),
+        compartments.readOnly.of(readOnlyExtension(latest.current.readOnly)),
         keymap.of([
           // Enter belongs to send; Shift+Enter breaks the line.
           ...defaultKeymap.filter((binding) => !binding.key?.endsWith("Enter")),
@@ -480,6 +491,10 @@ export function ComposerEditor({
   }, [plain, compartments]);
 
   useEffect(() => {
+    viewRef.current?.dispatch({ effects: compartments.readOnly.reconfigure(readOnlyExtension(readOnly)) });
+  }, [readOnly, compartments]);
+
+  useEffect(() => {
     viewRef.current?.dispatch({
       effects: [
         compartments.placeholder.reconfigure(placeholderText(placeholder)),
@@ -496,8 +511,8 @@ export function ComposerEditor({
     const dom = viewRef.current?.dom;
     if (!dom) return;
     const clamped = height === null ? null : Math.min(height, heightLimit);
-    dom.style.height = clamped === null ? "" : `${clamped}px`;
-    dom.style.maxHeight = clamped === null ? "" : "none";
+    dom.style.minHeight = clamped === null ? "" : `${clamped}px`;
+    dom.style.maxHeight = `${clamped ?? heightLimit}px`;
   }, [height, heightLimit]);
 
   useEffect(() => {
@@ -509,14 +524,16 @@ export function ComposerEditor({
     }
   }, [resizeKey, height]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const dom = viewRef.current?.dom;
     if (!dom) return;
     const measure = () => setHeightLimit(maxHeight(dom));
     measure();
     const pane = dom.closest(".chat-pane");
+    const composer = dom.closest(".composer");
     const observer = new ResizeObserver(measure);
     if (pane) observer.observe(pane);
+    if (composer) observer.observe(composer);
     window.addEventListener("resize", measure);
     return () => {
       observer.disconnect();
@@ -524,8 +541,6 @@ export function ComposerEditor({
     };
   }, []);
 
-  const resizeBy = (start: number, delta: number) =>
-    setHeight(Math.round(Math.min(Math.max(start + delta, MIN_HEIGHT), heightLimit)));
   const currentHeight = () => viewRef.current?.dom.getBoundingClientRect().height ?? MIN_HEIGHT;
 
   useImperativeHandle(ref, () => ({
@@ -577,7 +592,7 @@ export function ComposerEditor({
   return (
     <div
       ref={hostRef}
-      className="composer-editor min-w-0 flex-1 [--editor-pad-x:12px] [--editor-pad-y:10px]"
+      className="composer-editor min-w-0 flex-1 [--editor-pad-x:var(--composer-pad-x,12px)] [--editor-pad-y:10px]"
       onKeyDown={(event) => {
         // CodeMirror skips its handlers while an IME composes; keep those keys
         // (an Escape that cancels a candidate) from reaching page shortcuts.
@@ -620,45 +635,15 @@ export function ComposerEditor({
         if (event.target instanceof Element && event.target.closest("[data-chip]")) scheduleClose();
       }}
     >
-      {/* Positioned against the composer box, so it rides the box's top edge. */}
-      <div
-        role="separator"
-        aria-orientation="horizontal"
-        aria-label={m.chat_resize_composer()}
-        aria-valuemin={MIN_HEIGHT}
-        aria-valuemax={Number.isFinite(heightLimit) ? Math.round(heightLimit) : undefined}
-        aria-valuenow={Math.round(height ?? MIN_HEIGHT)}
-        title={m.chat_resize_composer_hint()}
-        tabIndex={0}
-        className="group/resize absolute inset-x-0 -top-1.5 z-3 flex h-3 cursor-row-resize touch-none items-center justify-center outline-none"
-        onPointerDown={(event) => {
-          event.preventDefault();
-          event.currentTarget.setPointerCapture(event.pointerId);
-          const startY = event.clientY;
-          const start = currentHeight();
-          const move = (moveEvent: PointerEvent) => resizeBy(start, startY - moveEvent.clientY);
-          const stop = () => {
-            window.removeEventListener("pointermove", move);
-            window.removeEventListener("pointerup", stop);
-            window.removeEventListener("pointercancel", stop);
-          };
-          window.addEventListener("pointermove", move);
-          window.addEventListener("pointerup", stop);
-          window.addEventListener("pointercancel", stop);
-        }}
-        onDoubleClick={() => setHeight(null)}
-        onKeyDown={(event) => {
-          if (event.key === "ArrowUp" || event.key === "ArrowDown") {
-            event.preventDefault();
-            resizeBy(height ?? currentHeight(), event.key === "ArrowUp" ? KEYBOARD_STEP : -KEYBOARD_STEP);
-          } else if (event.key === "Home") {
-            event.preventDefault();
-            setHeight(null);
-          }
-        }}
-      >
-        <span className="h-1 w-10 rounded-full bg-muted opacity-0 transition-opacity group-hover/resize:opacity-100 group-focus-visible/resize:opacity-100 group-active/resize:opacity-100" />
-      </div>
+      {/* Rides the top edge of the composer box, or of the answer field under a question. */}
+      <ResizeHandle
+        label={m.chat_resize_composer()}
+        height={height}
+        min={MIN_HEIGHT}
+        max={heightLimit}
+        measure={currentHeight}
+        onChange={setHeight}
+      />
       {hovered && hoveredSkill && (
         <SkillPreviewCard
           id={previewId}

@@ -3,6 +3,13 @@ use serde_json::Value;
 
 pub(crate) const IDS: [&str; 5] = ["claude-code", "codex", "opencode", "cursor", "antigravity"];
 
+pub(crate) fn wire_id(id: &str) -> Option<&'static str> {
+    if id.starts_with("acp:") {
+        return Some(crate::local::acp::telemetry_id(id).unwrap_or("acp:custom"));
+    }
+    IDS.into_iter().find(|known| *known == id)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct InitialSnapshot {
     event_id: String,
@@ -18,11 +25,14 @@ fn state(id: &str, h: &Value) -> Value {
     let broken = h["installBroken"] == true;
     let checked = installed == Some(true) && !broken;
     let auth = h["authState"].as_str();
-    let signed_in =
-        h["authenticated"] == true || (id == "claude-code" && auth == Some("unsupported"));
+    // ACP detection never sets `authenticated`; a ready agent's failed check still reads `ready`.
+    let acp = id.starts_with("acp:");
+    let signed_in = h["authenticated"] == true
+        || (id == "claude-code" && auth == Some("unsupported"))
+        || (acp && auth == Some("ready"));
     let auth_state = if !checked {
         "not_checked"
-    } else if auth == Some("unknown") {
+    } else if auth == Some("unknown") || (acp && h["authCheckFailed"] == true) {
         "unverifiable"
     } else if auth == Some("needsLogin") {
         "signed_out"
@@ -48,10 +58,11 @@ pub(crate) fn capture_initial(harnesses: &Value) {
     if !is_enabled(flag()) {
         return;
     }
-    if load_settings()
-        .and_then(|s| s.harness_snapshot)
-        .is_some_and(|s| s.queued)
-    {
+    if load_settings().is_some_and(|settings| {
+        [settings.harness_snapshot, settings.acp_harness_snapshot]
+            .into_iter()
+            .all(|snapshot| snapshot.is_some_and(|snapshot| snapshot.queued))
+    }) {
         return;
     }
     if !crate::store::Store::open()
@@ -64,53 +75,94 @@ pub(crate) fn capture_initial(harnesses: &Value) {
     if mutate_settings(|settings| ensure_initial(settings, &install, harnesses)).is_err() {
         return;
     }
-    let mut queued = None;
+    let mut queued = Vec::new();
     let saved = mutate_settings(|settings| {
-        let Some(snapshot) = settings.harness_snapshot.as_mut().filter(|s| !s.queued) else {
-            return;
-        };
-        if let Some(path) = uuid::Uuid::parse_str(&snapshot.event_id)
-            .ok()
-            .and_then(|id| persist_payload(id, &snapshot.payload))
+        for snapshot in [
+            &mut settings.harness_snapshot,
+            &mut settings.acp_harness_snapshot,
+        ]
+        .into_iter()
+        .filter_map(Option::as_mut)
+        .filter(|snapshot| !snapshot.queued)
         {
-            snapshot.queued = true;
-            queued = Some((path, snapshot.payload.clone()));
+            if let Some(path) = uuid::Uuid::parse_str(&snapshot.event_id)
+                .ok()
+                .and_then(|id| persist_payload(id, &snapshot.payload))
+            {
+                snapshot.queued = true;
+                queued.push((path, snapshot.payload.clone()));
+            }
         }
     });
     if saved.is_ok() {
-        if let Some((path, payload)) = queued {
+        for (path, payload) in queued {
             register_pending(tokio::spawn(deliver_payload(Some(path), payload)));
         }
     }
 }
 
 fn ensure_initial(settings: &mut Settings, install: &str, harnesses: &Value) {
-    if settings.harness_snapshot.is_some() {
-        return;
+    let items = harnesses["harnesses"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if settings.harness_snapshot.is_none() {
+        settings.harness_snapshot = Some(initial_snapshot(
+            install,
+            IDS.iter().map(|id| {
+                let info = items
+                    .iter()
+                    .find(|h| h["id"] == *id)
+                    .unwrap_or(&Value::Null);
+                state(id, info)
+            }),
+        ));
     }
+    if settings.acp_harness_snapshot.is_none() {
+        let mut acp = std::collections::BTreeMap::new();
+        let readiness = |info: &Value| (info["agentReady"] == true, info["installed"] == true);
+        for info in items {
+            let Some(id) = info["id"]
+                .as_str()
+                .filter(|id| id.starts_with("acp:"))
+                .and_then(wire_id)
+            else {
+                continue;
+            };
+            let previous = acp.entry(id).or_insert(info);
+            if readiness(info) > readiness(previous) {
+                *previous = info;
+            }
+        }
+        if !acp.is_empty() {
+            settings.acp_harness_snapshot = Some(initial_snapshot(
+                install,
+                acp.into_iter().map(|(id, info)| state(id, info)),
+            ));
+        }
+    }
+}
+
+fn initial_snapshot(install: &str, states: impl Iterator<Item = Value>) -> InitialSnapshot {
     let event_id = uuid::Uuid::new_v4();
     let mut payload = build_payload_with_id("harness_initial_state", install, event_id, json!({}));
     let template = payload["events"][0].clone();
     payload["events"] = Value::Array(
-        IDS.iter()
-            .map(|id| {
-                let h = harnesses["harnesses"]
-                    .as_array()
-                    .and_then(|items| items.iter().find(|h| h["id"] == *id))
-                    .unwrap_or(&Value::Null);
+        states
+            .map(|properties| {
                 let mut event = template.clone();
                 event["eventId"] = json!(uuid::Uuid::new_v4().to_string());
-                event["properties"] = state(id, h);
+                event["properties"] = properties;
                 event
             })
             .collect(),
     );
-    settings.harness_snapshot = Some(InitialSnapshot {
+    InitialSnapshot {
         event_id: event_id.to_string(),
         payload,
         queued: false,
         unknown: Default::default(),
-    });
+    }
 }
 
 /// One detection pass — the boot snapshot or a catalog fill — sent as a
@@ -158,7 +210,7 @@ fn detect_payload(
     first_ready_ms: Option<u64>,
     installed: usize,
     ready: usize,
-    probes: Vec<crate::local::harness::ProbeTiming>,
+    mut probes: Vec<crate::local::harness::ProbeTiming>,
 ) -> Value {
     let mut payload = build_payload_with_id(
         "harness_detect",
@@ -169,15 +221,18 @@ fn detect_payload(
             "pass": pass,
             "durationMs": duration_ms.min(9_007_199_254_740_991),
             "firstReadyMs": first_ready_ms.map(|ms| ms.min(9_007_199_254_740_991)),
-            "installed": installed,
-            "ready": ready,
+            "installed": installed.min(64),
+            "ready": ready.min(64),
         }),
     );
     let template = payload["events"][0].clone();
     if let Some(events) = payload["events"].as_array_mut() {
-        // Ingestion caps a batch at 25 events; the pass row always survives.
+        // Keep per-agent totals ahead of detailed timings under the 25-event cap.
+        if probes.len() > 24 {
+            probes.sort_by_key(|probe| probe.probe != "total");
+        }
         for probe in probes.into_iter().take(24) {
-            debug_assert!(IDS.contains(&probe.harness), "{}", probe.harness);
+            debug_assert_eq!(wire_id(probe.harness), Some(probe.harness));
             debug_assert!(probe.probe.len() <= 64, "{}", probe.probe);
             let mut event = template.clone();
             event["eventId"] = json!(uuid::Uuid::new_v4().to_string());
@@ -194,8 +249,26 @@ fn detect_payload(
     payload
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum InstallStep {
+    ReleaseLookup,
+    NativeUpdater,
+    ManagedCopy,
+}
+
+impl InstallStep {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ReleaseLookup => "managed release lookup",
+            Self::NativeUpdater => "native agent updater",
+            Self::ManagedCopy => "managed agent copy",
+        }
+    }
+}
+
 pub(crate) struct SetupAttempt {
     id: uuid::Uuid,
+    install_step: std::sync::Mutex<Option<InstallStep>>,
     harness: String,
     action: &'static str,
     trigger: &'static str,
@@ -206,6 +279,7 @@ impl SetupAttempt {
     pub(crate) fn new(harness: &str, action: &'static str, trigger: &'static str) -> Self {
         let attempt = Self {
             id: uuid::Uuid::new_v4(),
+            install_step: Default::default(),
             harness: harness.into(),
             action,
             trigger,
@@ -213,6 +287,13 @@ impl SetupAttempt {
         };
         attempt.record("started", "detect", None, None, None);
         attempt
+    }
+
+    pub(crate) async fn command<T>(&self, work: impl std::future::Future<Output = T>) -> T {
+        observe_command(work, |outcome, detail| {
+            self.record(outcome, "command", None, None, detail);
+        })
+        .await
     }
 
     pub(crate) fn record(
@@ -223,9 +304,6 @@ impl SetupAttempt {
         exit_code: Option<u32>,
         output: Option<&str>,
     ) {
-        if self.harness.starts_with("acp:") {
-            return;
-        }
         // Ingestion rejects the whole event on a value outside the companion
         // schema, so a new call site fails here in any debug run that hits it.
         debug_assert!(contract::OUTCOMES.contains(&outcome), "{outcome}");
@@ -240,30 +318,85 @@ impl SetupAttempt {
                 "attemptId": self.id.to_string(), "harness": self.harness, "action": self.action, "trigger": self.trigger,
                 "outcome": outcome, "stage": stage, "reason": reason,
                 "exitCode": exit_code, "durationMs": self.started.elapsed().as_millis().min(9_007_199_254_740_991) as u64,
-                "errorExcerpt": output.and_then(safe_error_excerpt),
+                "errorExcerpt": self.error_excerpt(outcome, stage, exit_code, output),
             }),
         );
     }
+
+    pub(crate) fn set_install_step(&self, step: InstallStep) {
+        if let Ok(mut current) = self.install_step.lock() {
+            *current = Some(step);
+        }
+    }
+
+    fn error_excerpt(
+        &self,
+        outcome: &str,
+        stage: &str,
+        exit_code: Option<u32>,
+        output: Option<&str>,
+    ) -> Option<String> {
+        // A failed command may be credited after verification if it installed a runnable copy.
+        let failed_command = (outcome == "failed" && stage == "command")
+            || (outcome == "succeeded" && exit_code.is_some_and(|code| code != 0));
+        let step = if failed_command {
+            self.install_step.lock().ok().and_then(|step| *step)
+        } else {
+            None
+        };
+        safe_error_excerpt_with_step(output.unwrap_or_default(), step)
+    }
+}
+
+/// A dropped future is an observed interruption, not evidence the agent command failed.
+async fn observe_command<T>(
+    work: impl std::future::Future<Output = T>,
+    report: impl Fn(&'static str, Option<&'static str>),
+) -> T {
+    struct Pending<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Drop for Pending<F> {
+        fn drop(&mut self) {
+            if let Some(report) = self.0.take() {
+                report();
+            }
+        }
+    }
+
+    report("command_started", None);
+    let mut pending = Pending(Some(|| {
+        report(
+            "interrupted",
+            Some("setup command task ended before a result"),
+        );
+    }));
+    let result = work.await;
+    pending.0.take();
+    result
 }
 
 #[cfg(test)]
 pub(super) async fn assert_production_contract() {
     let mut settings = Settings::default();
+    let preset = &crate::local::acp::presets()[0].launch;
     ensure_initial(
         &mut settings,
         "cli-release-contract-test",
-        &json!({"harnesses": []}),
+        &json!({"harnesses": [{"id": preset.id}]}),
     );
-    let snapshot = settings.harness_snapshot.unwrap();
-    assert_eq!(
-        post_payload(&snapshot.payload).await,
-        DeliveryOutcome::Acknowledged
-    );
-    for harness in IDS {
+    for snapshot in [
+        settings.harness_snapshot.unwrap(),
+        settings.acp_harness_snapshot.unwrap(),
+    ] {
+        assert_eq!(
+            post_payload(&snapshot.payload).await,
+            DeliveryOutcome::Acknowledged
+        );
+    }
+    for harness in IDS.into_iter().chain(["acp:custom"]) {
         let payload = build_payload(
             "harness_setup",
             "cli-release-contract-test",
-            json!({"attemptId":uuid::Uuid::new_v4().to_string(),"harness":harness,"action":"login","trigger":"manual","outcome":"failed","stage":"verify","reason":"not_ready","exitCode":null,"durationMs":100,"errorExcerpt":null}),
+            json!({"attemptId":uuid::Uuid::new_v4().to_string(),"harness":harness,"action":"install","trigger":"manual","outcome":"failed","stage":"verify","reason":"not_ready","exitCode":null,"durationMs":100,"errorExcerpt":null}),
         );
         assert_eq!(
             post_payload(&payload).await,
@@ -323,8 +456,13 @@ pub(crate) mod contract {
     pub(crate) const MAX_ERROR_EXCERPT: usize = 1024;
 }
 
+pub(crate) const MANAGED_LOOKUP: &str = "Managed release lookup failed";
+pub(crate) const MANAGED_INSTALL: &str = "Managed release installation failed";
+
 // Fail closed: only fixed diagnostic phrases from output can leave the machine, never arbitrary tokens.
 const PHRASES: &[&str] = &[
+    MANAGED_LOOKUP,
+    MANAGED_INSTALL,
     "Could not resolve host",
     "Could not resolve proxy",
     "Failed to connect",
@@ -343,11 +481,44 @@ const PHRASES: &[&str] = &[
     "running scripts is disabled on this system",
     "Unsupported platform",
     "Unsupported architecture",
-    "OpenCode has no Windows build",
-    // The OpenCode Windows installer's sources, then .NET's network faults.
-    "GitHub download failed",
-    "npm download failed",
-    "npm package checksum mismatch",
+    // orx's own installs of the agents it manages.
+    "Could not download",
+    "Could not reach",
+    "does not match its published SHA-256",
+    "Could not unpack the download",
+    "The download is not zstd",
+    "Could not run the downloaded",
+    "did not answer `--version`",
+    "failed `--version`",
+    "Could not look up the latest Claude Code release",
+    "Could not read the latest Claude Code release",
+    "returned something other than a version",
+    "The download was interrupted",
+    "Could not move the release into",
+    "OpenCode is in use",
+    "Couldn't create",
+    "Couldn't open",
+    "Couldn't lock",
+    // What reqwest, hyper and rustls say under those, which is the actual cause.
+    "dns error",
+    "failed to lookup address information",
+    "No such host is known",
+    "tcp connect error",
+    "actively refused it",
+    "did not properly respond after a period of time",
+    "forcibly closed by the remote host",
+    "connection closed before message completed",
+    "invalid peer certificate",
+    "UnknownIssuer",
+    "certificate not valid for name",
+    "certificate expired",
+    "error decoding response body",
+    "HTTP status client error (403",
+    "HTTP status client error (404",
+    "HTTP status client error (407",
+    "HTTP status client error (429",
+    "HTTP status server error",
+    // .NET's network faults, which PowerShell installers print.
     "The remote name could not be resolved",
     "The operation has timed out",
     "The underlying connection was closed",
@@ -394,8 +565,12 @@ const PHRASES: &[&str] = &[
     "ECONNRESET",
     // Fixed classifications `verify_reason` passes in; the ingested
     // `reason` allowlist has no vocabulary for which predicate failed.
+    "agent detection returned no result",
+    "agent account could not be prepared",
+    "agent executable path is unavailable",
     "agent is not installed",
     "agent is installed but failed to run",
+    "setup command task ended before a result",
     "agent is not signed in",
     "agent sign-in could not be verified",
     "agent version is unsupported",
@@ -404,7 +579,12 @@ const PHRASES: &[&str] = &[
     "agent reported no usable state",
 ];
 
+#[cfg(test)]
 fn safe_error_excerpt(output: &str) -> Option<String> {
+    safe_error_excerpt_with_step(output, None)
+}
+
+fn safe_error_excerpt_with_step(output: &str, step: Option<InstallStep>) -> Option<String> {
     let output = output
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -413,9 +593,11 @@ fn safe_error_excerpt(output: &str) -> Option<String> {
     // Ingestion caps `errorExcerpt` and rejects the whole event over it, so
     // stop joining before the limit rather than lose the attempt.
     const MAX: usize = contract::MAX_ERROR_EXCERPT;
-    let mut excerpt = String::new();
+    let mut excerpt = step.map_or_else(String::new, |step| step.label().to_owned());
     for phrase in PHRASES
         .iter()
+        .copied()
+        .chain(crate::local::harness::cursor::CursorStatusError::ALL.map(|e| e.excerpt()))
         .filter(|phrase| output.contains(&phrase.to_ascii_lowercase()))
     {
         let separator = if excerpt.is_empty() { "" } else { "; " };
@@ -431,6 +613,100 @@ fn safe_error_excerpt(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn only_an_observed_command_drop_adds_an_interruption() {
+        let events = std::cell::RefCell::new(Vec::new());
+        let observe = |outcome, detail: Option<&'static str>| {
+            events
+                .borrow_mut()
+                .push((outcome, detail.and_then(safe_error_excerpt)));
+        };
+
+        // Never polled: setup did not reach its command.
+        drop(observe_command(std::future::pending::<()>(), observe));
+        assert!(events.borrow().is_empty());
+
+        let mut command = Box::pin(observe_command(std::future::pending::<()>(), observe));
+        assert!(futures::poll!(&mut command).is_pending());
+        drop(command);
+        assert_eq!(
+            *events.borrow(),
+            vec![
+                ("command_started", None),
+                (
+                    "interrupted",
+                    Some("setup command task ended before a result".to_owned())
+                ),
+            ]
+        );
+
+        for result in [Ok(()), Err("disconnected")] {
+            events.borrow_mut().clear();
+            assert_eq!(
+                observe_command(std::future::ready(result), observe).await,
+                result
+            );
+            assert_eq!(*events.borrow(), vec![("command_started", None)]);
+        }
+    }
+
+    #[test]
+    fn install_failures_name_the_step_even_without_an_allowed_error() {
+        let attempt = SetupAttempt {
+            id: uuid::Uuid::new_v4(),
+            harness: "opencode".into(),
+            action: "update",
+            trigger: "manual",
+            started: std::time::Instant::now(),
+            install_step: Default::default(),
+        };
+        let noise = Some("native agent updater /home/private https://private.test/?token=abc");
+        assert!(attempt
+            .error_excerpt("failed", "command", Some(1), noise)
+            .is_none());
+        for step in [
+            InstallStep::ReleaseLookup,
+            InstallStep::NativeUpdater,
+            InstallStep::ManagedCopy,
+        ] {
+            attempt.set_install_step(step);
+            assert_eq!(
+                attempt
+                    .error_excerpt("failed", "command", Some(1), noise)
+                    .as_deref(),
+                Some(step.label())
+            );
+            assert_eq!(
+                attempt
+                    .error_excerpt("succeeded", "verify", Some(1), None)
+                    .as_deref(),
+                Some(step.label())
+            );
+            assert!(attempt
+                .error_excerpt("succeeded", "verify", Some(0), None)
+                .is_none());
+            assert_eq!(
+                attempt
+                    .error_excerpt("failed", "verify", None, Some("agent is not signed in"))
+                    .as_deref(),
+                Some("agent is not signed in")
+            );
+            let diagnostic = attempt
+                .error_excerpt(
+                    "failed",
+                    "command",
+                    None,
+                    Some("Permission denied: /secret"),
+                )
+                .unwrap();
+            assert_eq!(diagnostic, format!("{}; Permission denied", step.label()));
+            let longest = attempt
+                .error_excerpt("failed", "command", Some(1), Some(&PHRASES.join(" ")))
+                .unwrap();
+            assert!(longest.len() <= contract::MAX_ERROR_EXCERPT);
+        }
+    }
+
     #[test]
     fn detect_payload_batches_pass_and_probe_events_on_one_fill_id() {
         let fill_id = uuid::Uuid::new_v4();
@@ -488,9 +764,15 @@ mod tests {
                     probe: "spec",
                     ms: 1,
                 })
+                .chain([crate::local::harness::ProbeTiming {
+                    harness: "acp:pi",
+                    probe: "total",
+                    ms: 2,
+                }])
                 .collect(),
         );
         assert_eq!(payload["events"].as_array().unwrap().len(), 25);
+        assert_eq!(payload["events"][1]["properties"]["harness"], "acp:pi");
     }
     #[test]
     fn snapshot_survives_restart_and_does_not_change() {
@@ -502,9 +784,20 @@ mod tests {
         ensure_initial(
             &mut restarted,
             "installation",
-            &json!({"harnesses":[{"id":"opencode","installed":true}]}),
+            &json!({"harnesses":[
+                {"id":"opencode","installed":true},
+                {"id":"acp:467b1900-c3c3-47c1-8b87-09389e1c44b5","installed":true},
+                {"id":"acp:97e2c73d-18f0-4933-90b4-57da9d880a62","installed":false},
+                {"id":"acp:5df69eb9-06a5-4741-8fe6-2cc47b0f2176","installed":true,"agentReady":true}
+            ]}),
         );
         assert_eq!(first, restarted.harness_snapshot.unwrap().payload);
+        let acp = restarted.acp_harness_snapshot.unwrap().payload;
+        let events = acp["events"].as_array().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["properties"]["harness"], "acp:custom");
+        assert_eq!(events[0]["properties"]["usability"], "usable");
+        assert_eq!(events[1]["properties"]["harness"], "acp:pi");
         assert_eq!(first["events"].as_array().unwrap().len(), IDS.len());
     }
     #[test]
@@ -560,6 +853,42 @@ mod tests {
         assert_eq!(state("codex", &h)["auth"], "not_checked");
     }
     #[test]
+    fn acp_auth_follows_the_credential_check() {
+        let mut h = json!({"installed":true,"authenticated":false,"agentReady":true,"authState":"ready","version":"1"});
+        assert_eq!(state("acp:pi", &h)["auth"], "signed_in");
+        assert_eq!(state("acp:pi", &h)["authEvidence"], "configuration");
+        h["authCheckFailed"] = json!(true);
+        let unverified = state("acp:custom", &h);
+        assert_eq!(unverified["auth"], "unverifiable");
+        assert_eq!(unverified["authEvidence"], "none");
+        assert_eq!(unverified["usability"], "usable");
+        assert_eq!(state("claude-code", &h)["auth"], "signed_out");
+    }
+    #[test]
+    fn harness_ids_reach_the_wire_canonical_and_non_acp_ids_unchanged() {
+        let mut seen = std::collections::BTreeSet::new();
+        for preset in crate::local::acp::presets() {
+            let id = wire_id(&preset.launch.id).unwrap();
+            assert_ne!(id, "acp:custom", "{}", preset.launch.name);
+            let slug = id.strip_prefix("acp:").unwrap();
+            assert!(slug.len() <= 31 && slug.starts_with(|c: char| c.is_ascii_alphanumeric()));
+            assert!(slug
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-'));
+            assert_eq!(wire_id(id), Some(id));
+            assert!(seen.insert(id), "{id}");
+        }
+        let custom = format!("acp:{}", uuid::Uuid::new_v4());
+        for (sent, wire) in [
+            (custom.as_str(), "acp:custom"),
+            ("acp:custom", "acp:custom"),
+            ("gemini", "gemini"),
+        ] {
+            let payload = build_payload("chat_message_sent", "did", json!({ "harness": sent }));
+            assert_eq!(payload["events"][0]["properties"]["harness"], wire);
+        }
+    }
+    #[test]
     fn excerpts_never_include_dynamic_output() {
         assert_eq!(safe_error_excerpt("\x1b[31mPermission denied: /Users/person/secret Bearer sk-abc a@b.com https://auth?token=secret"), Some("Permission denied".into()));
         assert_eq!(safe_error_excerpt("my-secret-api-key"), None);
@@ -610,6 +939,46 @@ mod tests {
             )
             .as_deref(),
             Some("stdin is not a terminal")
+        );
+    }
+
+    #[test]
+    fn a_managed_download_keeps_the_network_cause_without_the_url() {
+        let url = "https://registry.npmjs.org/@opencode%2fcli-windows-x64/latest?token=secret";
+        for (cause, expected) in [
+            (
+                "client error (Connect): dns error: No such host is known. (os error 11001)",
+                "Could not reach; dns error; No such host is known",
+            ),
+            (
+                "client error (Connect): tcp connect error: No connection could be made because the target machine actively refused it. (os error 10061)",
+                "Could not reach; tcp connect error; actively refused it",
+            ),
+            (
+                "client error (Connect): invalid peer certificate: UnknownIssuer",
+                "Could not reach; invalid peer certificate; UnknownIssuer",
+            ),
+            (
+                "client error (SendRequest): connection closed before message completed",
+                "Could not reach; connection closed before message completed",
+            ),
+        ] {
+            let output = format!("Could not reach {url}: error sending request for url ({url}): {cause}");
+            assert_eq!(safe_error_excerpt(&output).as_deref(), Some(expected), "{output}");
+        }
+        assert_eq!(
+            safe_error_excerpt(&format!(
+                "Could not reach {url}: HTTP status client error (403 rate limit exceeded) for url ({url})"
+            ))
+            .as_deref(),
+            Some("Could not reach; HTTP status client error (403")
+        );
+        assert_eq!(
+            safe_error_excerpt(
+                "Could not move the release into C:\\Users\\person\\.cache\\openresearch\\managed-agents\\opencode\\2.3.0: Access is denied. (os error 5)"
+            )
+            .as_deref(),
+            Some("Access is denied; Could not move the release into")
         );
     }
 

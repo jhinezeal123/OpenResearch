@@ -22,6 +22,7 @@ mod config;
 mod downstream;
 mod engine;
 mod error;
+mod file_lock;
 mod folder_picker;
 mod invocation;
 mod jobs;
@@ -113,6 +114,10 @@ enum Command {
     /// Operate on one local experiment node.
     Exp(ExpArgs),
 
+    /// List the agents, accounts and model providers OpenResearch offers, name them, pin logos,
+    /// and add OpenAI-compatible endpoints. Runs from an OpenResearch chat.
+    Agents(AgentsArgs),
+
     /// Print CLI usage for agents, or fetch a skill doc.
     Skill(SkillArgs),
 
@@ -149,13 +154,6 @@ enum Command {
     /// `opencode serve`); the api tunnels to it on agent boxes.
     Serve(ServeArgs),
 
-    /// Supervise one local run: tail backend logs, persist status, and honor
-    /// local cancel intent. Spawned detached by `exp run`.
-    Supervise(SuperviseArgs),
-
-    #[command(hide = true)]
-    RentalSupervise { config: std::path::PathBuf },
-
     /// Start the local autoresearch dashboard on 127.0.0.1: embedded UI,
     /// JSON/SSE API over the local store, and the opencode agent proxy.
     Up(UpArgs),
@@ -175,6 +173,10 @@ enum Command {
 
     #[command(name = "invocation-gate", hide = true)]
     InvocationGate,
+
+    #[cfg(all(desktop_app, target_os = "linux"))]
+    #[command(name = "check-media", hide = true)]
+    CheckMedia,
 
     /// Internal: orx's stdio MCP server, which every agent harness spawns:
     /// Claude's permission bridge and the orchestration tools, relayed to the
@@ -217,6 +219,10 @@ pub struct LoginArgs {
     /// Connect alphaXiv to an existing OpenResearch sign-in.
     #[arg(long)]
     pub alphaxiv: bool,
+    /// Approve the sign-in with a code on any device, instead of this computer's
+    /// browser. The default inside an SSH session.
+    #[arg(long)]
+    pub device: bool,
 }
 
 #[derive(Args, Debug)]
@@ -302,6 +308,18 @@ pub enum ProjectCommand {
         no_artifacts: bool,
     },
 
+    /// From a chat: propose making it a project of its own. The user reviews
+    /// the name and folder in the chat; creating it moves the chat's committed
+    /// work there, and the chat continues in that project.
+    Create {
+        /// The project's name.
+        #[arg(long)]
+        name: String,
+        /// Folder for its code; it must be new or empty (default: ~/OpenResearch/<name>).
+        #[arg(long)]
+        path: Option<String>,
+    },
+
     /// Delete a project's published openresearch.sh link and its file.
     Unpublish { project_id: String },
 
@@ -382,6 +400,15 @@ pub struct ComputeArgs {
     pub json: bool,
     #[command(flatten)]
     pub catalog: commands::compute::CatalogArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentsArgs {
+    #[command(subcommand)]
+    pub command: Option<commands::agents::AgentsCommand>,
+    /// Machine-readable output.
+    #[arg(long, global = true)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -608,7 +635,8 @@ pub struct ExpRunArgs {
     /// h200, … With `--backend modal`: a Modal GPU (t4, l4, a10g, a100,
     /// a100-80gb, l40s, h100, h200, or e.g. h100:2) or cpu/cpu-large. With
     /// `--backend slurm`: a GPU request as a GRES spec (h100:2 → --gres=gpu:h100:2;
-    /// plain `gpu` → one GPU; omit for CPU-only). With `--backend ray`: optional
+    /// plain `gpu` → one GPU; `cpu` → none; omitted uses the default flavor, if
+    /// the default backend is slurm, else none). With `--backend ray`: optional
     /// entrypoint resources (`cpu:2`, `gpu:1`, `gpu:1,mem:8GiB`; omit to reserve
     /// nothing). With `--backend vercel`: optional vCPUs (cpu = 2, cpu-<n> or
     /// <n>: 1 or an even number up to 32; 2 GB memory each; plans cap this at
@@ -651,8 +679,8 @@ pub struct ExpRunArgs {
     /// 30m, 4h, 1d. Default 4h (HF's own default is only 30 minutes; Vercel
     /// defaults to 40m on Hobby so a 45-minute session still includes 5 minutes
     /// to read logs and the exit status, and caps a session at 24h otherwise). With
-    /// `--backend k8s` it becomes activeDeadlineSeconds unless the manifest
-    /// sets its own. With `--backend slurm` it becomes `#SBATCH --time=` and
+    /// `--backend k8s` it counts from the run's start, excluding the wait for a
+    /// node or image, unless the manifest sets activeDeadlineSeconds. With `--backend slurm` it becomes `#SBATCH --time=` and
     /// has no 4h default — unset falls back to the slurm settings, then the
     /// cluster's own limit. With `--backend openresearch` it bounds the run's
     /// wall clock on the box (the box itself is deleted when the run ends).
@@ -676,6 +704,23 @@ pub struct ExpRunArgs {
     /// Slurm partition for this run; overrides the saved default. Accepts comma-separated names.
     #[arg(long)]
     pub partition: Option<String>,
+    /// Slurm quality of service for this run (`#SBATCH --qos=`); overrides the saved default.
+    #[arg(long)]
+    pub qos: Option<String>,
+    /// Slurm nodes to run on (`#SBATCH --nodelist=`), e.g. node[01-04].
+    #[arg(long)]
+    pub nodelist: Option<String>,
+    /// Slurm node features to require (`#SBATCH --constraint=`), e.g. a100&ib.
+    #[arg(long)]
+    pub constraint: Option<String>,
+    /// Slurm nodes to avoid (`#SBATCH --exclude=`), e.g. node07.
+    #[arg(long)]
+    pub exclude: Option<String>,
+    /// An extra `#SBATCH` line for this run, such as --sbatch-arg='--rsc g=1'; repeatable,
+    /// written after the saved ones. Options orx writes itself are refused.
+    #[arg(long = "sbatch-arg", value_name = "ARG", allow_hyphen_values = true)]
+    #[serde(default)]
+    pub sbatch_args: Vec<String>,
     /// Launch even when another run is already in flight for this experiment.
     #[arg(long)]
     pub force: bool,
@@ -696,6 +741,15 @@ pub struct ExpRunArgs {
     #[arg(skip)]
     #[serde(default)]
     pub caller_config_dir: Option<std::path::PathBuf>,
+    /// The caller's interpreter overrides (`ORX_MODAL_PYTHON`, …), which must be the server's.
+    #[arg(skip)]
+    #[serde(default)]
+    pub caller_python_overrides: std::collections::BTreeMap<String, String>,
+    /// What the caller's config dir sets for this backend; absent from an orx that sends only
+    /// the dir.
+    #[arg(skip)]
+    #[serde(default)]
+    pub caller_compute_settings: Option<crate::commands::up::LaunchSettings>,
 }
 
 /// Markers the native agent CLIs export to their shells; nested agents are `unknown`.
@@ -756,12 +810,6 @@ pub struct ServeArgs {
     /// Port to bind on 127.0.0.1 (default 4790 — what the api proxies to).
     #[arg(long)]
     pub port: Option<u16>,
-}
-
-#[derive(Args, Debug)]
-pub struct SuperviseArgs {
-    /// The run to supervise (must exist in the local store).
-    pub run_id: String,
 }
 
 #[derive(Args, Debug)]
@@ -1161,6 +1209,17 @@ async fn run_cli() {
         Cli::command().print_help().ok();
         return;
     };
+    #[cfg(all(desktop_app, target_os = "linux"))]
+    if matches!(command, Command::CheckMedia) {
+        if let Err(error) = commands::app::media::check() {
+            eprintln!("orx check-media: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if ends_with_its_stdout(&command) {
+        output::end_when_stdout_closes();
+    }
     // Outdated-version warning (skipped for the commands that manage updates
     // themselves). `start` prints the cached warning to stderr *now*,
     // before the command runs, so it shows even for commands that
@@ -1392,15 +1451,29 @@ fn install_panic_reporter() {
     }));
 }
 
+/// Servers, protocol children and per-call hooks outlive a closed stdout; every other
+/// command ends with it, as `orx runs | head` expects.
+fn ends_with_its_stdout(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::Up(_)
+            | Command::Serve(_)
+            | Command::Mcp
+            | Command::AlphaxivMcp
+            | Command::AntigravityGate
+            | Command::RemoteHost(_)
+            | Command::PlanGate
+            | Command::InvocationGate
+    )
+}
+
 fn should_capture_command(command: &Command) -> bool {
     !matches!(
         command,
-        Command::Supervise(_)
-            | Command::RentalSupervise { .. }
-            | Command::Update(UpdateArgs {
-                background: true,
-                ..
-            })
+        Command::Update(UpdateArgs {
+            background: true,
+            ..
+        })
     )
 }
 
@@ -1408,6 +1481,8 @@ fn should_capture_command(command: &Command) -> bool {
 /// variant name so renames don't silently break analytics continuity.
 fn command_name(command: &Command) -> &'static str {
     match command {
+        #[cfg(all(desktop_app, target_os = "linux"))]
+        Command::CheckMedia => "check-media",
         Command::Login(_) => "login",
         Command::Logout => "logout",
         Command::Alphaxiv(_) => "alphaxiv",
@@ -1423,6 +1498,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Instance(_) => "instance",
         Command::SshKey(_) => "ssh-key",
         Command::Exp(_) => "exp",
+        Command::Agents(_) => "agents",
         Command::Skill(_) => "skill",
         Command::Skills(_) => "skills",
         Command::Templates(_) => "templates",
@@ -1434,8 +1510,6 @@ fn command_name(command: &Command) -> &'static str {
         Command::InstallCli(_) => "install-cli",
         Command::Delete(_) => "delete",
         Command::Serve(_) => "serve",
-        Command::Supervise(_) => "supervise",
-        Command::RentalSupervise { .. } => "rental-supervise",
         Command::Up(_) => "up",
         Command::Telemetry(_) => "telemetry",
         Command::Feedback(_) => "feedback",
@@ -1481,6 +1555,7 @@ async fn dispatch(command: Command) -> error::Result<()> {
             SshKeyCommand::List => commands::ssh_key::list().await,
         },
         Command::Exp(args) => commands::exp::run(args).await,
+        Command::Agents(args) => commands::agents::run(args).await,
         Command::Skill(args) => commands::skill::run(args).await,
         Command::Skills(args) => commands::library::skills(args),
         Command::Templates(args) => commands::library::templates(args),
@@ -1492,8 +1567,6 @@ async fn dispatch(command: Command) -> error::Result<()> {
         Command::InstallCli(args) => commands::install_cli::run(args).await,
         Command::Delete(args) => commands::delete::run(args).await,
         Command::Serve(args) => commands::serve::run(args).await,
-        Command::Supervise(args) => commands::supervise::run(args).await,
-        Command::RentalSupervise { config } => jobs::rental::supervise(&config).await,
         Command::Up(mut args) => {
             if args.headless {
                 args.no_browser = true;
@@ -1510,6 +1583,8 @@ async fn dispatch(command: Command) -> error::Result<()> {
         Command::InvocationGate => commands::invocation_gate::run().await,
         Command::Mcp => commands::mcp::run().await,
         Command::AntigravityGate => commands::mcp::run_antigravity().await,
+        #[cfg(all(desktop_app, target_os = "linux"))]
+        Command::CheckMedia => unreachable!("handled before dispatch"),
         Command::AlphaxivMcp => unreachable!("handled before dispatch"),
         Command::PublishBranch(_) => unreachable!("handled before dispatch"),
         Command::RemoteHost(_) => unreachable!("handled before dispatch"),
@@ -1522,6 +1597,7 @@ fn command_uses_lifecycle_lock(command: &Command) -> bool {
         Command::Login(_)
             | Command::Logout
             | Command::Alphaxiv(_)
+            | Command::Agents(_)
             | Command::InstallSkills(_)
             | Command::Discover(_)
             | Command::Paper(_)
@@ -1559,11 +1635,6 @@ mod cli_tests {
 
     #[test]
     fn internal_commands_do_not_emit_command_telemetry() {
-        assert!(!should_capture_command(&Command::Supervise(
-            SuperviseArgs {
-                run_id: "run-1".into(),
-            }
-        )));
         assert!(!should_capture_command(&Command::Update(UpdateArgs {
             background: true,
             dry_run: false,

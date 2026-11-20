@@ -6,12 +6,10 @@
 
 use std::path::PathBuf;
 
-#[cfg(not(test))]
-use dirs::home_dir;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
-use crate::error::Result;
+use crate::error::{Context, Result};
 
 /// Base URL of the API. Defaults to prod (`https://api.openresearch.sh`), so a
 /// plain `orx login` just works. Override per-invocation with `--api-url` (handled
@@ -99,9 +97,256 @@ pub(crate) fn config_dir() -> PathBuf {
     base.join("openresearch")
 }
 
+pub(crate) use user_dirs::*;
+
+/// The user's directories. Callers go through these, never `dirs`, so that
+/// under test each one is [`test_home`] or a directory inside it.
+#[cfg(not(test))]
+#[allow(clippy::disallowed_methods)]
+mod user_dirs {
+    use std::path::PathBuf;
+
+    pub(crate) fn home_dir() -> Option<PathBuf> {
+        dirs::home_dir()
+    }
+
+    pub(crate) fn cache_dir() -> Option<PathBuf> {
+        dirs::cache_dir()
+    }
+
+    pub(crate) fn data_local_dir() -> Option<PathBuf> {
+        dirs::data_local_dir()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn roaming_config_dir() -> Option<PathBuf> {
+        dirs::config_dir()
+    }
+}
+
 #[cfg(test)]
-fn home_dir() -> Option<PathBuf> {
-    Some(test_home())
+mod user_dirs {
+    use super::test_home;
+    use std::path::PathBuf;
+
+    pub(crate) fn home_dir() -> Option<PathBuf> {
+        Some(test_home())
+    }
+
+    pub(crate) fn cache_dir() -> Option<PathBuf> {
+        Some(test_home().join(".cache"))
+    }
+
+    pub(crate) fn data_local_dir() -> Option<PathBuf> {
+        Some(test_home().join(".local/share"))
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn roaming_config_dir() -> Option<PathBuf> {
+        Some(test_home().join("AppData/Roaming"))
+    }
+}
+
+/// Returns `path`, an agent's binary, native home or a path inside one. Under
+/// test it panics unless `path` resolves inside [`test_root`]: one found in the
+/// developer's environment is their real agent or history.
+pub(crate) fn test_contained(path: PathBuf) -> PathBuf {
+    #[cfg(test)]
+    assert!(
+        contained(&path),
+        "a test resolved {} outside its temp root {}; give it a fake inside that root, \
+         or unset the variable or PATH entry that leads there",
+        path.display(),
+        test_root().display()
+    );
+    path
+}
+
+/// `$var` as a path, as the user's shell exports it; empty reads as unset. Under
+/// test a value outside [`test_root`] is the developer's own, so it reads as unset too.
+pub(crate) fn env_path(var: &str) -> Option<PathBuf> {
+    let path = crate::local::shell_env::var(var)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)?;
+    #[cfg(test)]
+    if !contained(&path) {
+        return None;
+    }
+    Some(path)
+}
+
+/// The `ssh -F` file every orx ssh call reads: `$ORX_SSH_CONFIG`, else the
+/// generated one that puts saved hosts ahead of the user's own configuration.
+/// Under test it leaves out the system configuration.
+pub(crate) fn ssh_config() -> PathBuf {
+    if let Some(config) = env_path("ORX_SSH_CONFIG") {
+        return config;
+    }
+    static GENERATED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    GENERATED
+        .get_or_init(|| {
+            // ssh itself then names the file it cannot open.
+            crate::jobs::ssh::hosts::config_file(!cfg!(test)).unwrap_or_else(|error| {
+                eprintln!("orx: {error:#}");
+                config_dir().join("ssh").join("config")
+            })
+        })
+        .clone()
+}
+
+/// Whether `$var = value` leads to one of the developer's own homes. The main
+/// test process inherits their environment whole, so there a home variable
+/// outside [`test_root`] reads as unset; a test child's environment is its test's.
+#[cfg(test)]
+pub(crate) fn developers_home(var: &str, value: &std::ffi::OsStr) -> bool {
+    let home_var = REDIRECT_VARS.contains(&var)
+        || home_vars(std::path::Path::new(""))
+            .iter()
+            .any(|(name, _)| *name == var);
+    home_var
+        && !value.is_empty()
+        && std::env::var_os(TEST_CHILD).is_none()
+        && !contained(std::path::Path::new(value))
+}
+
+/// Inside [`test_root`], or the root of the test process that started this one.
+#[cfg(test)]
+pub(crate) fn contained(path: &std::path::Path) -> bool {
+    let path = resolved(&std::path::absolute(path).unwrap());
+    let parent = std::env::var_os(PARENT_TEST_ROOT).map(PathBuf::from);
+    std::iter::once(test_root())
+        .chain(parent)
+        .any(|root| path.starts_with(resolved(&root)))
+}
+
+/// What this test process owns: its [`test_home`], or in [`in_test_child`]'s
+/// child the whole temp dir the parent made for it.
+#[cfg(test)]
+pub(crate) fn test_root() -> PathBuf {
+    if std::env::var_os(TEST_CHILD).is_some() {
+        std::env::temp_dir()
+    } else {
+        test_home()
+    }
+}
+
+/// Names the root of the test process that started this one.
+#[cfg(test)]
+pub(crate) const PARENT_TEST_ROOT: &str = "ORX_PARENT_TEST_ROOT";
+
+/// Variables that move orx's or an agent's state to a directory the user
+/// chose; under test a child gets one only from the test itself.
+#[cfg(test)]
+pub(crate) const REDIRECT_VARS: [&str; 12] = [
+    "ORX_DATA_DIR",
+    "ORX_CACHE_DIR",
+    "OPENCODE_CONFIG",
+    "OPENCODE_CONFIG_DIR",
+    "KIMI_CODE_HOME",
+    "KIMI_SHARE_DIR",
+    "MINIMAX_DATA_DIR",
+    "MAVIS_DATA_DIR",
+    "ZCODE_HOME",
+    "GROK_HOME",
+    "GROK_AUTH_PATH",
+    "MODAL_CONFIG_PATH",
+];
+
+/// The credentials, endpoints and models agents and backends read, and the
+/// markers of an agent's shell; a test child sees only those its test sets.
+#[cfg(test)]
+pub(crate) const PROVIDER_VARS: [&str; 40] = [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_MODEL",
+    "CLAUDE_CODE_PROMPT_CACHE_TTL",
+    "CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENROUTER_API_KEY",
+    "CURSOR_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GROQ_API_KEY",
+    "KIMI_API_KEY",
+    "XAI_API_KEY",
+    "GROK_AUTH_PROVIDER_COMMAND",
+    "GROK_DISABLE_API_KEY_AUTH",
+    "GROK_OAUTH2_CLIENT_ID",
+    "GROK_OAUTH2_ISSUER",
+    "GROK_OIDC_CLIENT_ID",
+    "GROK_OIDC_ISSUER",
+    "OPENCODE_CONFIG_CONTENT",
+    "OPENCODE_PASSWORD",
+    "HF_TOKEN",
+    "HF_ENDPOINT",
+    "MODAL_PROFILE",
+    "MODAL_TOKEN_ID",
+    "MODAL_TOKEN_SECRET",
+    "TINKER_API_KEY",
+    "VERCEL_TOKEN",
+    "VERCEL_OIDC_TOKEN",
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CODEX_THREAD_ID",
+    "OPENCODE",
+    "CURSOR_AGENT",
+    "ORX_CHAT_SESSION_ID",
+    "ORX_CHAT_HARNESS",
+    "ORX_LOCAL_SESSION",
+];
+
+/// Every variable that locates one of the user's homes, pointed inside `home`.
+#[cfg(test)]
+pub(crate) fn home_vars(home: &std::path::Path) -> [(&'static str, PathBuf); 15] {
+    [
+        ("HOME", home.to_owned()),
+        ("USERPROFILE", home.to_owned()),
+        ("APPDATA", home.join("AppData/Roaming")),
+        ("LOCALAPPDATA", home.join("AppData/Local")),
+        ("XDG_CONFIG_HOME", home.join(".config")),
+        ("XDG_DATA_HOME", home.join(".local/share")),
+        ("XDG_CACHE_HOME", home.join(".cache")),
+        ("XDG_STATE_HOME", home.join(".local/state")),
+        ("HF_HOME", home.join(".cache/huggingface")),
+        ("CODEX_HOME", home.join(".codex")),
+        ("CLAUDE_CONFIG_DIR", home.join(".claude")),
+        ("CLAUDE_SECURESTORAGE_CONFIG_DIR", home.join(".claude")),
+        ("CURSOR_CONFIG_DIR", home.join(".cursor")),
+        ("CURSOR_DATA_DIR", home.join(".cursor")),
+        (
+            "OPENCODE_DB",
+            home.join(".local/share/opencode/opencode.db"),
+        ),
+    ]
+}
+
+/// `path` with its longest existing ancestor canonicalized, so a symlink cannot
+/// lead out of the test root. A `..` or a dangling link after it could, so both panic.
+#[cfg(test)]
+fn resolved(path: &std::path::Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        if let Ok(real) = ancestor.canonicalize() {
+            let rest = path.strip_prefix(ancestor).unwrap();
+            assert!(
+                !rest
+                    .components()
+                    .any(|part| part == std::path::Component::ParentDir),
+                "a test resolved {}, which climbs out of an unresolved path",
+                path.display()
+            );
+            return real.join(rest);
+        }
+        assert!(
+            ancestor.symlink_metadata().is_err(),
+            "a test resolved {} through {}, which exists but cannot be resolved",
+            path.display(),
+            ancestor.display()
+        );
+    }
+    unreachable!("an absolute path has an existing root")
 }
 
 /// Debug builds divide background timers (run supervision, turn leases) by `ORX_TEST_SPEEDUP`,
@@ -120,40 +365,52 @@ pub(crate) fn paced(wait: std::time::Duration) -> std::time::Duration {
     wait / (*speedup).max(1)
 }
 
-/// Stands in for `$HOME` and the XDG dirs under test: one fresh directory per
-/// process, so no test reads or writes the user's config or data.
+/// Stands in for `$HOME` and the XDG dirs under test: one fresh, existing
+/// directory per process, so no test reads or writes the user's config or data.
+/// Its name stays short: fixtures nest git objects under it, within Windows' 260-character paths.
 #[cfg(test)]
 pub(crate) fn test_home() -> PathBuf {
     static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     HOME.get_or_init(|| {
-        std::env::temp_dir().join(format!("orx-test-home-{}", uuid::Uuid::new_v4()))
+        let home = std::env::temp_dir().join(format!(
+            "orx-test-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        home
     })
     .clone()
 }
 
+#[cfg(test)]
+pub(crate) const TEST_CHILD: &str = "ORX_TEST_CHILD";
+
 /// Runs the calling test again, alone, in a child process with its own
-/// [`test_home`] and without `cleared` vars, so its body may change
-/// process-wide env. True in that child; in the parent, asserts the child passed.
+/// [`test_home`], its home, XDG and agent-home variables inside its temp dir,
+/// and without `cleared` vars, so its body may change process-wide env. True in
+/// that child; in the parent, asserts the child passed.
 #[cfg(test)]
 pub(crate) fn in_test_child(cleared: &[&str]) -> bool {
-    const CHILD: &str = "ORX_TEST_CHILD";
     let thread = std::thread::current();
     let test = thread.name().expect("libtest names each test's thread");
-    if std::env::var_os(CHILD).is_some_and(|child| child == test) {
+    if std::env::var_os(TEST_CHILD).is_some_and(|child| child == test) {
         return true;
     }
     let temp = std::env::temp_dir().join(format!("orx-test-child-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&temp).unwrap();
     let mut command = crate::process::command(std::env::current_exe().unwrap());
+    // Run exactly the selected test, including an explicitly selected release-only test.
     command
-        .args(["--exact", test])
-        .env(CHILD, test)
-        .env_remove("ORX_DATA_DIR");
+        .args(["--include-ignored", "--exact", test])
+        .env(TEST_CHILD, test);
     // The child's temp dir, home included, goes away with it.
     for var in ["TMPDIR", "TMP", "TEMP"] {
         command.env(var, &temp);
     }
-    for var in cleared {
+    for (var, path) in home_vars(&temp.join("home")) {
+        command.env(var, path);
+    }
+    for var in REDIRECT_VARS.iter().chain(&PROVIDER_VARS).chain(cleared) {
         command.env_remove(var);
     }
     let output = command.output().unwrap();
@@ -375,34 +632,6 @@ pub fn set_settings_data_dir(data_dir: Option<String>) -> Result<()> {
     Ok(())
 }
 
-pub fn run_engine_settings() -> Result<(bool, Option<&'static str>)> {
-    let channel = crate::updates::current_release_channel();
-    let override_value = std::env::var_os("ORX_RUN_ENGINE");
-    let saved = crate::telemetry::load_settings().and_then(|settings| settings.run_engine);
-    run_engine_settings_for(channel, override_value.as_deref(), saved)
-}
-
-fn run_engine_settings_for(
-    channel: crate::updates::ReleaseChannel,
-    override_value: Option<&std::ffi::OsStr>,
-    saved: Option<bool>,
-) -> Result<(bool, Option<&'static str>)> {
-    if channel == crate::updates::ReleaseChannel::Canary {
-        return Ok((true, Some("canary")));
-    }
-    match override_value {
-        Some(value) if value == "1" => Ok((true, Some("environment"))),
-        Some(value) if value == "0" => Ok((false, Some("environment"))),
-        None => Ok((saved.unwrap_or(false), None)),
-        Some(_) => Err(crate::error::anyhow!("ORX_RUN_ENGINE must be 1 or 0.")),
-    }
-}
-
-pub fn set_run_engine_enabled(enabled: bool) -> Result<()> {
-    crate::telemetry::mutate_settings(|settings| settings.run_engine = Some(enabled))?;
-    Ok(())
-}
-
 /// The persisted default compute target for local-mode launches, if any:
 /// `(backend, flavor)`. Lives in the telemetry-owned `settings.json` for the
 /// same single-writer reason as the data dir above.
@@ -512,22 +741,47 @@ pub fn list_synced_env() -> Vec<(String, String)> {
 /// Names the run inside its job, e.g. as a metric tracker's run name.
 pub const RUN_ID_ENV: &str = "ORX_RUN_ID";
 
-/// A run's environment: the synced env file plus what the run knows about itself.
-pub fn run_env(run_id: &str) -> std::collections::HashMap<String, String> {
-    let mut env: std::collections::HashMap<String, String> =
-        list_synced_env().into_iter().collect();
-    env.extend(run_context_env(run_id));
+/// The synced env file with the project's own variables applied over it.
+pub fn saved_project_env(
+    store: &crate::store::Store,
+    project_id: &str,
+) -> Result<std::collections::HashMap<String, String>> {
+    Ok(merge_saved_env(store.project_env(project_id)?))
+}
+
+pub fn merge_saved_env(
+    project_vars: Vec<crate::store::ProjectEnvVar>,
+) -> std::collections::HashMap<String, String> {
+    let mut env: std::collections::HashMap<_, _> = list_synced_env().into_iter().collect();
+    env.extend(project_vars.into_iter().map(|var| (var.key, var.value)));
     env
 }
 
-/// What a launched job sees: [`run_env`] plus a configured Hugging Face token. Resolved at
+pub fn saved_run_env(
+    run: &crate::store::StoredRun,
+) -> Result<std::collections::HashMap<String, String>> {
+    crate::store::Store::open()
+        .and_then(|store| saved_project_env(&store, &run.project_id))
+        .with_context(|| {
+            format!(
+                "Couldn't read project {}'s environment for run {}.",
+                run.project_id, run.id
+            )
+        })
+}
+
+/// What a launched job sees: saved variables, run context and a configured Hugging Face token. Resolved at
 /// launch, so secrets never enter a stored launch intent.
-pub fn launch_env(run_id: &str) -> std::collections::HashMap<String, String> {
-    let mut env = run_env(run_id);
+pub fn launch_env(
+    run: &crate::store::StoredRun,
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut env = saved_run_env(run)?;
+    let context = run_context_env(run, &env);
+    env.extend(context);
     if let Ok(token) = crate::jobs::huggingface::resolve_token() {
         env.entry("HF_TOKEN".to_string()).or_insert(token);
     }
-    env
+    Ok(env)
 }
 
 const EXPERIMENT_ENV: &str = "ORX_EXPERIMENT";
@@ -535,25 +789,33 @@ const EXPERIMENT_TITLE_ENV: &str = "ORX_EXPERIMENT_TITLE";
 const PARENT_EXPERIMENT_ENV: &str = "ORX_PARENT_EXPERIMENT";
 const COMMIT_ENV: &str = "ORX_COMMIT";
 
-/// The run's id, experiment, parent, commit and Trackio project, read from its reserved row.
-pub fn run_context_env(run_id: &str) -> Vec<(String, String)> {
-    let mut env = vec![(RUN_ID_ENV.to_string(), run_id.to_string())];
-    match stored_run_context(run_id) {
+/// The run's identity, experiment and Trackio project.
+pub fn run_context_env(
+    run: &crate::store::StoredRun,
+    saved: &std::collections::HashMap<String, String>,
+) -> Vec<(String, String)> {
+    use crate::local::trackio::PROJECT;
+
+    let mut env = vec![(RUN_ID_ENV.to_string(), run.id.clone())];
+    let trackio_project = saved.get(PROJECT);
+    env.extend(trackio_project.map(|project| (PROJECT.to_string(), project.clone())));
+    match stored_run_context(run, trackio_project.is_none()) {
         Ok(context) => env.extend(context),
         Err(error) => {
             eprintln!(
-                "warning: could not read run {run_id}'s experiment for its environment: {error}"
+                "warning: could not read run {}'s experiment for its environment: {error}",
+                run.id
             )
         }
     }
     env
 }
 
-fn stored_run_context(run_id: &str) -> Result<Vec<(String, String)>> {
+fn stored_run_context(
+    run: &crate::store::StoredRun,
+    needs_trackio_project: bool,
+) -> Result<Vec<(String, String)>> {
     let store = crate::store::Store::open()?;
-    let Some(run) = store.get_run(run_id)? else {
-        return Ok(Vec::new());
-    };
     let mut env = Vec::new();
     if let Some(experiment) = store.get_local_experiment(&run.experiment_id)? {
         let parent = match &experiment.parent_experiment_id {
@@ -568,14 +830,13 @@ fn stored_run_context(run_id: &str) -> Result<Vec<(String, String)>> {
         }
         env.push((EXPERIMENT_ENV.to_string(), experiment.slug));
     }
-    if let Some(commit) = run.commit_sha.filter(|sha| !sha.is_empty()) {
-        env.push((COMMIT_ENV.to_string(), commit));
+    if let Some(commit) = run.commit_sha.as_ref().filter(|sha| !sha.is_empty()) {
+        env.push((COMMIT_ENV.to_string(), commit.clone()));
     }
-    if let Some(project) = store.get_local_project(&run.project_id)? {
-        env.push((
-            crate::local::trackio::PROJECT.to_string(),
-            crate::local::trackio::project_for(&project.slug),
-        ));
+    if needs_trackio_project {
+        if let Some(project) = store.get_local_project(&run.project_id)? {
+            env.push((crate::local::trackio::PROJECT.to_string(), project.slug));
+        }
     }
     Ok(env)
 }
@@ -698,47 +959,4 @@ pub fn set_ssh_host(host: String, options: SshHostSettings) -> Result<()> {
 pub fn set_ssh_default(host: Option<String>) -> Result<()> {
     crate::telemetry::set_ssh_default(host)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::updates::ReleaseChannel;
-    use std::ffi::OsStr;
-
-    #[test]
-    fn canary_forces_the_engine_while_stable_and_dev_allow_opt_in() {
-        for saved in [None, Some(false), Some(true)] {
-            for value in [None, Some("0"), Some("1"), Some("invalid")] {
-                let value = value.map(OsStr::new);
-                assert_eq!(
-                    run_engine_settings_for(ReleaseChannel::Canary, value, saved).unwrap(),
-                    (true, Some("canary"))
-                );
-                let stable = run_engine_settings_for(ReleaseChannel::Stable, value, saved);
-                match value {
-                    None => assert_eq!(stable.unwrap(), (saved.unwrap_or(false), None)),
-                    Some(value) if value == "0" => {
-                        assert_eq!(stable.unwrap(), (false, Some("environment")))
-                    }
-                    Some(value) if value == "1" => {
-                        assert_eq!(stable.unwrap(), (true, Some("environment")))
-                    }
-                    Some(_) => assert!(stable.is_err()),
-                }
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn canary_ignores_even_a_non_unicode_environment_override() {
-        use std::os::unix::ffi::OsStrExt;
-        let value = Some(OsStr::from_bytes(&[0xff]));
-        assert_eq!(
-            run_engine_settings_for(ReleaseChannel::Canary, value, None).unwrap(),
-            (true, Some("canary"))
-        );
-        assert!(run_engine_settings_for(ReleaseChannel::Stable, value, None).is_err());
-    }
 }

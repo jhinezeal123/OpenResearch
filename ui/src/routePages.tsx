@@ -59,7 +59,7 @@ function Resume({ projectId }: { projectId?: string }) {
       });
     return () => { current = false; };
   }, [projectId, attempt, navigate, workspace]);
-  return <>{error ? <RouteFailure error={error} reset={() => setAttempt((value) => value + 1)} /> : <RoutePending />}<WorkspaceConnection runtime={runtime} corner /></>;
+  return <>{error ? <RouteFailure error={error} reset={() => setAttempt((value) => value + 1)} /> : <RoutePending />}{error && <WorkspaceConnection runtime={runtime} corner />}</>;
 }
 
 export function ResumeGlobal() { return <Resume />; }
@@ -114,9 +114,8 @@ export function ProjectsPage() {
               remote={runtime.kind === "ssh"}
               preferredAgent={state.preferredAgent}
               onCreated={(project, publicationError) => {
-                queryClient.setQueryData(projectsOptions.queryKey, (cur) => [...(cur ?? []).filter((p) => p.id !== project.id), project]);
                 void navigate({
-                  href: `/projects/${encodeURIComponent(project.id)}${publicationError ? "/settings/projects" : ""}`,
+                  href: `/projects/${encodeURIComponent(project.id)}${publicationError ? "/settings/project" : ""}`,
                 });
                 if (publicationError) showAlert(publicationError, "error");
               }}
@@ -124,7 +123,7 @@ export function ProjectsPage() {
           ) : (
             <ResumeGlobal />
           )}
-      <WorkspaceConnection runtime={runtime} corner />
+      {(agentSetup || (error && (!projects || !state))) && <WorkspaceConnection runtime={runtime} corner />}
     </div>
   );
 }

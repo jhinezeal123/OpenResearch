@@ -261,7 +261,7 @@ async fn phase_moves_only_forward_and_one_terminal_notice_survives_a_crash() {
         .observe(
             "run",
             Observation::Queued {
-                detail: "late".into(),
+                detail: Some("late".into()),
             },
         )
         .unwrap();
@@ -495,6 +495,53 @@ async fn cancel_during_submission_rides_the_launch() {
 }
 
 #[tokio::test]
+async fn a_launch_that_lost_its_gate_to_recovery_leaves_the_fenced_attempt_to_it() {
+    let f = Fixture::new();
+    let metadata = BackendDescriptor::parse(r#"{"kind":"ssh_job"}"#).unwrap();
+    f.engine
+        .insert(SubmittingRun {
+            id: "run",
+            experiment_id: "exp",
+            project_id: "proj",
+            metadata: &metadata,
+            command: "train",
+            created_at: 1,
+            commit_sha: None,
+            chat_session_id: Some(CHAT),
+            spec_digest: "spec",
+            launch: &ssh_launch(),
+        })
+        .unwrap();
+    // A tick recovers the new row before the submitting task takes the gate.
+    f.backend
+        .then_launch(Err(LaunchError::Interrupted {
+            detail: "lost".into(),
+        }))
+        .then_recover(Recovery::Unknown {
+            detail: "host down".into(),
+        });
+    f.engine.recover(&f.backend, "run").await.unwrap();
+    assert!(f.engine.cancel(&f.backend, "run", "user").await.unwrap());
+    f.engine.launch_inserted(&f.backend, "run").await.unwrap();
+    assert_eq!(f.status("run"), "submitting");
+
+    f.backend
+        .then_recover(Recovery::Found(handle()))
+        .then_cancel(CancelOutcome::Pending);
+    f.engine.recover(&f.backend, "run").await.unwrap();
+    assert_eq!(f.status("run"), "starting");
+    assert_eq!(
+        f.backend.calls(),
+        [
+            "launch run #1",
+            "recover run #1",
+            "recover run #1",
+            "cancel run Ssh"
+        ]
+    );
+}
+
+#[tokio::test]
 async fn an_unknown_submission_stays_unreconciled_with_backoff_until_recovery_decides() {
     let f = Fixture::new();
     f.backend
@@ -509,7 +556,6 @@ async fn an_unknown_submission_stays_unreconciled_with_backoff_until_recovery_de
     assert!(unreconciled(&f.contact("run")));
     assert_eq!(f.kinds(), [ATTENTION]);
 
-    assert!(f.engine.cancel(&f.backend, "run", "user").await.unwrap());
     f.engine.recover(&f.backend, "run").await.unwrap();
     assert_eq!(f.backend.calls().len(), 2);
     f.clock.advance(Duration::from_secs(5));
@@ -522,7 +568,8 @@ async fn an_unknown_submission_stays_unreconciled_with_backoff_until_recovery_de
     assert_eq!(f.backend.calls().len(), 3);
     assert_eq!(f.status("run"), "submitting");
 
-    f.clock.advance(Duration::from_secs(1));
+    // A cancel is decided at once, not after the backoff the launch earned.
+    assert!(f.engine.cancel(&f.backend, "run", "user").await.unwrap());
     f.backend
         .then_recover(Recovery::Found(handle()))
         .then_cancel(CancelOutcome::Verified);
@@ -571,7 +618,6 @@ async fn absent_relaunches_the_next_attempt_unless_cancelled() {
         .cancel(&f.backend, "cancelled", "user")
         .await
         .unwrap();
-    f.clock.advance(Duration::from_secs(5));
     f.backend.then_recover(Recovery::Absent);
     f.engine.recover(&f.backend, "cancelled").await.unwrap();
     assert_eq!(f.status("cancelled"), "cancelled");
@@ -967,7 +1013,6 @@ async fn abandon_tells_the_chat_once_and_keeps_the_kill_pending_until_the_job_is
         .unwrap()
         .contains("Reason: Abandoned; the cancel stays pending until the job is confirmed gone."));
     assert!(f.locked("unsubmitted"));
-    f.clock.advance(Duration::from_secs(5));
     f.backend
         .then_recover(Recovery::Found(handle()))
         .then_cancel(CancelOutcome::Verified);
@@ -1031,6 +1076,189 @@ async fn abandon_tells_the_chat_once_and_keeps_the_kill_pending_until_the_job_is
 }
 
 #[tokio::test]
+async fn abandoning_a_launch_that_created_nothing_settles_when_it_answers() {
+    let f = Fixture::new();
+    let outcomes = [
+        (
+            "rejected",
+            LaunchError::Rejected {
+                reason: "no such flavor".into(),
+            },
+        ),
+        (
+            "blocked",
+            LaunchError::Blocked {
+                contact: Contact::Unreachable {
+                    since: 1,
+                    cause: "eof".into(),
+                },
+            },
+        ),
+    ];
+    for (id, outcome) in outcomes {
+        f.backend.then_launch(Err(outcome));
+        // The fake yields inside the launch, so the abandon lands while it is in flight.
+        let (submitted, abandoned) = tokio::join!(f.submit(id), async { f.engine.abandon(id) });
+        submitted.unwrap();
+        assert!(abandoned.unwrap());
+        assert_eq!(f.status(id), "lost");
+        assert_eq!(f.contact(id), Contact::Live);
+    }
+    assert_eq!(
+        f.backend.calls(),
+        ["launch rejected #1", "launch blocked #1"]
+    );
+}
+
+#[tokio::test]
+async fn a_stop_is_sent_again_when_the_run_loses_contact_and_a_proven_loss_ends_it_cancelled() {
+    let f = Fixture::new();
+    f.running("run").await;
+    f.backend.then_cancel(CancelOutcome::Pending);
+    assert!(f.engine.cancel(&f.backend, "run", "user").await.unwrap());
+    let wrapper_gone = |detail: &str| Observation::Unreconciled {
+        detail: detail.into(),
+    };
+    let watched = [WatchedRun {
+        id: "run".into(),
+        handle: handle(),
+    }];
+    f.backend.then_cancel(CancelOutcome::Pending);
+    f.engine
+        .apply_observations(
+            &f.backend,
+            &watched,
+            vec![("run".into(), wrapper_gone("gone"))],
+        )
+        .await;
+    // A changed detail is the same loss of contact, so the stop is not repeated.
+    f.engine
+        .apply_observations(
+            &f.backend,
+            &watched,
+            vec![("run".into(), wrapper_gone("still"))],
+        )
+        .await;
+    assert_eq!(
+        f.backend.calls(),
+        ["launch run #1", "cancel run Ssh", "cancel run Ssh"]
+    );
+
+    f.engine
+        .observe(
+            "run",
+            Observation::Lost {
+                reason: "host rebooted".into(),
+            },
+        )
+        .unwrap();
+    let row = f.store().get_run("run").unwrap().unwrap();
+    assert_eq!(row.status, "cancelled");
+    assert_eq!(row.result_markdown.as_deref(), Some("host rebooted"));
+    assert_eq!(f.contact("run"), Contact::Live);
+}
+
+#[tokio::test]
+async fn an_ending_withdraws_the_unsent_outage_notice_and_a_repeated_cause_is_said_once() {
+    let f = Fixture::new();
+    f.backend
+        .then_launch(Err(LaunchError::Interrupted {
+            detail: "wrapper unconfirmed".into(),
+        }))
+        .then_recover(Recovery::Unknown {
+            detail: "wrapper unconfirmed".into(),
+        });
+    f.submit("run").await.unwrap();
+    assert!(
+        matches!(f.contact("run"), Contact::Unreconciled { detail, .. } if detail == "wrapper unconfirmed")
+    );
+    assert!(f.engine.abandon("run").unwrap());
+    assert_eq!(f.kinds(), [TERMINAL]);
+}
+
+#[tokio::test]
+async fn a_refused_stop_is_shown_until_one_is_delivered() {
+    let mut f = Fixture::new();
+    f.running("run").await;
+    f.events();
+    f.backend.then_cancel(CancelOutcome::Undelivered {
+        detail: "provider said no".into(),
+    });
+    assert!(f.engine.cancel(&f.backend, "run", "user").await.unwrap());
+    assert_eq!(
+        f.engine.cancel_error("run").as_deref(),
+        Some("provider said no")
+    );
+    assert!(f.events().iter().any(|event| matches!(
+        event,
+        RunEvent::Changed {
+            cancelling: true,
+            ..
+        }
+    )));
+
+    f.backend.then_cancel(CancelOutcome::Pending);
+    f.engine.deliver_cancel(&f.backend, "run").await.unwrap();
+    assert_eq!(f.engine.cancel_error("run"), None);
+}
+
+#[tokio::test]
+async fn an_adopted_tombstone_is_adopted_again_after_a_restart() {
+    let mut f = Fixture::new();
+    f.legacy_run(
+        "abandoned",
+        r#"{"kind":"ssh_job","jobId":"/orx/runs/abandoned"}"#,
+    );
+    f.legacy_run(
+        "stopping",
+        r#"{"kind":"ssh_job","jobId":"/orx/runs/stopping"}"#,
+    );
+    assert_eq!(f.engine.scan_legacy().unwrap().len(), 2);
+    f.engine
+        .observe(
+            "abandoned",
+            Observation::Unreachable {
+                cause: "eof".into(),
+            },
+        )
+        .unwrap();
+    assert!(f.engine.abandon("abandoned").unwrap());
+    f.backend.then_cancel(CancelOutcome::Survivors { count: 1 });
+    assert!(f
+        .engine
+        .cancel(&f.backend, "stopping", "user")
+        .await
+        .unwrap());
+    assert!(matches!(f.contact("stopping"), Contact::Stopping { .. }));
+
+    f.restart();
+    let mut adopted: Vec<_> = f
+        .engine
+        .scan_legacy()
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    adopted.sort();
+    assert_eq!(adopted, ["abandoned", "stopping"]);
+    f.engine
+        .observe(
+            "abandoned",
+            Observation::Cancelled {
+                finished_at: None,
+                code: None,
+                signal: None,
+            },
+        )
+        .unwrap();
+    assert_eq!(f.contact("abandoned"), Contact::Live);
+    f.engine
+        .observe("stopping", Observation::Lingering { pids: vec![] })
+        .unwrap();
+    assert_eq!(f.contact("stopping"), Contact::Live);
+}
+
+#[tokio::test]
 async fn runs_an_old_supervisor_holds_are_watched_and_never_written() {
     let f = Fixture::new();
     f.legacy_run("held", r#"{"kind":"ssh_job","jobId":"/orx/runs/held"}"#);
@@ -1049,11 +1277,10 @@ async fn runs_an_old_supervisor_holds_are_watched_and_never_written() {
         r#"{"kind":"openresearch_job","namespace":"org","jobId":"sb"}"#,
     );
     f.legacy_run("hf", r#"{"kind":"hf_job","namespace":"lab","jobId":"j"}"#);
-    f.legacy_run("submitting", r#"{"kind":"modal_job"}"#);
     f.legacy_run("mystery", r#"{"kind":"future_job","jobId":"x"}"#);
     f.running("engine").await;
 
-    let mut decisions = f.engine.scan_legacy(true).unwrap();
+    let mut decisions = f.engine.scan_legacy().unwrap();
     decisions.sort_by(|a, b| a.0.cmp(&b.0));
     let container = match &decisions[3].1 {
         Adoption::Inspect { container, .. } => container.clone(),
@@ -1087,7 +1314,7 @@ async fn runs_an_old_supervisor_holds_are_watched_and_never_written() {
     assert!(f.locked("ssh") && f.locked("box") && f.locked("hf"));
     assert!(f
         .engine
-        .scan_legacy(true)
+        .scan_legacy()
         .unwrap()
         .iter()
         .all(|(id, _)| id == "held"));
@@ -1123,14 +1350,14 @@ async fn runs_an_old_supervisor_holds_are_watched_and_never_written() {
         .unwrap();
     drop(old_supervisor);
     f.released("held");
-    f.engine.scan_legacy(true).unwrap();
+    f.engine.scan_legacy().unwrap();
     let notices = f.deliver();
     assert_eq!(notices.len(), 1);
     assert_eq!(
         (notices[0].run_id.as_str(), notices[0].kind.as_str()),
         ("held", TERMINAL)
     );
-    f.engine.scan_legacy(true).unwrap();
+    f.engine.scan_legacy().unwrap();
     assert!(f.deliver().is_empty());
     f.released("held");
 }
@@ -1144,7 +1371,7 @@ async fn an_old_cli_cancel_is_accepted_once_under_its_lock_and_survives_withdraw
             &format!(r#"{{"kind":"ssh_job","jobId":"/orx/runs/{id}"}}"#),
         );
     }
-    f.engine.scan_legacy(true).unwrap();
+    f.engine.scan_legacy().unwrap();
     let old_cli = |id: &str, act: &dyn Fn(&Store)| {
         let path = f.dir.join(format!("run-logs/{id}.cancel.lock"));
         let mut lock = crate::store::open_lifecycle_lock_at(&path).unwrap();
@@ -1225,7 +1452,7 @@ async fn reordered_feed_reports_never_move_a_phase_backwards() {
         (
             "run".to_string(),
             Observation::Queued {
-                detail: "stale".into(),
+                detail: Some("stale".into()),
             },
         ),
     ]);
@@ -1467,34 +1694,28 @@ async fn a_dropped_launch_leaves_the_run_recoverable() {
 }
 
 #[test]
-fn legacy_adoption_waits_for_the_launch_to_settle_and_respects_the_current_mode() {
+fn legacy_adoption_waits_for_the_launch_to_settle() {
     let f = Fixture::new();
     f.legacy_run("recent", r#"{"kind":"local_job","jobId":"job"}"#);
     let mut run = f.store().get_run("recent").unwrap().unwrap();
     run.updated_at = f.clock.wall_ms();
     f.store().upsert_run(&run).unwrap();
-    for enabled in [false, true] {
-        assert_eq!(
-            f.engine.scan_legacy(enabled).unwrap(),
-            [("recent".into(), Adoption::Watch)]
-        );
-        assert!(!f.engine.holds("recent"));
-    }
+    assert_eq!(
+        f.engine.scan_legacy().unwrap(),
+        [("recent".into(), Adoption::Watch)]
+    );
+    assert!(!f.engine.holds("recent"));
     f.clock.advance(Duration::from_millis(
         u64::try_from(ORPHANED_RUN_SETTLE_MS).unwrap() - 1,
     ));
     assert_eq!(
-        f.engine.scan_legacy(true).unwrap(),
-        [("recent".into(), Adoption::Watch)]
-    );
-    f.clock.advance(Duration::from_millis(1));
-    assert_eq!(
-        f.engine.scan_legacy(false).unwrap(),
+        f.engine.scan_legacy().unwrap(),
         [("recent".into(), Adoption::Watch)]
     );
     assert!(!f.engine.holds("recent"));
+    f.clock.advance(Duration::from_millis(1));
     assert_eq!(
-        f.engine.scan_legacy(true).unwrap(),
+        f.engine.scan_legacy().unwrap(),
         [(
             "recent".into(),
             Adoption::Native {
@@ -1503,8 +1724,69 @@ fn legacy_adoption_waits_for_the_launch_to_settle_and_respects_the_current_mode(
         )]
     );
     assert!(f.engine.holds("recent"));
-    assert!(f.engine.scan_legacy(false).unwrap().is_empty());
+    assert!(f.engine.scan_legacy().unwrap().is_empty());
     assert!(f.engine.holds("recent"));
+}
+
+#[test]
+fn a_legacy_launch_without_a_handle_takes_its_recovery_file_or_fails_once_settled() {
+    let f = Fixture::new();
+    f.legacy_run("lost", r#"{"kind":"modal_job"}"#);
+    f.legacy_run("kept", r#"{"kind":"local_job"}"#);
+    f.legacy_run("recent", r#"{"kind":"hf_job"}"#);
+    f.legacy_run("unreadable", r#"{"kind":"modal_job"}"#);
+    let handles = f.dir.join("submission-handles");
+    std::fs::create_dir_all(handles.join("unreadable.json")).unwrap();
+    std::fs::write(
+        handles.join("kept.json"),
+        r#"{"kind":"local_job","jobId":"/runs/kept"}"#,
+    )
+    .unwrap();
+    let mut recent = f.store().get_run("recent").unwrap().unwrap();
+    recent.updated_at = f.clock.wall_ms();
+    f.store().upsert_run(&recent).unwrap();
+
+    f.engine.scan_legacy().unwrap();
+    let lost = f.store().get_run("lost").unwrap().unwrap();
+    assert_eq!(lost.status, "failed");
+    assert!(lost
+        .result_markdown
+        .unwrap()
+        .contains("Inspect the provider for resources labelled or_run=lost"));
+    let kept = f.store().get_run("kept").unwrap().unwrap();
+    assert_eq!(kept.status, "running");
+    assert_eq!(
+        BackendDescriptor::parse(&kept.backend_json)
+            .unwrap()
+            .job_id
+            .as_deref(),
+        Some("/runs/kept")
+    );
+    assert_eq!(f.status("recent"), "running");
+    let unreadable = f.store().get_run("unreadable").unwrap().unwrap();
+    assert_eq!(unreadable.status, "failed");
+    assert!(unreadable
+        .result_markdown
+        .unwrap()
+        .contains("recovery file that could not be read"));
+    assert!(!f.engine.holds("lost") && !f.engine.holds("kept"));
+    let mut notices: Vec<_> = f
+        .deliver()
+        .into_iter()
+        .map(|notice| (notice.run_id, notice.kind))
+        .collect();
+    notices.sort();
+    assert_eq!(
+        notices,
+        [
+            ("lost".to_string(), TERMINAL.to_string()),
+            ("unreadable".to_string(), TERMINAL.to_string())
+        ]
+    );
+
+    f.engine.scan_legacy().unwrap();
+    assert!(f.deliver().is_empty());
+    assert_eq!(f.status("recent"), "running");
 }
 
 #[tokio::test]
@@ -1521,7 +1803,7 @@ async fn an_old_supervisor_finishing_while_the_engine_is_down_still_reaches_the_
             file
         });
     assert_eq!(
-        f.engine.scan_legacy(true).unwrap(),
+        f.engine.scan_legacy().unwrap(),
         [("held".to_string(), Adoption::Watch)]
     );
 
@@ -1531,12 +1813,12 @@ async fn an_old_supervisor_finishing_while_the_engine_is_down_still_reaches_the_
         .unwrap();
     drop(old_supervisor);
     f.released("held");
-    assert!(f.engine.scan_legacy(true).unwrap().is_empty());
+    assert!(f.engine.scan_legacy().unwrap().is_empty());
     let notices = f.deliver();
     assert_eq!(notices.len(), 1);
     assert!(notices[0].body.contains("**failed**"));
     f.restart();
-    f.engine.scan_legacy(true).unwrap();
+    f.engine.scan_legacy().unwrap();
     assert!(f.deliver().is_empty());
 }
 
@@ -1554,7 +1836,7 @@ async fn a_supervisor_finishing_between_snapshot_and_adoption_still_reaches_the_
             file
         });
     assert_eq!(
-        f.engine.scan_legacy(true).unwrap(),
+        f.engine.scan_legacy().unwrap(),
         [("held".to_string(), Adoption::Watch)]
     );
 
@@ -1568,13 +1850,13 @@ async fn a_supervisor_finishing_between_snapshot_and_adoption_still_reaches_the_
         drop(old_supervisor);
         released(&paths);
     }));
-    assert!(f.engine.scan_legacy(true).unwrap().is_empty());
+    assert!(f.engine.scan_legacy().unwrap().is_empty());
     let notices = f.deliver();
     assert_eq!(notices.len(), 1);
     assert!(notices[0].body.contains("**done**"));
     assert!(f.store().legacy_watches().unwrap().is_empty());
     f.released("held");
-    f.engine.scan_legacy(true).unwrap();
+    f.engine.scan_legacy().unwrap();
     assert!(f.deliver().is_empty());
 }
 
@@ -1672,8 +1954,7 @@ async fn observing_a_run_without_cancel_intent_does_not_take_the_cancel_lock() {
             }],
             Duration::ZERO,
         )
-        .await
-        .unwrap();
+        .await;
     let elapsed = began.elapsed();
     let _ = release.send(());
     holder.join().unwrap();
@@ -2174,7 +2455,12 @@ async fn emptied_survivors_without_proof_do_not_claim_a_verified_stop_in_the_fol
 async fn supervised_monitoring_outages_and_recoveries_are_delivered_once() {
     let mut f = Fixture::new();
     f.legacy_run("run", r#"{"kind":"ssh_job","jobId":"/orx/run"}"#);
-    f.engine.scan_legacy(false).unwrap();
+    let _old_supervisor = f.store().supervisor_lock_paths("run").unwrap().map(|path| {
+        let file = lock_file(&path);
+        file.try_lock().unwrap();
+        file
+    });
+    f.engine.scan_legacy().unwrap();
     assert!(f.deliver().is_empty());
     for _ in 0..2 {
         let mut run = f.store().get_run("run").unwrap().unwrap();
@@ -2182,23 +2468,23 @@ async fn supervised_monitoring_outages_and_recoveries_are_delivered_once() {
         descriptor.monitoring_error = Some("Host unreachable".into());
         run.backend_json = descriptor.to_json();
         f.store().upsert_run(&run).unwrap();
-        f.engine.scan_legacy(false).unwrap();
-        f.engine.scan_legacy(false).unwrap();
+        f.engine.scan_legacy().unwrap();
+        f.engine.scan_legacy().unwrap();
         let notices = f.deliver();
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].kind, ATTENTION);
         assert!(notices[0].body.contains("orx can no longer monitor"));
         f.restart();
-        f.engine.scan_legacy(false).unwrap();
+        f.engine.scan_legacy().unwrap();
         assert!(f.deliver().is_empty());
         descriptor.monitoring_error = None;
         run.backend_json = descriptor.to_json();
         f.store().upsert_run(&run).unwrap();
-        f.engine.scan_legacy(false).unwrap();
-        f.engine.scan_legacy(false).unwrap();
+        f.engine.scan_legacy().unwrap();
+        f.engine.scan_legacy().unwrap();
         assert_eq!(f.kinds(), [RECOVERED]);
         f.restart();
-        f.engine.scan_legacy(false).unwrap();
+        f.engine.scan_legacy().unwrap();
         assert!(f.deliver().is_empty());
     }
 }
@@ -2251,7 +2537,7 @@ async fn queue_detail_survives_restart_reaches_cli_and_clears_on_contact_loss_or
     f.backend.then_launch(Ok(handle()));
     f.submit("queued").await.unwrap();
     let queue = || Observation::Queued {
-        detail: "Queued on Kaggle".into(),
+        detail: Some("Queued on Kaggle".into()),
     };
     f.engine.observe("queued", queue()).unwrap();
     let row = f.store().get_run("queued").unwrap().unwrap();
@@ -2265,7 +2551,8 @@ async fn queue_detail_survives_restart_reaches_cli_and_clears_on_contact_loss_or
     assert!(handle_of(&row).is_some());
     let cli = crate::plane::Run::from_store(&f.store(), &row).unwrap();
     assert_eq!(cli.queue_detail.as_deref(), Some("Queued on Kaggle"));
-    assert!(cli.contact_detail().unwrap().contains("Queued on Kaggle"));
+    assert!(cli.waiting_detail().unwrap().contains("Queued on Kaggle"));
+    assert_eq!(cli.contact_detail(), None);
     f.restart();
     assert_eq!(
         crate::plane::Run::from_store(&f.store(), &f.store().get_run("queued").unwrap().unwrap())
@@ -2315,6 +2602,14 @@ async fn unreadable_backend_status_can_still_reach_the_user() {
         .set_backend_json("unreadable", "unreadable")
         .unwrap();
     f.engine
+        .observe(
+            "unreadable",
+            Observation::Queued {
+                detail: Some("Queued on Kaggle".into()),
+            },
+        )
+        .unwrap();
+    f.engine
         .unreconciled(
             "unreadable",
             &anyhow!("Could not read the run's backend descriptor"),
@@ -2323,4 +2618,105 @@ async fn unreadable_backend_status_can_still_reach_the_user() {
     assert!(
         matches!(f.contact("unreadable"), Contact::Unreconciled { detail, .. } if detail.contains("backend descriptor"))
     );
+}
+
+#[tokio::test]
+async fn a_starting_run_shows_the_backends_latest_waiting_reason_until_it_runs() {
+    let mut f = Fixture::new();
+    f.backend.then_launch(Ok(handle()));
+    f.submit("run").await.unwrap();
+    f.events();
+    let waiting = |f: &Fixture| {
+        f.store()
+            .engine_run_state("run")
+            .unwrap()
+            .unwrap()
+            .waiting_reason
+    };
+    let queued = |detail: &str| Observation::Queued {
+        detail: Some(detail.into()),
+    };
+    let unscheduled = "0/4 nodes are available: 4 Insufficient nvidia.com/gpu.";
+
+    f.engine
+        .observe(
+            "run",
+            queued("0/4 nodes are available:\n  4 Insufficient nvidia.com/gpu."),
+        )
+        .unwrap();
+    assert_eq!(waiting(&f).as_deref(), Some(unscheduled));
+    assert_eq!(f.phases(), [Phase::Starting]);
+
+    // Each poll repeats the reason; only a new one is written and published.
+    let observer = rusqlite::Connection::open(f.dir.join("orx.db")).unwrap();
+    let version = || -> i64 {
+        observer
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .unwrap()
+    };
+    let before = version();
+    f.engine.observe("run", queued(unscheduled)).unwrap();
+    assert_eq!(version(), before);
+    assert!(f.events().is_empty());
+
+    f.engine
+        .observe(
+            "run",
+            Observation::Unreachable {
+                cause: "eof".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(waiting(&f).as_deref(), Some(unscheduled));
+
+    f.engine
+        .observe("run", Observation::Queued { detail: None })
+        .unwrap();
+    assert_eq!(waiting(&f), None);
+
+    f.engine.observe("run", queued(&"x".repeat(2000))).unwrap();
+    let long = waiting(&f).unwrap();
+    assert!(long.chars().count() <= 500 && long.ends_with('…'));
+
+    f.engine
+        .observe("run", Observation::Running { started_at: None })
+        .unwrap();
+    assert_eq!(waiting(&f), None);
+    f.engine.observe("run", queued("late")).unwrap();
+    assert_eq!(waiting(&f), None);
+    assert_eq!(f.status("run"), "running");
+}
+
+#[tokio::test]
+async fn an_ended_run_drops_its_waiting_reason() {
+    let f = Fixture::new();
+    f.backend.then_launch(Ok(handle()));
+    f.submit("run").await.unwrap();
+    f.engine
+        .observe(
+            "run",
+            Observation::Queued {
+                detail: Some("Provisioning box".into()),
+            },
+        )
+        .unwrap();
+    f.engine
+        .observe(
+            "run",
+            Observation::Failed {
+                finished_at: None,
+                reason: "Box provisioning failed".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(f.status("run"), "failed");
+    let stored: Option<String> = rusqlite::Connection::open(f.dir.join("orx.db"))
+        .unwrap()
+        .query_row(
+            "SELECT waiting_reason FROM runs WHERE id = 'run'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, None);
 }

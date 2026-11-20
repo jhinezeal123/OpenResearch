@@ -1,7 +1,8 @@
 import { useContext, useEffect, useRef, useState } from "react";
 import { WorkspaceDomContext } from "../WorkspaceDom";
 import { useWorkspace } from "../workspace";
-import { useQuery, useMutation } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
+import { mutCreateProject } from "../queries/projects";
 
 import { m } from "../paraglide/messages.js";
 import { getLocale } from "../paraglide/runtime.js";
@@ -21,6 +22,9 @@ export function useDebouncedValue(value: string, delay: number) {
   }, [value, delay]);
   return debounced;
 }
+
+/** Where a new project's folder goes unless the user picks one. */
+export const defaultProjectPath = (name: string) => name.trim() ? `~/OpenResearch/${slugify(name, 48)}` : "";
 
 export function slugify(text: string, maxLength?: number): string {
   const slug = text
@@ -84,14 +88,16 @@ export function NewProjectForm({
     searchPapersQuery,
     resolvePaperQuery,
   } = useWorkspace().queries;
-  const { createProject, pickProjectFolder, prewarmStarterPrompts } = useWorkspace().api;
-  const { queryClient } = useWorkspace();
+  const workspace = useWorkspace();
+  const { pickProjectFolder, prewarmStarterPrompts } = workspace.api;
+  const { queryClient } = workspace;
 
   const { data: harnesses = [] } = useQuery(getHarnessesQuery());
   const starterSelection = preferredAgent ?? defaultSelection(harnesses);
   const starterHarness = starterSelection?.harness;
   const starterModel = starterSelection?.model ?? null;
-  const starterAgent = starterHarness ? { harness: starterHarness, model: starterModel } : undefined;
+  const starterProfile = starterSelection?.profile ?? null;
+  const starterAgent = starterHarness ? { harness: starterHarness, model: starterModel, profile: starterProfile } : undefined;
   const [mode, setMode] = useState<Mode>(initialPaperId ? "paper" : "blank");
   const [name, setName] = useState("");
   const [nameTouched, setNameTouched] = useState(false);
@@ -115,7 +121,7 @@ export function NewProjectForm({
     paper: { name: "", nameTouched: false, path: "", pathTouched: false },
   });
   const paperGithubRepo = mode === "paper" ? parseGithubRepository(paper?.repoUrl) : null;
-  const automaticBlankProjectPath = name.trim() ? `~/OpenResearch/${slugify(name, 48)}` : "";
+  const automaticBlankProjectPath = defaultProjectPath(name);
   const automaticPaperProjectPath = `~/OpenResearch/${slugify(name || paper?.title || paper?.paperId || "")}`;
   const projectPath = mode === "blank" && !pathTouched
     ? automaticBlankProjectPath
@@ -166,7 +172,6 @@ export function NewProjectForm({
     const error = paperId ? resolveQuery.error : searchQuery.error;
     if (canSearch && error) setError(error.message);
   }, [canSearch, paperId, resolveQuery.error, searchQuery.error]);
-  const createMutation = useMutation({ mutationFn: createProject });
 
   async function choosePaper(paperId: string) {
     const request = ++seq.current;
@@ -262,7 +267,7 @@ export function NewProjectForm({
       if (githubSyncEnabled && existingGithubRepo) {
         await queryClient.fetchQuery({ ...repoAccessQuery(existingGithubRepo.owner, existingGithubRepo.repo), staleTime: 0 }).catch(() => null);
       }
-      const result = await createMutation.mutateAsync({
+      const result = await mutCreateProject.runAsHeadlessPromise(workspace, {
         name: name.trim(),
         path: projectPath.trim(),
         creationMode: mode,
@@ -275,7 +280,7 @@ export function NewProjectForm({
         ...(mode === "paper" && paper
           ? { paperId: paper.paperId, cloneUrl: paper.repoUrl ?? undefined }
           : {}),
-      });
+      }, {});
       onCreated(result.project, result.githubPublicationError);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -299,11 +304,11 @@ export function NewProjectForm({
         paperId: prewarmPaperId ?? undefined,
         path: prewarmPath ?? undefined,
         locale: getLocale(),
-        starterAgent: starterHarness ? { harness: starterHarness, model: starterModel } : undefined,
+        starterAgent,
       }).catch(() => {});
     }, 1200);
     return () => window.clearTimeout(timer);
-  }, [prewarmReady, prewarmName, prewarmPaperId, prewarmPath, starterHarness, starterModel]);
+  }, [prewarmReady, prewarmName, prewarmPaperId, prewarmPath, starterHarness, starterModel, starterProfile]);
 
   const gitMissing = pathStatus?.gitVersion === null;
   const missingLocalFolder =

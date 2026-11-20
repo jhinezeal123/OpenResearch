@@ -1,7 +1,13 @@
 import { QueryClient, type QueryFilters, type QueryKey, type DataTag } from "@tanstack/react-query";
 
-export function createWorkspaceClient(identity: string, basePath = "") {
-  const queryClient = new QueryClient({
+import { m } from "../paraglide/messages.js";
+
+/** The connection to orx up dropped before an answer arrived. */
+export class ConnectionLostError extends Error {}
+
+/** One cache for every machine; each workspace's keys start with its own scope. */
+export const createQueryClient = () =>
+  new QueryClient({
     defaultOptions: {
       queries: {
         staleTime: 30_000,
@@ -14,6 +20,8 @@ export function createWorkspaceClient(identity: string, basePath = "") {
       mutations: { retry: false, networkMode: "always" },
     },
   });
+
+export function createWorkspaceClient(queryClient: QueryClient, identity: string, basePath = "") {
   const scope = ["workspace", identity] as const;
   const lifetime = new AbortController();
   const listeners = new Set<() => void>();
@@ -44,7 +52,11 @@ export function createWorkspaceClient(identity: string, basePath = "") {
     const signal = init.signal
       ? AbortSignal.any([init.signal, lifetime.signal])
       : lifetime.signal;
-    return fetch(url(path), { ...init, signal });
+    // Browsers report a dropped connection as a bare TypeError ("Load failed", "Failed to fetch").
+    return fetch(url(path), { ...init, signal }).catch((error: unknown) => {
+      if (error instanceof TypeError && !signal.aborted) throw new ConnectionLostError(m.request_connection_lost(), { cause: error });
+      throw error;
+    });
   }
 
   function socketUrl(path: string) {
@@ -64,7 +76,7 @@ export function createWorkspaceClient(identity: string, basePath = "") {
 
   function replaceWorkspace() {
     lifetime.abort();
-    void cancelAndRemove({});
+    void cancelAndRemove({ queryKey: scope });
     deletedSessionIds.clear();
     listeners.forEach((listener) => listener());
   }

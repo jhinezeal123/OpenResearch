@@ -1,7 +1,7 @@
 import type { WorkspaceQueries } from "../workspace";
 import type { WorkspaceClient } from "./client";
-import { useCallback, useMemo, useSyncExternalStore } from "react";
-import { useQuery, type QueryCacheNotifyEvent } from "@tanstack/react-query";
+import { useCallback, useMemo } from "react";
+import { useQuery } from "@tanstack/react-query";
 
 import { markLiveUpdate } from "./live";
 import { reducer, type Action, type ChatState } from "./chatState";
@@ -16,34 +16,28 @@ export function createChatStore(
     client;
   const { getChatMessagesQuery, listChatSessionsQuery } = queries;
 
-  let revision = 0;
-  function isChatDataEvent(event: QueryCacheNotifyEvent) {
-    return (
-      (event.query.queryKey[2] === "listChatSessions" ||
-        event.query.queryKey[2] === "getChatMessages") &&
-      (event.type === "removed" ||
-        (event.type === "updated" && event.action.type === "success"))
-    );
+  let writeTail: Promise<unknown> = Promise.resolve();
+  /** Holds the next place among session writes and sends; `run` fills it, `release` gives it up. One must be called. */
+  function reserve() {
+    let fill!: (write: (() => Promise<unknown>) | null) => void;
+    const slot = new Promise<(() => Promise<unknown>) | null>((resolve) => { fill = resolve; });
+    const result = writeTail.catch(() => {}).then(() => slot).then((write) => {
+      if (!write) return;
+      if (!isCurrentScope(workspaceScope())) throw new DOMException("Workspace changed", "AbortError");
+      return write();
+    });
+    writeTail = result.catch(() => {});
+    return {
+      run<T>(write: () => Promise<T>) {
+        fill(write);
+        return result as Promise<T>;
+      },
+      release: () => fill(null),
+    };
   }
-  queryClient.getQueryCache().subscribe((event) => { if (isChatDataEvent(event)) revision++; });
-  const subscribeChat = (notify: () => void) => queryClient.getQueryCache().subscribe((event) => { if (isChatDataEvent(event)) notify(); });
-  const getRevision = () => revision;
 
-  function readChatState(projectId: string, activeId: string | null): ChatState {
-    const sessions = queryClient.getQueryData(listChatSessionsQuery(projectId).queryKey) ?? [];
-    const busySessions = new Set(sessions.filter((session) => session.busy).map((session) => session.id));
-    const state: ChatState = { messagesBySession: {}, queuedBySession: {}, activeLeafBySession: {}, busySessions };
-    const visible = new Set(sessions.map((session) => session.id));
-    if (activeId) visible.add(activeId);
-    for (const id of visible) {
-      const snapshot = queryClient.getQueryData(getChatMessagesQuery(id).queryKey);
-      if (!snapshot) continue;
-      state.messagesBySession[id] = snapshot.messages;
-      state.queuedBySession[id] = snapshot.queued;
-      state.activeLeafBySession[id] = snapshot.activeLeafId;
-    }
-    return state;
-  }
+  /** Runs session writes and sends one at a time, so a turn starts with the settings changed before it. */
+  const serialize = <T>(write: () => Promise<T>) => reserve().run(write);
 
   function dispatchChat(projectId: string, action: Action, existingOnly = false) {
     if (action.type === "busy") {
@@ -74,8 +68,14 @@ export function createChatStore(
   function useChatState(projectId: string, activeId: string | null) {
     const enabled = Boolean(activeId) && !deletedSessionIds.has(activeId ?? "");
     const history = useQuery({ ...getChatMessagesQuery(activeId ?? ""), enabled, subscribed: enabled });
-    const dataRevision = useSyncExternalStore(subscribeChat, getRevision);
-    const state = useMemo(() => readChatState(projectId, activeId), [projectId, activeId, dataRevision, history.data]);
+    const sessions = useQuery(listChatSessionsQuery(projectId));
+    const busySessions = useMemo(() => new Set(sessions.data?.filter((session) => session.busy).map((session) => session.id)), [sessions.data]);
+    const state = useMemo<ChatState>(() => ({
+      messagesBySession: activeId && history.data ? { [activeId]: history.data.messages } : {},
+      queuedBySession: activeId && history.data ? { [activeId]: history.data.queued } : {},
+      activeLeafBySession: activeId && history.data ? { [activeId]: history.data.activeLeafId } : {},
+      busySessions,
+    }), [activeId, history.data, busySessions]);
     const generation = workspaceScope()[1];
     const dispatch = useCallback((action: Action) => {
       if (isCurrentScope(["workspace", generation])) dispatchChat(projectId, action);
@@ -84,9 +84,8 @@ export function createChatStore(
   }
 
   return {
-    isChatDataEvent,
-    subscribeChat,
-    readChatState,
+    reserve,
+    serialize,
     dispatchChat,
     useChatState,
   };

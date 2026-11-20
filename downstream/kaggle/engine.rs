@@ -200,7 +200,7 @@ fn request(run_id: &str, with_env: bool) -> Result<(Launch, Value)> {
     request["sourcePath"] = json!(source.path);
     request["digest"] = json!(source.digest);
     if with_env {
-        request["env"] = json!(crate::downstream::bridge::config::run_env(run_id));
+        request["env"] = json!(crate::downstream::bridge::config::launch_env(&run)?);
     }
     Ok((launch, request))
 }
@@ -230,7 +230,9 @@ fn waiting(reply: &Value) -> Observation {
     if reply["error"].as_str().is_some() {
         Observation::Unreachable { cause: detail }
     } else {
-        Observation::Queued { detail }
+        Observation::Queued {
+            detail: Some(detail),
+        }
     }
 }
 
@@ -259,7 +261,7 @@ fn observe(reply: &Value, step: &mut Step) -> Observation {
         "NOT_STARTED" => {
             step.launched = false;
             Observation::Queued {
-                detail: "The Kaggle notebook is ready; the run has not started yet.".into(),
+                detail: Some("The Kaggle notebook is ready; the run has not started yet.".into()),
             }
         }
         "UNKNOWN" => Observation::Unreconciled {
@@ -349,7 +351,7 @@ async fn run_step(run_id: String, cancelled: bool, acquired: bool, launched: boo
         acquired,
         launched,
         observation: Observation::Queued {
-            detail: "Contacting Kaggle".into(),
+            detail: Some("Contacting Kaggle".into()),
         },
     };
     step.observation = match drive(&run_id, cancelled, &mut step).await {
@@ -433,7 +435,7 @@ impl Api for KaggleAccount {
                 Err(_) => {
                     driver.step = Some(task);
                     driver.last.clone().unwrap_or(Observation::Queued {
-                        detail: "Contacting Kaggle".into(),
+                        detail: Some("Contacting Kaggle".into()),
                     })
                 }
             }
@@ -492,7 +494,7 @@ impl Api for KaggleAccount {
         run: &WatchedRun,
         cursor: &mut u64,
         window: Duration,
-        sink: &mut (dyn for<'b> FnMut(&'b [u8]) + Send),
+        sink: &mut (dyn for<'b, 'c> FnMut(&'b [u8], Option<&'c u64>) + Send),
     ) -> Result<bool> {
         check(run)?;
         let deadline = tokio::time::Instant::now() + window;
@@ -504,8 +506,9 @@ impl Api for KaggleAccount {
                 file.seek(SeekFrom::Start(*cursor))?;
                 let mut chunk = Vec::with_capacity(LOG_CHUNK);
                 file.take(LOG_CHUNK as u64).read_to_end(&mut chunk)?;
-                sink(&chunk);
-                *cursor += chunk.len() as u64;
+                let next = *cursor + chunk.len() as u64;
+                sink(&chunk, Some(&next));
+                *cursor = next;
                 received = true;
                 continue;
             }
@@ -541,6 +544,10 @@ impl Api for KaggleAccount {
             tokio::time::sleep(LOG_POLL).await;
         }
     }
+
+    fn resume(len: u64) -> Option<u64> {
+        Some(len)
+    }
 }
 
 #[cfg(test)]
@@ -551,9 +558,7 @@ mod tests {
         Step {
             acquired: true,
             launched: true,
-            observation: Observation::Queued {
-                detail: String::new(),
-            },
+            observation: Observation::Queued { detail: None },
         }
     }
 
@@ -654,16 +659,19 @@ mod tests {
 
     #[test]
     fn queued_runs_say_why_they_wait() {
-        let Observation::Queued { detail } = waiting(&json!({
+        let Observation::Queued {
+            detail: Some(detail),
+        } = waiting(&json!({
             "queued": true,
             "detail": "Queued on Kaggle. Waiting for Kaggle to start the notebook."
-        })) else {
+        }))
+        else {
             panic!("not queued");
         };
         assert!(detail.contains("Queued on Kaggle"));
         assert!(matches!(
             waiting(&json!({"queued":true,"detail":"Waiting for a free account."})),
-            Observation::Queued { detail } if detail.contains("free account")
+            Observation::Queued { detail: Some(detail) } if detail.contains("free account")
         ));
         assert!(matches!(
             waiting(&json!({"error":"Could not check Kaggle status"})),

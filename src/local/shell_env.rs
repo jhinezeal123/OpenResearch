@@ -43,10 +43,18 @@ static OVERRIDE: OnceLock<HashMap<&'static str, OsString>> = OnceLock::new();
 
 /// Like `env::var_os`, but preferring what the user's shell reported.
 pub fn var(key: &str) -> Option<OsString> {
-    OVERRIDE
+    let value = OVERRIDE
         .get()
         .and_then(|vars| vars.get(key).cloned())
-        .or_else(|| std::env::var_os(key))
+        .or_else(|| std::env::var_os(key));
+    #[cfg(test)]
+    if value
+        .as_deref()
+        .is_some_and(|value| crate::config::developers_home(key, value))
+    {
+        return None;
+    }
+    value
 }
 
 /// The PATH to search for the binaries orx spawns, and to hand its children.
@@ -93,46 +101,7 @@ fn path_key(dir: &std::path::Path) -> String {
 /// The machine then user `Path`, as a new process would compose them, expanded.
 #[cfg(windows)]
 fn registry_path() -> Vec<PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
-    use windows_sys::Win32::System::Registry::{
-        RegGetValueW, HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ,
-    };
-
-    fn wide(text: &str) -> Vec<u16> {
-        text.encode_utf16().chain(Some(0)).collect()
-    }
-    fn read(root: HKEY, key: &str) -> Option<OsString> {
-        let (key, value) = (wide(key), wide("Path"));
-        let mut buffer = vec![0u16; 4096];
-        // Expansion can outgrow the size a first call reports, so retry on ERROR_MORE_DATA.
-        for _ in 0..3 {
-            let mut bytes = u32::try_from(buffer.len() * 2).ok()?;
-            // SAFETY: both names are NUL-terminated and `bytes` is the buffer's size.
-            let status = unsafe {
-                RegGetValueW(
-                    root,
-                    key.as_ptr(),
-                    value.as_ptr(),
-                    // Expanding (no RRF_NOEXPAND) returns REG_EXPAND_SZ as REG_SZ;
-                    // naming RRF_RT_REG_EXPAND_SZ here fails with ERROR_INVALID_PARAMETER.
-                    RRF_RT_REG_SZ,
-                    std::ptr::null_mut(),
-                    buffer.as_mut_ptr().cast(),
-                    &mut bytes,
-                )
-            };
-            match status {
-                ERROR_SUCCESS => {
-                    buffer.truncate(bytes as usize / 2);
-                    return Some(OsString::from_wide(until_nul(&buffer)));
-                }
-                ERROR_MORE_DATA => buffer.resize((bytes as usize).div_ceil(2) + 1, 0),
-                _ => return None,
-            }
-        }
-        None
-    }
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 
     [
         (
@@ -142,9 +111,52 @@ fn registry_path() -> Vec<PathBuf> {
         (HKEY_CURRENT_USER, "Environment"),
     ]
     .into_iter()
-    .filter_map(|(root, key)| read(root, key))
+    .filter_map(|(root, key)| registry_string(root, key, "Path"))
     .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
     .collect()
+}
+
+/// A string registry value, with environment variables expanded.
+#[cfg(windows)]
+pub(crate) fn registry_string(
+    root: windows_sys::Win32::System::Registry::HKEY,
+    key: &str,
+    value: &str,
+) -> Option<OsString> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
+    use windows_sys::Win32::System::Registry::{RegGetValueW, RRF_RT_REG_SZ};
+
+    let key: Vec<u16> = key.encode_utf16().chain(Some(0)).collect();
+    let value: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
+    let mut buffer = vec![0u16; 4096];
+    // Expansion can outgrow the size a first call reports, so retry on ERROR_MORE_DATA.
+    for _ in 0..3 {
+        let mut bytes = u32::try_from(buffer.len() * 2).ok()?;
+        // SAFETY: both names are NUL-terminated and `bytes` is the buffer's size.
+        let status = unsafe {
+            RegGetValueW(
+                root,
+                key.as_ptr(),
+                value.as_ptr(),
+                // Expanding (no RRF_NOEXPAND) returns REG_EXPAND_SZ as REG_SZ;
+                // naming RRF_RT_REG_EXPAND_SZ here fails with ERROR_INVALID_PARAMETER.
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buffer.as_mut_ptr().cast(),
+                &mut bytes,
+            )
+        };
+        match status {
+            ERROR_SUCCESS => {
+                buffer.truncate(bytes as usize / 2);
+                return Some(OsString::from_wide(until_nul(&buffer)));
+            }
+            ERROR_MORE_DATA => buffer.resize((bytes as usize).div_ceil(2) + 1, 0),
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// The string before its terminator. An expanded value's reported size can run
@@ -165,20 +177,31 @@ pub const PATH_LIST_SEPARATOR: &str = ";";
 /// Where `binary` lives: what detection reports and what [`crate::process`]
 /// runs for a bare name.
 pub fn find(binary: &str) -> Option<PathBuf> {
-    installs(binary, []).into_iter().next()
+    every_install(binary, []).into_iter().next()
 }
 
-/// Every copy of `binary` worth trying, best first: the one on PATH, then the
-/// directories installers drop CLIs into without putting them on PATH, then the
-/// tool's `own` install locations. Only when none has it, `npx`'s cache. The path
-/// is returned as it sits in its directory; a caller that needs the real binary
-/// behind a symlink composes with `resolve_symlinks`.
+/// Every copy of the agent `binary` worth trying, best first: the one on PATH,
+/// then the directories installers drop CLIs into without putting them on PATH,
+/// then the agent's `own` install locations. Only when none has it, `npx`'s
+/// cache. The path is returned as it sits in its directory; a caller that needs
+/// the real binary behind a symlink composes with `resolve_symlinks`. Under test
+/// a copy outside the test's temp root is the developer's own and stays unseen.
 pub fn installs(binary: &str, own: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = dirs::home_dir()
+    let found = every_install(binary, own);
+    #[cfg(test)]
+    let found = found
+        .into_iter()
+        .filter(|path| crate::config::contained(path))
+        .collect();
+    found
+}
+
+fn every_install(binary: &str, own: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = crate::config::home_dir()
         .map(|home| vec![home.join(".local/bin"), home.join(".npm-global/bin")])
         .unwrap_or_default();
     #[cfg(windows)]
-    dirs.extend(dirs::config_dir().map(|roaming| roaming.join("npm")));
+    dirs.extend(crate::config::roaming_config_dir().map(|roaming| roaming.join("npm")));
     dirs.extend(own);
     let found: Vec<PathBuf> = find_on_path(binary)
         .into_iter()
@@ -196,8 +219,8 @@ pub fn installs(binary: &str, own: impl IntoIterator<Item = PathBuf>) -> Vec<Pat
 
 /// Where npm keeps `npx` runs by default.
 fn npx_roots() -> Vec<PathBuf> {
-    let windows_cache = cfg!(windows).then(dirs::cache_dir).flatten();
-    dirs::home_dir()
+    let windows_cache = cfg!(windows).then(crate::config::cache_dir).flatten();
+    crate::config::home_dir()
         .map(|home| home.join(".npm/_npx"))
         .into_iter()
         .chain(windows_cache.map(|cache| cache.join("npm-cache/_npx")))
@@ -311,9 +334,10 @@ pub fn export_to(mut set: impl FnMut(&'static str, &OsString)) {
     }
 }
 
-/// What the Linux AppImage's AppRun and GTK hook point at the image (keep in step
+/// What the Linux AppImage's AppRun overrides for its runtime (keep in step
 /// with linux/AppRun, which saves the session's values as `ORX_HOST_<name>`).
-const APPIMAGE_GTK_VARS: [&str; 12] = [
+const APPIMAGE_RUNTIME_VARS: [&str; 13] = [
+    "LD_LIBRARY_PATH",
     "GDK_BACKEND",
     "GDK_PIXBUF_MODULE_FILE",
     "GI_TYPELIB_PATH",
@@ -328,10 +352,10 @@ const APPIMAGE_GTK_VARS: [&str; 12] = [
     "XDG_DATA_DIRS",
 ];
 
-/// The session's own values (`None`: unset) of what AppRun set for the bundled GTK,
+/// The session's own values (`None`: unset) of what AppRun set for its runtime,
 /// for host programs, which fail on the image's schemas. Empty outside the AppImage.
 pub fn host_gui_env() -> Vec<(&'static str, Option<OsString>)> {
-    APPIMAGE_GTK_VARS
+    APPIMAGE_RUNTIME_VARS
         .iter()
         .filter_map(|var| {
             let saved = std::env::var_os(format!("ORX_HOST_{var}"))?;
@@ -390,6 +414,53 @@ pub fn parse_probe(stdout: &str, marker: &str) -> Option<HashMap<&'static str, O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_programs_receive_the_sessions_library_path() {
+        if !crate::config::in_test_child(&[]) {
+            return;
+        }
+        std::env::set_var("LD_LIBRARY_PATH", "/appimage/lib");
+        for saved in ["-", "=", "=/host/lib:/drivers"] {
+            std::env::set_var("ORX_HOST_LD_LIBRARY_PATH", saved);
+            let command = crate::process::command("host-program");
+            let setting = command
+                .get_envs()
+                .find(|(key, _)| *key == "LD_LIBRARY_PATH")
+                .expect("library path is restored");
+            assert_eq!(setting.1, saved.strip_prefix('=').map(std::ffi::OsStr::new));
+        }
+    }
+
+    #[test]
+    fn an_agent_on_path_outside_the_test_root_is_never_resolved() {
+        if !crate::config::in_test_child(&[]) {
+            return;
+        }
+        let root = std::env::temp_dir();
+        let outside = root
+            .parent()
+            .unwrap()
+            .join(format!("orx-agent-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&outside).unwrap();
+        let agent = outside.join(if cfg!(windows) {
+            "claude.cmd"
+        } else {
+            "claude"
+        });
+        std::fs::write(&agent, "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        std::env::set_var("PATH", &outside);
+
+        let found = installs("claude", []);
+        std::fs::remove_dir_all(&outside).unwrap();
+
+        assert!(!found.contains(&agent), "{found:?}");
+    }
 
     #[test]
     fn a_tool_off_path_is_found_in_its_own_install_dir() {

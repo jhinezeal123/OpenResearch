@@ -49,6 +49,13 @@ fn paced_child() -> bool {
 }
 
 fn config(server: &Sshd) -> Config {
+    let test = std::env::current_exe().unwrap();
+    // Cargo nests unit-test binaries at a varying depth below the profile directory holding `orx`.
+    let orx = test
+        .ancestors()
+        .map(|dir| dir.join("orx"))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("no orx binary in any directory above {}", test.display()));
     Config {
         alias: server.alias().into(),
         root: "~/engine-root".into(),
@@ -57,13 +64,7 @@ fn config(server: &Sshd) -> Config {
         binary_dir: Some(binaries()),
         #[cfg(unix)]
         sharing_home: None,
-        askpass_executable: std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("orx"),
+        askpass_executable: orx,
     }
 }
 
@@ -413,6 +414,66 @@ async fn interactive_lifecycle(server: Sshd, factors: usize) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_saved_passphrase_logs_an_ended_master_back_in_once() {
+    if !crate::config::in_test_child(&[]) {
+        return;
+    }
+    std::env::set_var(crate::local::keychain::TEST_KEYCHAIN, "1");
+    let passphrase = "orx transport 'passphrase'";
+    let server = SshdBuilder {
+        extra_client_keys: vec![Some(passphrase.into()), None],
+        identity_files: vec!["client_key_1".into()],
+        ..SshdBuilder::default()
+    }
+    .start()
+    .unwrap();
+    let clock = TestClock::new();
+    let conn = start(&server, clock.clone());
+    status(&conn, Status::NeedsAuth).await;
+    let fixture = server.askpass(passphrase).unwrap();
+    let prompt: Prompt = Arc::new(move |question| {
+        let fixture = fixture.clone();
+        Box::pin(async move {
+            let answer = crate::process::tokio_command(fixture)
+                .arg(question)
+                .output()
+                .await?;
+            Ok(Some(String::from_utf8(answer.stdout)?.trim_end().into()))
+        })
+    });
+    conn.connect_interactive(prompt, false).await.unwrap();
+    status(&conn, Status::Live).await;
+    assert!(!crate::local::keychain::load(server.alias())
+        .unwrap()
+        .is_empty());
+
+    let exit_master = || {
+        let pin = alias_auth(&server).route.unwrap();
+        let path = ssh::socket(&config(&server), &pin).unwrap();
+        let output = server
+            .spawn(&["-S", path.to_str().unwrap(), "-O", "exit"], None)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert!(output.status.success());
+    };
+    exit_master();
+    status(&conn, Status::Backoff).await;
+    let before = auth_attempts(&server);
+    clock.advance(6001);
+    status(&conn, Status::Live).await;
+    assert!(auth_attempts(&server).values().sum::<usize>() > before.values().sum::<usize>());
+
+    crate::local::keychain::save(server.alias(), &Default::default()).unwrap();
+    exit_master();
+    status(&conn, Status::Backoff).await;
+    let attempts = auth_attempts(&server);
+    clock.advance(6001);
+    status(&conn, Status::NeedsAuth).await;
+    assert_eq!(auth_attempts(&server), attempts);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_master_is_ignored_and_route_edits_require_explicit_approval() {
     let server = SshdBuilder {
         extra_client_keys: vec![None],
@@ -516,6 +577,24 @@ async fn black_hole_is_unreachable_by_deadline_and_recovers_in_one_backoff_step(
         .unwrap();
 }
 
+/// A connection to `server` under the managed rental alias `alias`.
+fn start_managed(server: &Sshd, clock: Arc<TestClock>, alias: &str) -> HostConn {
+    let store = Store::open_at(server.directory().join("store")).unwrap();
+    let mut config = config(server);
+    config.alias = alias.into();
+    let text = fs::read_to_string(server.config_path()).unwrap();
+    fs::write(
+        server.config_path(),
+        text.replace(
+            &format!("Host {}", server.alias()),
+            &format!("Host {alias}"),
+        ),
+    )
+    .unwrap();
+    let auth = Auth::new(&store, alias).unwrap();
+    HostConn::start_shared(config, store, clock, auth).unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn managed_rental_reconnects_after_repeated_failures_within_collection_grace() {
     if !paced_child() {
@@ -523,20 +602,7 @@ async fn managed_rental_reconnects_after_repeated_failures_within_collection_gra
     }
     let server = Sshd::start().unwrap();
     let clock = TestClock::new();
-    let store = Store::open_at(server.directory().join("store")).unwrap();
-    let mut config = config(&server);
-    config.alias = "orx-box-recovery".into();
-    let text = fs::read_to_string(server.config_path()).unwrap();
-    fs::write(
-        server.config_path(),
-        text.replace(
-            &format!("Host {}", server.alias()),
-            &format!("Host {}", config.alias),
-        ),
-    )
-    .unwrap();
-    let auth = Auth::new(&store, &config.alias).unwrap();
-    let conn = HostConn::start_shared(config, store, clock.clone(), auth).unwrap();
+    let conn = start_managed(&server, clock.clone(), "orx-box-recovery");
     status(&conn, Status::Live).await;
     let disconnected_at = clock.wall_ms();
     server
@@ -574,6 +640,63 @@ async fn managed_rental_reconnects_after_repeated_failures_within_collection_gra
         .await
         .expect("rental must retry before collection grace expires");
     assert!(clock.wall_ms() - disconnected_at < 900_000);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn managed_rental_retries_refused_keys_until_the_key_sync_grace_ends() {
+    let server = Sshd::start().unwrap();
+    let authorized = server.directory().join("authorized_keys");
+    let key = fs::read(&authorized).unwrap();
+    fs::write(&authorized, "").unwrap();
+    let clock = TestClock::new();
+    let conn = start_managed(&server, clock.clone(), "orx-box-keys");
+
+    let refused = status(&conn, Status::Backoff).await;
+    assert!(
+        key_refused(refused.cause.as_deref().unwrap()),
+        "{refused:?}"
+    );
+    fs::write(&authorized, &key).unwrap();
+    clock.advance((refused.next_retry_ms.unwrap() - clock.wall_ms()).max(0) as u64 + 1);
+    status(&conn, Status::Live).await;
+    let auth = Store::open_at(server.directory().join("store"))
+        .unwrap()
+        .engine_host_auth("orx-box-keys")
+        .unwrap();
+    assert_eq!(auth.class, Some(HostClass::Key));
+
+    fs::write(&authorized, "").unwrap();
+    server.proxy().reset().unwrap();
+    let mut state = conn.state();
+    let mut first_refusal = None;
+    let opened = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let snapshot = state.borrow_and_update().clone();
+            if snapshot.status == Status::NeedsAuth {
+                return snapshot;
+            }
+            if snapshot.status == Status::Backoff
+                && snapshot.cause.as_deref().is_some_and(key_refused)
+            {
+                first_refusal.get_or_insert(snapshot.since_ms);
+                let due = snapshot.next_retry_ms.unwrap() - clock.wall_ms();
+                clock.advance(due.max(0) as u64 + 1);
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(100), state.changed()).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(key_refused(opened.cause.as_deref().unwrap()));
+    assert!(opened.since_ms - first_refusal.unwrap() >= KEY_SYNC_GRACE_MS);
+    let refusals = auth_attempts(&server)
+        .get(&("publickey".into(), "Failed".into()))
+        .copied()
+        .unwrap_or(0);
+    assert!((3..=8).contains(&refusals), "{refusals}");
+    clock.advance(30 * 60 * 1000);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(conn.state().borrow().status, Status::NeedsAuth);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -669,6 +792,7 @@ fn jittered_cadence_is_persisted_and_capped_at_fifteen_minutes() {
         state,
         publish,
         incoming,
+        unsupported: None,
     };
     actor.classify(HostClass::Key);
     let mut since = None;
@@ -1029,7 +1153,6 @@ async fn key_retry_resets_the_backoff_step_without_prompting() {
             &HostState {
                 status: Status::Backoff,
                 failures: 4,
-                next_retry_ms: Some(clock.wall_ms() + 900_000),
                 ..HostState::default()
             },
         )
@@ -1040,11 +1163,22 @@ async fn key_retry_resets_the_backoff_step_without_prompting() {
         HostConn::start_shared(config, store, clock.clone(), auth)
     }
     .unwrap();
+    // Startup retries a key host at once; a retry pressed during that attempt only joins it.
+    let state = status(&conn, Status::Backoff).await;
+    assert_eq!(state.failures, 5);
+
+    let before = clock.wall_ms();
     assert!(conn.retry_key().await.is_err());
+    let after = clock.wall_ms();
+
     let state = status(&conn, Status::Backoff).await;
     assert_eq!(state.failures, 1);
-    let delay = state.next_retry_ms.unwrap() - state.since_ms;
-    assert!((4000..=6000).contains(&delay), "{delay}");
+    let retry = state.next_retry_ms.unwrap();
+    assert!(
+        (before + 4000..=after + 6000).contains(&retry),
+        "{}",
+        retry - before
+    );
     assert!(auth_attempts(&server).is_empty());
 }
 
@@ -1078,6 +1212,54 @@ async fn key_retry_cannot_approve_a_changed_route() {
         Some("SSH route changed; press Connect to approve it")
     );
     assert_eq!(auth_attempts(&server), attempts);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connect_during_an_attempt_approves_a_route_changed_after_it_began() {
+    let server = Sshd::start().unwrap();
+    server
+        .proxy()
+        .set(Faults {
+            paused: true,
+            ..Faults::default()
+        })
+        .unwrap();
+    let conn = start(&server, TestClock::new());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while ssh_pids(&server).is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let old = fs::read_to_string(server.config_path()).unwrap();
+    fs::write(
+        server.config_path(),
+        old.replace("HostName 127.0.0.1", "HostName localhost"),
+    )
+    .unwrap();
+    let key = fs::read_to_string(server.directory().join("host_key.pub")).unwrap();
+    let mut known = fs::read_to_string(server.directory().join("known_hosts")).unwrap();
+    known.push_str(&format!("[localhost]:{} {key}", server.port()));
+    fs::write(server.directory().join("known_hosts"), known).unwrap();
+    let (reply, connected) = oneshot::channel();
+    conn.actions
+        .send(Action {
+            key_only: false,
+            keep_master: false,
+            prompt: None,
+            reply,
+        })
+        .await
+        .unwrap();
+    server.proxy().clear().unwrap();
+    connected.await.unwrap().unwrap();
+    assert_eq!(conn.state().borrow().status, Status::Live);
+    assert!(alias_auth(&server)
+        .route
+        .unwrap()
+        .lines()
+        .any(|line| line == "hostname localhost"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1162,6 +1344,9 @@ fn ssh_diagnostics_preserve_primary_errors_and_proxy_hops() {
         ("SSH connection closed", "ssh: Could not resolve hostname x: nodename nor servname provided, or not known\n", Some(255), "Could not resolve hostname x: nodename nor servname provided, or not known", false),
         ("SSH connection closed", "kex_exchange_identification: read: X\n", Some(255), "SSH connection closed: X", true),
         ("SSH connection closed", "user@jump: Permission denied (publickey).\r\nkex_exchange_identification: Connection closed by UNKNOWN port 65535\n", Some(255), "Permission denied (publickey)", true),
+        ("No orx-host for linux-x86_64", "Warning: Permanently added '64.247.196.69' (ED25519) to the list of known hosts.\r\n", Some(255), "No orx-host for linux-x86_64", true),
+        ("SSH connection closed", "Warning: Permanently added 'box' (ED25519) to the list of known hosts.\r\n** WARNING: connection is not using a post-quantum key exchange algorithm.\r\n** This session may be vulnerable to \"store now, decrypt later\" attacks.\r\nbash: module: command not found\n", Some(98), "Could not prepare the remote run directory: command not found", true),
+        ("SSH connection closed", "Warning: Permanently added 'box' (ED25519) to the list of known hosts.\r\nssh: connect to host box port 22: Connection refused\r\n", Some(255), "Connection refused", false),
         ("invalid response", "", Some(97), "The remote host rejected the bootstrap request", true),
         ("invalid response", "", Some(96), "Could not install or verify the remote host binary", true),
         ("invalid response", "", Some(95), "The remote host binary is missing", true),
@@ -1636,6 +1821,11 @@ async fn broken_config_during_connect_leaves_the_actor_alive() {
     let server = Sshd::start().unwrap();
     let conn = start(&server, TestClock::new());
     status(&conn, Status::Live).await;
+    conn.request(Request::Hello {
+        proto: orx_host_proto::PROTOCOL_VERSION,
+    })
+    .await
+    .unwrap();
     let original = fs::read_to_string(server.config_path()).unwrap();
     fs::write(server.config_path(), "InvalidOrxOption yes\n").unwrap();
     assert!(conn
@@ -2051,7 +2241,7 @@ fi
         .filter(|line| !line.trim_start().starts_with("ControlPath "))
         .collect::<Vec<_>>()
         .join("\n")
-        + "\n";
+        + "\nHost *\nInclude openresearch_config\n";
     fs::write(home.join(".ssh/config"), &user_config).unwrap();
     let clock = TestClock::new();
     let store = Store::open_at(server.directory().join("store")).unwrap();
@@ -2069,10 +2259,7 @@ fi
     let registry = home.join(".ssh/openresearch_connections.json");
     assert!(fs::read_to_string(&registry).unwrap().contains("engine:"));
     let installed = fs::read_to_string(home.join(".ssh/config")).unwrap();
-    assert_eq!(
-        installed.matches("Include openresearch_config\n").count(),
-        1
-    );
+    assert_eq!(installed, user_config);
 
     let plain = |scoped: bool| {
         let mut command = crate::process::tokio_command("ssh");
@@ -2156,4 +2343,73 @@ fi
     let mut cfg = config(&server);
     cfg.sharing_home = Some(home);
     ssh::stop_master(&cfg, &pin).await.unwrap();
+}
+
+/// Pinning a source can take longer than a reply deadline: the pin and the launch are still
+/// answered, and the session every other run shares stays up meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_source_pin_is_answered_without_dropping_the_session() {
+    if !paced_child() {
+        return;
+    }
+    let server = Sshd::start().unwrap();
+    let command = server.directory().join("command");
+    let text = fs::read_to_string(&command).unwrap();
+    // Paced, the reply deadline is 3.5 s, and pinning takes 5 s.
+    fs::write(
+        &command,
+        text.replace("export HOME", "export HOME\nexport ORX_TEST_SLOW_RPC=5000"),
+    )
+    .unwrap();
+    let conn = start(&server, TestClock::new());
+    status(&conn, Status::Live).await;
+    let sessions = ssh_pids(&server);
+    let source = server.directory().join("slow-source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("train"), "x").unwrap();
+    let archive = server.directory().join("slow.tar");
+    assert!(crate::process::command("tar")
+        .arg("-cf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&source)
+        .arg(".")
+        .status()
+        .unwrap()
+        .success());
+    let bytes = fs::read(&archive).unwrap();
+    let sha = orx_host::sha(&bytes);
+    let len = bytes.len() as u64;
+    for request in [
+        Request::PutBlob {
+            sha: sha.clone(),
+            offset: 0,
+            bytes,
+        },
+        Request::HasBlob {
+            sha: sha.clone(),
+            len,
+        },
+        Request::PinSource {
+            run: "slow".into(),
+            sha: sha.clone(),
+        },
+    ] {
+        let response = conn.request(request).await.unwrap();
+        assert!(!matches!(response, Response::Error { .. }), "{response:?}");
+    }
+    let launched = conn
+        .request(Request::Launch(orx_host_proto::LaunchIntent {
+            run: "slow".into(),
+            digest: orx_host::sha(b"slow"),
+            run_sh: "cat repo/train > ran".into(),
+            env: Default::default(),
+            source: Some(sha),
+            cancel_sh: None,
+        }))
+        .await
+        .unwrap();
+    assert!(matches!(launched, Response::Launch { .. }), "{launched:?}");
+    assert_eq!(conn.state.borrow().status, Status::Live);
+    assert_eq!(ssh_pids(&server), sessions);
 }

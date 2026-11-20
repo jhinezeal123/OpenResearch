@@ -22,7 +22,61 @@ pub use askpass::Prompt;
 fn deadline() -> Duration {
     crate::config::paced(Duration::from_secs(35))
 }
+
+/// How long orx-host may work on one request before answering: sbatch then squeue take up to
+/// 40 s, and a request on a run may first wait for another doing that. Probes keep checking the
+/// session meanwhile, so a dead host is still noticed by `deadline`.
+const HOST_WORK: Duration = Duration::from_secs(80);
+
+/// Blob requests share one host lock, which checking another blob holds while it hashes: up to
+/// 5 GiB at `hash_time`'s rate.
+const BLOB_WORK: Duration = Duration::from_secs(320);
+
+/// Hashing a staged blob on a slow disk, at a pessimistic 16 MiB/s.
+fn hash_time(len: u64) -> Duration {
+    Duration::from_secs(len / (16 << 20))
+}
+
+fn reply_deadline(body: &Request) -> Duration {
+    deadline()
+        + match body {
+            Request::Exec { timeout_ms, .. } => Duration::from_millis(u64::from(*timeout_ms)),
+            Request::Changes { wait_ms, .. } => {
+                Duration::from_millis(u64::from(*wait_ms)) + HOST_WORK
+            }
+            Request::HasBlob { len, .. } => BLOB_WORK + hash_time(*len),
+            Request::PutBlob { .. } => BLOB_WORK,
+            Request::Launch(_)
+            | Request::SlurmSubmit { .. }
+            | Request::SlurmQueue { .. }
+            | Request::PinSource { .. }
+            | Request::Cancel { .. }
+            | Request::CancelLegacy { .. }
+            | Request::Cleanup { .. } => HOST_WORK,
+            Request::Hello { .. }
+            | Request::Inspect { .. }
+            | Request::ReadLog { .. }
+            | Request::SlurmCancelLegacy { .. }
+            | Request::InspectLegacy { .. } => Duration::ZERO,
+        }
+}
 const CHUNK: usize = 256 * 1024;
+
+/// sshd and the org key sync can lag a freshly online box, so its key refusals back off this
+/// long before they open the breaker.
+const KEY_SYNC_GRACE_MS: i64 = 2 * 60 * 1000;
+
+/// An OpenResearch box: a key-only host orx rents, with no Connect to close a breaker.
+pub(crate) fn managed(alias: &str) -> bool {
+    alias.starts_with("orx-box-")
+}
+
+/// The host refused every key ssh offered.
+pub(crate) fn key_refused(cause: &str) -> bool {
+    cause
+        .to_ascii_lowercase()
+        .starts_with("permission denied (publickey")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HostClass {
@@ -89,6 +143,18 @@ impl std::fmt::Display for Unavailable {
 }
 
 impl std::error::Error for Unavailable {}
+
+/// Context on an `Unavailable` whose last connection failed in a way no retry fixes: a platform
+/// orx-host doesn't support, or a bootstrap the host refuses. A launch that was never sent
+/// fails with it instead of waiting.
+#[derive(Debug)]
+pub struct Unsupported(pub String);
+
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
 
 #[derive(Clone)]
 pub struct Config {
@@ -191,7 +257,7 @@ impl HostConn {
             .engine_root(&config.alias, &config.root)?
             .unwrap_or_default();
         let class = auth.state.borrow().class;
-        if state.status == Status::Connecting && class.is_none() {
+        if state.status == Status::Connecting && class.is_none() && !managed(&config.alias) {
             state.status = Status::NeedsAuth;
             state.cause = Some("First SSH attempt was interrupted; press Connect".into());
             if let Err(error) = auth.block(
@@ -233,6 +299,7 @@ impl HostConn {
             state,
             publish,
             incoming,
+            unsupported: None,
         };
         tokio::spawn(actor.run(action_rx));
         Ok(Self {
@@ -313,6 +380,7 @@ struct Actor {
     state: HostState,
     publish: watch::Sender<HostState>,
     incoming: mpsc::Receiver<Call>,
+    unsupported: Option<String>,
 }
 
 fn lane(body: &Request) -> usize {
@@ -350,6 +418,17 @@ async fn publish_master(config: &Config, route: &str) {
 }
 
 impl Actor {
+    fn unavailable(&self, sent: bool) -> anyhow::Error {
+        let error = anyhow!(Unavailable {
+            state: self.state.clone(),
+            sent,
+        });
+        match &self.unsupported {
+            Some(cause) => error.context(Unsupported(cause.clone())),
+            None => error,
+        }
+    }
+
     fn save(&self) {
         if let Err(error) =
             self.store
@@ -375,12 +454,18 @@ impl Actor {
     }
 
     fn failed(&mut self, breaker: bool, cause: String) {
-        if breaker && self.auth.state.borrow().class.is_none() {
-            self.classify(HostClass::Interactive);
-        }
+        let managed = managed(&self.config.alias);
         let now = self.clock.wall_ms();
-        if self.state.cause.is_none() {
+        let refusing = self.state.cause.as_deref().is_some_and(key_refused);
+        if self.state.cause.is_none() || managed && key_refused(&cause) && !refusing {
             self.state.since_ms = now;
+        }
+        let breaker = breaker
+            && !(managed
+                && key_refused(&cause)
+                && now.saturating_sub(self.state.since_ms) < KEY_SYNC_GRACE_MS);
+        if breaker && !managed && self.auth.state.borrow().class.is_none() {
+            self.classify(HostClass::Interactive);
         }
         self.state.cause = Some(cause);
         if breaker {
@@ -407,11 +492,7 @@ impl Actor {
             let base = steps[self.state.failures.min(steps.len() - 1)];
             let noise =
                 u16::from_le_bytes(uuid::Uuid::new_v4().as_bytes()[..2].try_into().unwrap()) as i64;
-            let max_delay = if self.config.alias.starts_with("orx-box-") {
-                60_000
-            } else {
-                900_000
-            };
+            let max_delay = if managed { 60_000 } else { 900_000 };
             let delay = (base * (800 + noise % 401) / 1000).min(max_delay);
             self.state.failures = self.state.failures.saturating_add(1);
             self.state.next_retry_ms = Some(now.saturating_add(delay));
@@ -424,10 +505,25 @@ impl Actor {
         &mut self,
         prompt: Option<Prompt>,
         approve_route: bool,
+        keep_master: bool,
+    ) -> Result<ssh::Session> {
+        let saved = askpass::Saved::new(&self.config.alias);
+        let prompt = prompt.map(|user| saved.wrap(Some(user)));
+        let result = self.login(prompt, &saved, approve_route, keep_master).await;
+        saved.finish(result.is_ok()).await;
+        result
+    }
+
+    async fn login(
+        &mut self,
+        prompt: Option<Prompt>,
+        #[cfg_attr(windows, allow(unused_variables))] saved: &Arc<askpass::Saved>,
+        approve_route: bool,
         #[cfg_attr(windows, allow(unused_variables))] keep_master: bool,
     ) -> Result<ssh::Session> {
         let auth = self.auth.clone();
         let _guard = auth.gate.lock().await;
+        self.unsupported = None;
         let blocked = auth.state.borrow().blocked.clone();
         if !approve_route {
             if let Some((_, cause)) = blocked {
@@ -481,6 +577,20 @@ impl Actor {
         auth.update(&self.store, &self.config.alias, |state| {
             state.route = Some(route.clone())
         })?;
+        // A saved password brings an interactive host's ended master back once, unattended.
+        #[cfg(unix)]
+        let interactive = self.auth.state.borrow().class == Some(HostClass::Interactive);
+        #[cfg(unix)]
+        let prompt = match prompt {
+            None if interactive
+                && !ssh::master_alive(&self.config, &ssh::socket(&self.config, &route)?)
+                    .await?
+                && saved.has_answers().await =>
+            {
+                Some(saved.wrap(None))
+            }
+            prompt => prompt,
+        };
         #[cfg(unix)]
         let mut attach = false;
         #[cfg(windows)]
@@ -634,7 +744,15 @@ impl Actor {
                 Ok(session)
             }
             Err(error) => {
+                #[cfg(windows)]
+                let resumed_older = resuming;
+                #[cfg(unix)]
+                let resumed_older = false;
+                let unsupported = error.downcast_ref::<Unsupported>().is_some() && !resumed_older;
                 let failure = session.failure(error, retry_closure).await;
+                if unsupported || failure.unsupported {
+                    self.unsupported = Some(failure.cause.clone());
+                }
                 if askpass
                     .as_ref()
                     .is_some_and(|bridge| bridge.auth_prompted())
@@ -709,7 +827,7 @@ impl Actor {
                 call = self.incoming.recv(), if queues.iter().map(VecDeque::len).sum::<usize>() < 256 => {
                     match call {
                         Some(call) if session.is_some() || matches!(self.state.status, Status::Idle | Status::Connecting) => queues[lane(&call.body)].push_back(call),
-                        Some(call) => { let _ = call.reply.send(Err(anyhow!(Unavailable { state: self.state.clone(), sent: false }))); }
+                        Some(call) => { let _ = call.reply.send(Err(self.unavailable(false))); }
                         None => break,
                     }
                 }
@@ -816,15 +934,7 @@ impl Actor {
                     if call.reply.is_closed() {
                         continue;
                     }
-                    let timeout = match &call.body {
-                        Request::Exec { timeout_ms, .. } => {
-                            Duration::from_millis(u64::from(*timeout_ms)) + deadline()
-                        }
-                        Request::Changes { wait_ms, .. } => {
-                            Duration::from_millis(u64::from(*wait_ms)) + deadline()
-                        }
-                        _ => deadline(),
-                    };
+                    let timeout = reply_deadline(&call.body);
                     let remaining = pending
                         .values()
                         .map(|call| call.deadline.saturating_sub(self.clock.monotonic()))
@@ -892,18 +1002,12 @@ impl Actor {
                 }
                 for (_, call) in std::mem::take(&mut pending) {
                     if let Reply::Call(reply) = call.reply {
-                        let _ = reply.send(Err(anyhow!(Unavailable {
-                            state: self.state.clone(),
-                            sent: true
-                        })));
+                        let _ = reply.send(Err(self.unavailable(true)));
                     }
                 }
                 for queue in &mut queues {
                     for call in queue.drain(..) {
-                        let _ = call.reply.send(Err(anyhow!(Unavailable {
-                            state: self.state.clone(),
-                            sent: false
-                        })));
+                        let _ = call.reply.send(Err(self.unavailable(false)));
                     }
                 }
             }
@@ -960,8 +1064,17 @@ impl Actor {
                             let _ = action.reply.send(Err(anyhow!("Host requires Connect")));
                         }
                     }
+                    // A Connect pressed during an automatic attempt approves only the current route.
+                    let unapproved = !approve_route
+                        && result.is_ok()
+                        && queued_action
+                            .as_ref()
+                            .is_some_and(|action| !action.key_only)
+                        && ssh::route(&self.config).await.ok().as_ref()
+                            != self.auth.state.borrow().route.as_ref();
                     if queued_action.is_some()
                         && (result.is_err()
+                            || unapproved
                             || cfg!(unix)
                                 && !keep_master
                                 && queued_action
@@ -1004,10 +1117,7 @@ impl Actor {
                         }
                         for queue in &mut queues {
                             for call in queue.drain(..) {
-                                let _ = call.reply.send(Err(anyhow!(Unavailable {
-                                    state: self.state.clone(),
-                                    sent: false
-                                })));
+                                let _ = call.reply.send(Err(self.unavailable(false)));
                             }
                         }
                     }

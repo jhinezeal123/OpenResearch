@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use super::{CreateExperimentSpec, DescInput, ProjectEdit, Run, RunListing};
-use crate::error::{anyhow, Result};
+use crate::error::{anyhow, Context, Result};
 use crate::local::model::{LocalExperiment, LocalProject};
 use crate::store::Store;
 use crate::ExpRunArgs;
@@ -178,8 +178,14 @@ impl LocalPlane {
                     crate::output::format_duration(run.duration_secs),
                     run.updated_display
                 );
-                if let Some(detail) = run.contact_detail() {
+                for detail in [run.waiting_detail(), run.contact_detail()]
+                    .into_iter()
+                    .flatten()
+                {
                     println!("  {detail}");
+                }
+                if let Some(next) = run.next_step() {
+                    println!("  {next}");
                 }
                 let launch = state.and_then(|state| state.launch);
                 let backend = crate::store::public_backend(&r.backend_json, launch.as_ref())
@@ -230,8 +236,13 @@ impl LocalPlane {
                 || run.cancel_unconfirmed.is_some()
             {
                 println!("  run {}: {}", run.id, run.display_status());
-            } else if let Some(detail) = run.contact_detail() {
-                println!("  run {}: {detail}", run.id);
+            } else {
+                for detail in [run.waiting_detail(), run.contact_detail(), run.next_step()]
+                    .into_iter()
+                    .flatten()
+                {
+                    println!("  run {}: {detail}", run.id);
+                }
             }
         }
         Ok(())
@@ -264,8 +275,8 @@ impl LocalPlane {
         crate::local::apply_compute_default(&mut args.backend, &mut args.flavor);
         let backend = args.backend.get_or_insert_with(|| "local".into()).clone();
         crate::compute::validate_run_args(&args)?;
-        warn_unreachable_trackio(&backend);
         let experiment = self.experiment()?;
+        warn_unreachable_trackio(&self.store, &experiment.project_id, &backend)?;
         if let Some(warning) = self
             .store
             .get_local_project(&experiment.project_id)?
@@ -331,9 +342,11 @@ impl LocalPlane {
         let parent_exp = match &parent {
             Some(parent_id) => Some(store.get_local_experiment(parent_id)?.ok_or_else(|| {
                 anyhow!(
-                    "Parent experiment {} not found in the local store. \
+                    "Parent experiment {} was not found in the orx store at {}. \
                      Choose an existing local experiment from `orx project view {}`, or omit --parent to branch off the project root.",
-                    parent_id, project.id
+                    parent_id,
+                    store.data_dir().display(),
+                    project.id
                 )
             })?),
             None if baseline => None,
@@ -423,12 +436,14 @@ fn project_wait_progress(total: usize, in_flight: usize) {
     }
 }
 
-fn warn_unreachable_trackio(backend: &str) {
+fn warn_unreachable_trackio(store: &Store, project_id: &str, backend: &str) -> Result<()> {
     use crate::local::trackio::{self, Target};
     if !crate::compute::backend(backend).is_ok_and(|b| b.capabilities().remote) {
-        return;
+        return Ok(());
     }
-    match trackio::target() {
+    let saved = crate::config::saved_project_env(store, project_id)
+        .with_context(|| format!("Couldn't read project {project_id}'s Trackio settings."))?;
+    match trackio::target(&saved) {
         Target::Server(url) if trackio::is_local_only(&url) => eprintln!(
             "warning: {} is {url}, which a {backend} run may not reach, so its Trackio metrics may not arrive. Save an address the remote machine can reach.",
             trackio::SERVER_URL
@@ -441,6 +456,7 @@ fn warn_unreachable_trackio(backend: &str) {
         ),
         _ => {}
     }
+    Ok(())
 }
 
 /// True when `error` is a transient SQLite lock ("database is locked") —
@@ -608,6 +624,14 @@ impl ApiClient {
         args.chat_session_id = args.launching_chat_session();
         args.agent_origin = crate::agent_origin();
         args.caller_config_dir = Some(crate::commands::up::absolute_config_dir());
+        args.caller_python_overrides = crate::jobs::caller_python_overrides();
+        args.caller_compute_settings = Some(
+            crate::commands::up::launch_settings(&args)
+                .await?
+                .filter(|(_, set)| *set)
+                .map(|(settings, _)| settings)
+                .unwrap_or_default(),
+        );
         args.invocation_context = args
             .invocation_identity()?
             .map(|identity| serde_json::to_string(&identity))
@@ -637,14 +661,8 @@ impl ApiClient {
     }
 
     pub async fn abandon(&self, run: &str) -> Result<()> {
-        let path = format!("runs/{}", urlencoding::encode(run));
-        let response = self.json(reqwest::Method::GET, &path, None).await?;
-        if response["contact"]["type"] == "unreachable" {
-            eprint!("{} ", super::LABELS["run_abandon_unreachable"]);
-        }
-        eprintln!("{}", super::LABELS["run_abandon_body"]);
-        self.json(reqwest::Method::POST, &format!("{path}/abandon"), None)
-            .await?;
+        let path = format!("runs/{}/abandon", urlencoding::encode(run));
+        self.json(reqwest::Method::POST, &path, None).await?;
         println!("Run {run} abandoned; its cancel stays pending until the job is confirmed gone.");
         Ok(())
     }
@@ -697,13 +715,24 @@ impl ApiClient {
             let request = serde_json::json!({
                 "chatSessionId": crate::local::chat::launching_chat_session(),
             });
-            self.json(
-                reqwest::Method::POST,
-                &format!("runs/{}/cancel", urlencoding::encode(id)),
-                Some(&request),
-            )
-            .await?;
-            println!("\u{2713} Cancel requested for run {id}.");
+            let run: Run = serde_json::from_value(
+                self.json(
+                    reqwest::Method::POST,
+                    &format!("runs/{}/cancel", urlencoding::encode(id)),
+                    Some(&request),
+                )
+                .await?,
+            )?;
+            println!(
+                "\u{2713} Cancel requested for run {id}: {}.",
+                run.display_status()
+            );
+            for line in [run.contact_detail(), run.failure_detail(), run.next_step()]
+                .into_iter()
+                .flatten()
+            {
+                println!("  {line}");
+            }
         }
         Ok(())
     }
@@ -784,7 +813,7 @@ impl ApiClient {
                 }
                 if filter.project.is_none() {
                     let status = run.display_status();
-                    let progress = match run.contact_detail() {
+                    let progress = match run.wait_detail() {
                         Some(detail) => format!("{status}: {detail}"),
                         None => status.into_owned(),
                     };
@@ -866,7 +895,17 @@ impl ApiClient {
     }
 
     pub async fn logs(&self, id: &str, follow: bool) -> Result<()> {
-        self.logs_to(id, follow, &mut std::io::stdout()).await
+        let result = self.logs_to(id, follow, &mut std::io::stdout()).await;
+        // Of this call's I/O, only writing stdout can break a pipe.
+        if let Err(error) = &result {
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe)
+            {
+                crate::output::stdout_closed();
+            }
+        }
+        result
     }
 
     pub(crate) async fn logs_to(

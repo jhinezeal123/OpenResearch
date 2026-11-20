@@ -37,7 +37,15 @@ pub async fn run(args: crate::ExpArgs) -> Result<()> {
     {
         return wait(exp_id, project, timeout, interval).await;
     }
-    let mut store = Store::open()?;
+    let mut store = match &args.command {
+        ExpCommand::Status { .. }
+        | ExpCommand::Desc {
+            set: None,
+            stdin: false,
+            ..
+        } => Store::open_for_reading()?,
+        _ => Store::open()?,
+    };
     match args.command {
         ExpCommand::Archive {
             exp_id,
@@ -208,7 +216,7 @@ async fn wait(
         (Some(exp_id), None) => {
             let plane = crate::plane::local_plane::retry_on_db_lock(
                 || {
-                    let store = Store::open_with_busy_timeout(
+                    let store = Store::open_for_reading_within(
                         crate::plane::local_plane::busy_timeout_left(deadline),
                     )?;
                     resolve_experiment(store, &exp_id)
@@ -222,7 +230,7 @@ async fn wait(
         (None, Some(project_id)) => {
             let plane = crate::plane::local_plane::retry_on_db_lock(
                 || {
-                    let store = Store::open_with_busy_timeout(
+                    let store = Store::open_for_reading_within(
                         crate::plane::local_plane::busy_timeout_left(deadline),
                     )?;
                     resolve_project(store, &project_id)
@@ -234,142 +242,6 @@ async fn wait(
             plane.wait(deadline).await
         }
     }
-}
-
-const SUPERVISOR_LOG_MAX_BYTES: u64 = 1024 * 1024;
-
-pub(crate) fn spawn_detached_supervise(run_id: &str) -> Result<()> {
-    let exe = crate::paths::spawnable_exe().map_err(|e| {
-        anyhow!(
-            "Could not locate the orx binary to spawn the supervisor: {}",
-            e
-        )
-    })?;
-    // Supervisor diagnostics (retries, transitions) exist only on stderr; keep them per run.
-    let path =
-        crate::store::log_path(&crate::store::data_dir(), run_id).with_extension("supervisor.log");
-    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() >= SUPERVISOR_LOG_MAX_BYTES) {
-        // Rename rather than truncate: a still-running supervisor keeps writing to its handle.
-        let _ = std::fs::rename(&path, path.with_extension("log.1"));
-    }
-    let mut child = match supervise_command(&exe, run_id, &path).spawn() {
-        // `/proc/self/exe` can name a path this process cannot exec (OR-334); the `orx` on PATH still runs.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match crate::local::shell_env::find("orx").filter(|orx| *orx != exe) {
-                Some(orx) => {
-                    let tried = format!("`{}`{}: {error}", exe.display(), current_exe_note(&exe));
-                    let child = supervise_command(&orx, run_id, &path)
-                        .spawn()
-                        .map_err(|e| {
-                            anyhow!(
-                                "{} First tried {tried}.",
-                                supervise_spawn_error(&orx, run_id, e)
-                            )
-                        })?;
-                    let warning = format!(
-                        "warning: could not run {tried}; started the supervisor with `{}`.",
-                        orx.display()
-                    );
-                    eprintln!("{warning}");
-                    // A forwarded launch prints this on `orx up`'s stderr; keep it beside the run too.
-                    if let Ok(mut log) = std::fs::OpenOptions::new().append(true).open(&path) {
-                        use std::io::Write as _;
-                        let _ = log.write_all(format!("{warning}\n").as_bytes());
-                    }
-                    child
-                }
-                None => return Err(supervise_spawn_error(&exe, run_id, error)),
-            }
-        }
-        result => result.map_err(|e| supervise_spawn_error(&exe, run_id, e))?,
-    };
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
-}
-
-fn supervise_command(
-    exe: &std::path::Path,
-    run_id: &str,
-    log_path: &std::path::Path,
-) -> std::process::Command {
-    let stderr = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .map_or_else(|_| std::process::Stdio::null(), std::process::Stdio::from);
-    // A long-lived `orx up` may be running a replaced binary; spawn the new file at its path.
-    let mut cmd = crate::process::command(exe);
-    cmd.arg("supervise")
-        .arg(run_id)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(stderr);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    // A console-less parent would otherwise give the supervisor a visible console window.
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-        // A launch from Git Bash otherwise hands its MSYS ssh.exe to native
-        // Rust/Python children. MSYS parses quoted -o/ProxyCommand arguments
-        // differently from CreateProcess, swallowing subsequent SSH options.
-        // Keep all Windows compute supervisors on the native OpenSSH client.
-        if let Some(ssh_dir) = std::env::var_os("SystemRoot")
-            .map(std::path::PathBuf::from)
-            .map(|root| root.join("System32/OpenSSH"))
-            .filter(|dir| dir.join("ssh.exe").is_file())
-        {
-            let current = cmd
-                .get_envs()
-                .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
-                .and_then(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
-                .or_else(crate::local::shell_env::search_path);
-            let mut path = ssh_dir.into_os_string();
-            path.push(";");
-            if let Some(current) = current {
-                path.push(current);
-            }
-            cmd.env("PATH", path);
-        }
-    }
-    cmd
-}
-
-fn supervise_spawn_error(
-    exe: &std::path::Path,
-    run_id: &str,
-    error: std::io::Error,
-) -> crate::error::Error {
-    let missing = if exe.exists() {
-        ""
-    } else {
-        " (no file at that path)"
-    };
-    let current = if crate::paths::spawnable_exe().is_ok_and(|own| own == exe) {
-        current_exe_note(exe)
-    } else {
-        String::new()
-    };
-    anyhow!(
-        "Could not spawn `{} supervise {run_id}`{missing}{current}: {error}. A running `orx up` retries \
-         within about 6 minutes; otherwise start `{} supervise {run_id}` in the background.",
-        exe.display(),
-        crate::invocation::orx(),
-    )
-}
-
-fn current_exe_note(exe: &std::path::Path) -> String {
-    std::env::current_exe()
-        .ok()
-        .filter(|raw| raw != exe)
-        .map(|raw| format!(" (current_exe: {})", raw.display()))
-        .unwrap_or_default()
 }
 
 // --- job-launch helpers shared with the src/local/* backends -----------------
@@ -413,49 +285,18 @@ fn request_legacy_run_cancel_at(
         .open(lock_path)?;
     let mut cancel_lock = fd_lock::RwLock::new(lock_file);
     let _cancel_guard = cancel_lock.write()?;
-    store
-        .get_run(run_id)?
-        .ok_or_else(|| anyhow!("Run {run_id} not found in the local store."))?;
+    store.get_run(run_id)?.ok_or_else(|| {
+        anyhow!(
+            "Run {run_id} was not found in the orx store at {}.",
+            store.data_dir().display()
+        )
+    })?;
     store.request_cancel(run_id, reason)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    #[cfg(windows)]
-    #[test]
-    fn supervisor_uses_native_ssh_despite_a_git_bash_launch_path() {
-        let Some(ssh_dir) = std::env::var_os("SystemRoot")
-            .map(std::path::PathBuf::from)
-            .map(|root| root.join("System32/OpenSSH"))
-            .filter(|dir| dir.join("ssh.exe").is_file())
-        else {
-            return;
-        };
-        let log = std::env::temp_dir().join(format!("orx-native-ssh-{}.log", uuid::Uuid::new_v4()));
-        let command = supervise_command(std::path::Path::new("orx.exe"), "run-qa", &log);
-        let path = command
-            .get_envs()
-            .find(|(key, _)| *key == "PATH")
-            .and_then(|(_, value)| value)
-            .expect("supervisor PATH");
-        assert_eq!(std::env::split_paths(path).next().unwrap(), ssh_dir);
-        drop(command);
-        let _ = std::fs::remove_file(log);
-    }
-
-    #[test]
-    fn supervise_spawn_error_names_the_binary_and_the_manual_attach() {
-        let message = supervise_spawn_error(
-            std::path::Path::new("/nonexistent/orx"),
-            "run-1",
-            std::io::Error::from(std::io::ErrorKind::NotFound),
-        )
-        .to_string();
-        assert!(message.contains("`/nonexistent/orx supervise run-1` (no file at that path)"));
-        assert!(message.ends_with(" supervise run-1` in the background."));
-    }
-
     #[tokio::test]
     async fn wait_validates_both_and_neither_targets_before_opening_the_store() {
         assert!(

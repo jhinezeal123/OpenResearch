@@ -12,11 +12,13 @@ export type RunDisplayStatus =
   | "unconfirmed"
   | "abandoned";
 
-type RunState = Pick<Run, "status"> & Partial<Pick<Run, "contact" | "cancelling" | "lostReason" | "host" | "cancelUnconfirmed" | "queueDetail">> & { cancelRequested?: boolean };
+type RunState = Pick<Run, "status"> & Partial<Pick<Run, "contact" | "cancelling" | "lostReason" | "host" | "cancelUnconfirmed" | "queueDetail" | "waitingReason" | "cancelError">> & { cancelRequested?: boolean };
 
 export interface RunDisplay {
   status: RunDisplayStatus;
   stopping?: { count: number; host: string };
+  /** Why the run hasn't started, in the backend's words. */
+  waiting?: string;
   /** The status is what was last seen, not live knowledge. */
   stale: boolean;
   /** When contact was lost, for the "when last seen" tooltip. */
@@ -29,8 +31,9 @@ export type RunNotice =
   | { kind: "needs_auth"; host: string | null; since: number; cause: string }
   | { kind: "unconfirmed_launch"; detail: string }
   | { kind: "cancel_pending"; host: string | null; since: number; contact: "unreachable" | "needs_auth" }
-  | { kind: "cancel_pending_launch" }
+  | { kind: "cancel_pending_launch"; detail: string | null }
   | { kind: "cancel_unconfirmed"; detail: string }
+  | { kind: "cancel_refused"; detail: string }
   | { kind: "abandoned"; host: string | null }
   | { kind: "cancelling" }
   | { kind: "cancelled_unconfirmed"; unreadable: number[] }
@@ -76,10 +79,15 @@ export function runDisplay(run: RunState): RunDisplay {
     return { status: runAbandoned(run) ? "abandoned" : run.status, stale: contact !== null, since };
   }
   if (runCancelling(run)) {
-    const pending = run.status === "submitting" || contact?.type === "unreachable" || contact?.type === "needs_auth";
+    const pending = run.status === "submitting" || Boolean(run.cancelError) || contact?.type === "unreachable" || contact?.type === "needs_auth" || contact?.type === "unreconciled";
     return { status: pending ? "cancellation_pending" : "cancelling", stale: contact !== null, since };
   }
-  if (contact === null) return { status: run.status === "starting" && run.queueDetail ? "queued" : run.status, stale: false, since };
+  if (contact === null) return {
+    status: run.status === "starting" && run.queueDetail ? "queued" : run.status,
+    ...(run.waitingReason ? { waiting: run.waitingReason } : {}),
+    stale: false,
+    since,
+  };
 
   if (contact.type === "needs_auth") return { status: "needs_auth", stale: true, since };
   const status = contact.type === "unreconciled" || contact.type === "stopping" ? "unconfirmed" : contact.type;
@@ -89,7 +97,7 @@ export function runDisplay(run: RunState): RunDisplay {
 /** What the run detail strip says about a run, or null when there is nothing to add. */
 type CollectionFields = Partial<Pick<Run, "logCollection" | "logCollectionError" | "noticeError">>;
 
-export function runNotice(run: Pick<Run, "status" | "backend"> & Partial<Pick<Run, "contact" | "cancelling" | "lostReason" | "host" | "cancelUnconfirmed" | "queueDetail">> & CollectionFields): RunNotice | null {
+export function runNotice(run: Pick<Run, "status" | "backend"> & Partial<Pick<Run, "contact" | "cancelling" | "lostReason" | "host" | "cancelUnconfirmed" | "queueDetail" | "waitingReason" | "cancelError">> & CollectionFields): RunNotice | null {
   const contact: RunContact | null = run.contact ?? null;
   const host = run.host ?? null;
 
@@ -103,10 +111,11 @@ export function runNotice(run: Pick<Run, "status" | "backend"> & Partial<Pick<Ru
       if (run.logCollection === "failed") return { kind: "log_failed", host, cause: run.logCollectionError ?? null };
       return run.noticeError ? { kind: "notice_failed", error: run.noticeError } : null;
     }
-    if (runCancelling(run)) return { kind: run.status === "submitting" ? "cancel_pending_launch" : "cancelling" };
+    if (runCancelling(run) && run.cancelError) return { kind: "cancel_refused", detail: run.cancelError };
+    if (runCancelling(run)) return run.status === "submitting" ? { kind: "cancel_pending_launch", detail: null } : { kind: "cancelling" };
     const error = run.backend?.monitoringError;
     if (typeof error === "string" && error) return { kind: "monitoring", error };
-    return run.status === "starting" && run.queueDetail ? { kind: "queued", detail: run.queueDetail } : null;
+    return run.status === "starting" && run.queueDetail && !run.waitingReason ? { kind: "queued", detail: run.queueDetail } : null;
   }
   if (contact.type === "stopping") return null;
   if (!runActive(run.status)) {
@@ -119,7 +128,7 @@ export function runNotice(run: Pick<Run, "status" | "backend"> & Partial<Pick<Ru
   if (runCancelling(run)) {
     if (contact.type !== "unreconciled") return { kind: "cancel_pending", host, since: contact.since, contact: contact.type };
     return submitting
-      ? { kind: "cancel_pending_launch" }
+      ? { kind: "cancel_pending_launch", detail: contact.detail }
       : { kind: "cancel_unconfirmed", detail: contact.detail };
   }
   if (contact.type === "unreconciled") {
@@ -147,7 +156,12 @@ export function runConnectHost(run: Pick<Run, "host"> & Partial<Pick<Run, "conta
   return run.contact?.type === "needs_auth" && !runApiProvider(run) ? run.host : null;
 }
 
-/** Abandon is the way out for an active run whose outcome we cannot observe. */
-export function runAbandonable(run: Pick<Run, "status"> & Partial<Pick<Run, "contact">>): boolean {
-  return runActive(run.status) && Boolean(run.contact);
+/** Stop is offered until a cancel is pending; the status badge carries it from then on. */
+export function runStoppable(run: RunState): boolean {
+  return runActive(run.status) && !runCancelling(run);
+}
+
+/** Abandon is the way out for an active run whose outcome we cannot observe or whose stop keeps failing. */
+export function runAbandonable(run: Pick<Run, "status"> & Partial<Pick<Run, "contact" | "cancelError">>): boolean {
+  return runActive(run.status) && (Boolean(run.contact) || Boolean(run.cancelError));
 }

@@ -9,9 +9,12 @@ export function setupAction(h: Pick<Harness, "installed" | "installBroken" | "au
   return h.authState === "unsupported" && !h.needsConfigRepair ? "update" : "login";
 }
 
-/** No command fixes needsConfigRepair, so none may auto-start: open on the note. */
-export function initialPhase(h: Pick<Harness, "needsConfigRepair">, action: SetupAction): SetupPhase {
-  return h.needsConfigRepair ? "error" : action === "login" ? "running" : "preview";
+/** No command fixes needsConfigRepair, so none may auto-start: open on the note. A sign-in,
+ * and a copy OpenResearch downloads itself start at once;
+ * anything else changes the user's own system, so it asks first. */
+export function initialPhase(h: Pick<Harness, "needsConfigRepair">, action: SetupAction, managed = false): SetupPhase {
+  if (h.needsConfigRepair) return "error";
+  return action === "login" || (action === "install" && managed) ? "running" : "preview";
 }
 
 /** Retry's action, re-derived after a re-check since `action` is fixed at mount.

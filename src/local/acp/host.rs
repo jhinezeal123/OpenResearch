@@ -1,16 +1,21 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use agent_client_protocol::schema::{v1::RequestPermissionRequest, ProtocolVersion};
-use agent_client_protocol::{Agent, ByteStreams, ConnectionTo, Responder, UntypedMessage};
+use agent_client_protocol::{Agent, ConnectionTo, Responder, UntypedMessage};
+use futures::{future, AsyncBufReadExt, StreamExt};
 use serde_json::{json, Value};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use super::{Definition, OwnedProcess};
 use crate::error::{anyhow, bail, Result};
+
+const MAX_OUTPUT_TAIL_BYTES: usize = 8192;
 
 pub enum Event {
     Update(Value),
@@ -21,6 +26,7 @@ pub enum Event {
 struct Permission {
     responder: Responder,
     options: Vec<String>,
+    auto_option: Option<String>,
 }
 
 #[derive(Default)]
@@ -28,6 +34,7 @@ struct SessionIo {
     native_id: Mutex<Option<String>>,
     events: Mutex<Option<mpsc::UnboundedSender<Event>>>,
     permissions: Mutex<HashMap<String, Permission>>,
+    one_shot: std::sync::atomic::AtomicBool,
 }
 
 impl SessionIo {
@@ -58,13 +65,21 @@ impl SessionIo {
 
 pub struct Client {
     alphaxiv_signed_in: bool,
+    launch: Definition,
     configuration_lock: tokio::sync::Mutex<()>,
     pub connection: ConnectionTo<Agent>,
     pub initialized: Value,
     io: Arc<SessionIo>,
-    stop: Mutex<Option<oneshot::Sender<()>>>,
-    closed: tokio::sync::watch::Receiver<bool>,
+    stop: Mutex<Option<oneshot::Sender<Stop>>>,
+    closed: tokio::sync::watch::Receiver<Option<String>>,
     idle_since: Mutex<Option<Instant>>,
+    delegated: Arc<super::delegated::Delegated>,
+    pid: Option<u32>,
+}
+
+pub(crate) enum Stop {
+    Shutdown(bool),
+    Failure(String),
 }
 
 struct ConfigurationActivity<'a> {
@@ -82,6 +97,28 @@ impl Drop for ConfigurationActivity<'_> {
 }
 
 impl Client {
+    pub fn approve_pending(&self) -> Result<Vec<(String, String)>> {
+        let mut permissions = self.io.permissions.lock().unwrap();
+        let approved: Vec<_> = permissions
+            .iter()
+            .filter_map(|(id, pending)| {
+                pending
+                    .auto_option
+                    .as_ref()
+                    .map(|option| (id.clone(), option.clone()))
+            })
+            .collect();
+        for (id, selected) in &approved {
+            let pending = permissions
+                .remove(id)
+                .expect("permission held under the same lock");
+            pending
+                .responder
+                .respond(json!({"outcome": {"outcome": "selected", "optionId": selected}}))?;
+        }
+        Ok(approved)
+    }
+
     pub async fn configure(&self, session_id: &str, option_id: &str, value: &str) -> Result<()> {
         let _lock = self.configuration_lock.lock().await;
         let _activity = ConfigurationActivity {
@@ -242,11 +279,64 @@ impl Client {
                 LoadSessionRequest::new(native_id.to_owned(), cwd).mcp_servers(mcp_servers),
             )?
         };
-        self.request(method, params).await
+        let error = match self.request(method, params).await {
+            Ok(response) => return Ok(response),
+            Err(error) => error,
+        };
+        let not_found = error
+            .downcast_ref::<agent_client_protocol::Error>()
+            .is_some_and(|error| error.code == agent_client_protocol::ErrorCode::ResourceNotFound);
+        if not_found || !self.lists_without(native_id).await {
+            return Err(error);
+        }
+        let mut missing = agent_client_protocol::Error::resource_not_found(None);
+        missing.message = format!("The agent no longer has session {native_id}: {error}");
+        Err(missing.into())
+    }
+
+    /// Whether the agent's own session list leaves out `native_id`. Some agents answer restoring a
+    /// session they no longer have with a generic error instead of `ResourceNotFound`.
+    async fn lists_without(&self, native_id: &str) -> bool {
+        if !self.initialized["agentCapabilities"]["sessionCapabilities"]["list"].is_object() {
+            return false;
+        }
+        let mut cursor: Option<String> = None;
+        for _ in 0..100 {
+            let params = match &cursor {
+                Some(cursor) => json!({"cursor": cursor}),
+                None => json!({}),
+            };
+            let Ok(page) = self.request("session/list", params).await else {
+                return false;
+            };
+            let Some(sessions) = page["sessions"].as_array() else {
+                return false;
+            };
+            if sessions
+                .iter()
+                .any(|session| session["sessionId"] == native_id)
+            {
+                return false;
+            }
+            match page["nextCursor"].as_str() {
+                Some(next) => cursor = Some(next.to_owned()),
+                None => return true,
+            }
+        }
+        false
     }
 
     pub fn awaiting_permission(&self) -> bool {
         !self.io.permissions.lock().unwrap().is_empty()
+    }
+
+    /// A tool call the agent reports running proves nothing once its turn ends
+    /// (agy never closes an async one), so this asks the processes instead.
+    fn running_a_command(&self) -> bool {
+        self.delegated.running_a_terminal()
+            || self
+                .pid
+                .is_some_and(crate::local::chat::runs_a_detached_command)
     }
 
     pub fn native_id(&self) -> Option<String> {
@@ -255,6 +345,17 @@ impl Client {
 
     pub fn set_native_id(&self, id: &str) {
         *self.io.native_id.lock().unwrap() = Some(id.to_owned());
+    }
+
+    /// A throwaway one-shot session: no delegated tools, and no stored chat session to update.
+    pub fn mark_one_shot(&self) {
+        self.io
+            .one_shot
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn cancel_permissions(&self) {
+        self.io.cancel_permissions();
     }
 
     pub fn begin_turn(&self) -> mpsc::UnboundedReceiver<Event> {
@@ -289,16 +390,46 @@ impl Client {
             .connection
             .send_request(UntypedMessage::new(method, params)?)
             .block_task();
-        if method == "session/prompt" {
-            return Ok(request.await?);
+        let result = if method == "session/prompt" {
+            request.await
+        } else {
+            match tokio::time::timeout(timeout, request).await {
+                Ok(response) => response,
+                Err(_) => {
+                    let reason = self
+                        .end(Stop::Failure(format!(
+                            "{method} timed out after {} seconds",
+                            timeout.as_secs()
+                        )))
+                        .await;
+                    return Err(anyhow!(reason));
+                }
+            }
+        };
+        match result {
+            Err(error) => {
+                let stopping =
+                    self.closed.borrow().is_some() || self.stop.lock().unwrap().is_none();
+                if stopping || agent_client_protocol::is_incoming_transport_closed(&error) {
+                    let message = self.connection_error().await.to_string();
+                    Err(anyhow!(error).context(message))
+                } else {
+                    Err(error.into())
+                }
+            }
+            Ok(response) => Ok(response),
         }
-        match tokio::time::timeout(timeout, request).await {
-            Ok(response) => Ok(response?),
-            Err(_) => {
-                self.shutdown().await;
-                bail!(
-                    "ACP {method} timed out. Check the agent's connection and send a new message."
-                )
+    }
+
+    pub(crate) async fn connection_error(&self) -> crate::error::Error {
+        match closed_reason(self.closed.clone()).await {
+            Ok(message) => anyhow!(message),
+            Err(error) => {
+                eprintln!("orx up: could not stop {}: {error:#}", self.launch.name);
+                error.context(format!(
+                    "{} closed its connection before diagnostics were available",
+                    self.launch.name
+                ))
             }
         }
     }
@@ -320,7 +451,8 @@ impl Client {
         Ok(())
     }
 
-    pub async fn shutdown(&self) {
+    /// Asks the agent to stop the session's running prompt.
+    pub fn cancel(&self) {
         self.io.cancel_permissions();
         if let Some(native_id) = self.native_id() {
             if let Ok(notification) =
@@ -329,15 +461,39 @@ impl Client {
                 let _ = self.connection.send_notification(notification);
             }
         }
-        if let Some(stop) = self.stop.lock().unwrap().take() {
-            let _ = stop.send(());
+    }
+
+    pub async fn shutdown(&self) {
+        self.end(Stop::Shutdown(false)).await;
+    }
+
+    pub(crate) async fn end(&self, stop: Stop) -> String {
+        self.cancel();
+        if let Some(sender) = self.stop.lock().unwrap().take() {
+            let _ = sender.send(stop);
         }
-        let mut closed = self.closed.clone();
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            closed.wait_for(|closed| *closed),
-        )
-        .await;
+        self.connection_error().await.to_string()
+    }
+}
+
+async fn closed_reason(mut closed: tokio::sync::watch::Receiver<Option<String>>) -> Result<String> {
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while closed.changed().await.is_ok() {}
+    })
+    .await
+    .is_ok();
+    let reason = closed
+        .borrow()
+        .clone()
+        .ok_or_else(|| anyhow!("The ACP process ended without reporting why"))?;
+    if completed {
+        Ok(reason)
+    } else {
+        let message = format!(
+            "{reason} Cleanup did not finish within 15 seconds; the agent may still be stopping."
+        );
+        eprintln!("orx up: {message}");
+        Ok(message)
     }
 }
 
@@ -348,7 +504,7 @@ impl Drop for Client {
     }
 }
 
-fn select_has_value(option: &Value, value: &str) -> bool {
+pub(super) fn select_has_value(option: &Value, value: &str) -> bool {
     option["type"] == "select"
         && option["options"]
             .as_array()
@@ -402,7 +558,9 @@ impl Host {
             .clone();
         let mut saved = slot.lock().await;
         if let Some(client) = saved.as_ref().filter(|client| {
-            !*client.closed.borrow() && client.alphaxiv_signed_in == crate::alphaxiv::signed_in()
+            client.closed.borrow().is_none()
+                && client.alphaxiv_signed_in == crate::alphaxiv::signed_in()
+                && client.launch == *definition
         }) {
             *client.idle_since.lock().unwrap() = None;
             return Ok(client.clone());
@@ -436,7 +594,7 @@ impl Host {
             .await
             .as_ref()
             .cloned()
-            .filter(|client| !*client.closed.borrow())
+            .filter(|client| client.closed.borrow().is_none())
             .ok_or_else(|| anyhow!("The ACP connection has ended"))?;
         Ok(client)
     }
@@ -460,9 +618,10 @@ impl Host {
         self.clients.lock().unwrap().retain(|_, slot| {
             Arc::strong_count(slot) > 1
                 || slot.try_lock().map_or(true, |saved| {
+                    // Kept until cleanup ends, so the chat cannot relaunch beside a stopping agent.
                     saved
                         .as_ref()
-                        .is_some_and(|client| !*client.closed.borrow())
+                        .is_some_and(|client| client.closed.has_changed().is_ok())
                 })
         });
     }
@@ -474,6 +633,7 @@ impl Host {
                 client.shutdown().await;
             }
         }
+        super::stop_one_shots().await;
     }
 
     fn start_reaper(self: &Arc<Self>) {
@@ -490,41 +650,53 @@ impl Host {
                 let Some(host) = weak.upgrade() else {
                     break;
                 };
-                host.prune_slots();
-                let policy = crate::local::agent_lifecycle::IdlePolicy::current();
-                let slots: Vec<_> = host.clients.lock().unwrap().values().cloned().collect();
-                let mut idle = Vec::new();
-                for slot in slots {
-                    if let Ok(saved) = slot.try_lock() {
-                        if let Some(client) = saved.as_ref() {
-                            if let Some(since) = *client.idle_since.lock().unwrap() {
-                                idle.push((slot.clone(), since.elapsed()));
-                            }
-                        }
-                    }
-                }
-                let over_limit =
-                    policy.over_limit(&idle.iter().map(|(_, age)| *age).collect::<Vec<_>>());
-                for (index, (slot, age)) in idle.into_iter().enumerate() {
-                    if age < policy.idle_timeout && !over_limit.contains(&index) {
-                        continue;
-                    }
-                    if let Ok(mut saved) = slot.try_lock() {
-                        let idle = saved.as_ref().is_some_and(|client| {
-                            client.idle_since.lock().unwrap().is_some()
-                                && !client.awaiting_permission()
-                        });
-                        if idle {
-                            if let Some(client) = saved.take() {
-                                client.shutdown().await;
-                            }
-                        }
-                    }
-                }
+                host.reap_idle_at(
+                    Instant::now(),
+                    crate::local::agent_lifecycle::IdlePolicy::current(),
+                )
+                .await;
             }
         });
     }
+
+    async fn reap_idle_at(&self, now: Instant, policy: crate::local::agent_lifecycle::IdlePolicy) {
+        self.prune_slots();
+        let slots: Vec<_> = self.clients.lock().unwrap().values().cloned().collect();
+        let mut idle = Vec::new();
+        for slot in slots {
+            if let Ok(saved) = slot.try_lock() {
+                if let Some(client) = saved.as_ref() {
+                    let since = *client.idle_since.lock().unwrap();
+                    if let Some(since) = since.filter(|_| !client.running_a_command()) {
+                        idle.push((slot.clone(), now.saturating_duration_since(since)));
+                    }
+                }
+            }
+        }
+        let over_limit = policy.over_limit(&idle.iter().map(|(_, age)| *age).collect::<Vec<_>>());
+        for (index, (slot, age)) in idle.into_iter().enumerate() {
+            if age < policy.idle_timeout && !over_limit.contains(&index) {
+                continue;
+            }
+            if let Ok(mut saved) = slot.try_lock() {
+                let idle = saved.as_ref().is_some_and(|client| {
+                    client.idle_since.lock().unwrap().is_some()
+                        && !client.awaiting_permission()
+                        && !client.running_a_command()
+                });
+                if idle {
+                    if let Some(client) = saved.take() {
+                        // A dev server the agent started stays the user's.
+                        client.end(Stop::Shutdown(true)).await;
+                    }
+                }
+            }
+        }
+    }
 }
+
+/// How long [`spawn`] waits for an agent to answer `initialize`.
+pub(super) const INITIALIZATION_BOUND: std::time::Duration = super::STARTUP_TIMEOUT;
 
 pub(super) async fn spawn(
     definition: &Definition,
@@ -533,55 +705,106 @@ pub(super) async fn spawn(
     events: Option<tokio::sync::broadcast::Sender<(&'static str, Value)>>,
     up_port: Option<u16>,
 ) -> Result<Arc<Client>> {
-    definition.validate()?;
+    definition.validate_launch()?;
     let executable = super::executable_path(&definition.executable).ok_or_else(|| {
-        anyhow!("Executable not found. Install the agent or check its launch command.")
+        anyhow!(
+            "Executable not found: {}. Install {} or check its launch command.",
+            definition.executable,
+            definition.name
+        )
     })?;
     let zcode = Path::new(&definition.executable)
         .file_stem()
         .is_some_and(|name| name == "zcode-acp-server")
         && definition.arguments.is_empty();
     let mut command = if zcode {
-        let node = super::executable_path("node")
+        let node = crate::local::harness::managed::node()
+            .or_else(|| super::executable_path("node"))
             .ok_or_else(|| anyhow!("ZCode ACP requires Node.js on PATH"))?;
         let mut command = crate::process::tokio_command(node);
         command
             .args(["-e", include_str!("zcode-runtime.cjs")])
-            .arg(executable)
+            .arg(&executable)
             .arg("--orx-launch");
+        crate::local::chat::prepare_env(&mut command);
+        crate::local::harness::managed::environment(&mut command, &executable);
         command
     } else {
-        crate::process::tokio_command(executable)
+        crate::local::harness::managed::command(&executable)
     };
     command
         .args(&definition.arguments)
         .current_dir(cwd)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    crate::local::chat::prepare_env(&mut command);
     if up_port.is_some() {
-        crate::local::chat::set_chat_session_env(&mut command, session_id, &definition.id, up_port);
+        crate::local::chat::set_chat_session_env(
+            &mut command,
+            session_id,
+            &definition.id,
+            up_port,
+        )?;
     }
     #[cfg(unix)]
     command.process_group(0);
     let child = command.spawn().map_err(|error| {
-        anyhow!("Could not start ACP harness. Check its installation and executable path: {error}")
+        anyhow!(
+            "Could not start {} ({}): {error}",
+            definition.name,
+            executable.display()
+        )
     })?;
     let mut process = OwnedProcess {
         id: child.id(),
         child,
     };
-    let transport = ByteStreams::new(
-        process
-            .child
-            .stdin
-            .take()
-            .expect("piped stdin")
-            .compat_write(),
-        process.child.stdout.take().expect("piped stdout").compat(),
-    );
+    let stdin = process.child.stdin.take().expect("piped stdin");
+    let outgoing = futures::sink::unfold(stdin, |mut stdin, line: String| async move {
+        let mut bytes = line.into_bytes();
+        bytes.push(b'\n');
+        stdin.write_all(&bytes).await?;
+        stdin.flush().await?;
+        Ok::<_, std::io::Error>(stdin)
+    });
+    let discarded_stdout = Arc::new(Mutex::new(String::new()));
+    let stdout = process.child.stdout.take().expect("piped stdout").compat();
+    // The SDK answers every line that is not JSON with a parse error, and some agents exit on it.
+    let incoming = futures::io::BufReader::new(stdout)
+        .lines()
+        .map(|line| {
+            line.map(|mut text| {
+                // Windows PowerShell starts a redirected stream with a byte-order mark.
+                if text.starts_with('\u{feff}') {
+                    text.drain(..'\u{feff}'.len_utf8());
+                }
+                text
+            })
+        })
+        .filter_map({
+            let discarded_stdout = discarded_stdout.clone();
+            move |line| {
+                let discarded = match &line {
+                    Ok(text) if text.trim().is_empty() => return future::ready(None),
+                    Ok(text) if serde_json::from_str::<Value>(text).is_err() => text.as_str(),
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        "(a line that is not UTF-8)"
+                    }
+                    _ => return future::ready(Some(line)),
+                };
+                let mut tail = discarded_stdout.lock().unwrap();
+                tail.push_str(discarded);
+                tail.push('\n');
+                let mut start = tail.len().saturating_sub(MAX_OUTPUT_TAIL_BYTES);
+                while !tail.is_char_boundary(start) {
+                    start += 1;
+                }
+                tail.drain(..start);
+                future::ready(None)
+            }
+        });
+    let transport = agent_client_protocol::Lines::new(outgoing, incoming);
     let io = Arc::new(SessionIo::default());
     let mut delegated = super::delegated::Delegated::new(cwd);
     if let Some(port) = up_port {
@@ -606,11 +829,40 @@ pub(super) async fn spawn(
     let (ready_sender, ready_receiver) = oneshot::channel();
     let ready_sender = Arc::new(Mutex::new(Some(ready_sender)));
     let initialized_sender = ready_sender.clone();
-    let (stop_sender, stop_receiver) = oneshot::channel();
-    let (closed_sender, closed_receiver) = tokio::sync::watch::channel(false);
+    let (stop_sender, mut stop_receiver) = oneshot::channel();
+    let (closed_sender, closed_receiver) = tokio::sync::watch::channel(None);
     let task_io = io.clone();
     let initialized_tools = delegated.clone();
+    let client_tools = delegated.clone();
+    let agent_pid = process.id;
+    let launch = definition.clone();
     tokio::spawn(async move {
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::downgrade(&stderr);
+        let mut pipe = process.child.stderr.take().expect("piped stderr");
+        let mut read_stderr = tokio::spawn(async move {
+            let mut buffer = [0; 4096];
+            loop {
+                let count = match pipe.read(&mut buffer).await {
+                    Ok(count) => count,
+                    Err(error) => {
+                        eprintln!(
+                            "orx up: could not read ACP process {agent_pid:?} stderr: {error}"
+                        );
+                        return Err(error);
+                    }
+                };
+                if count == 0 {
+                    return std::io::Result::Ok(());
+                }
+                if let Some(captured) = captured.upgrade() {
+                    let mut tail = captured.lock().unwrap();
+                    tail.extend_from_slice(&buffer[..count]);
+                    let excess = tail.len().saturating_sub(MAX_OUTPUT_TAIL_BYTES);
+                    tail.drain(..excess);
+                }
+            }
+        });
         let run = agent_client_protocol::Client
             .builder()
             .on_receive_notification(
@@ -619,7 +871,9 @@ pub(super) async fn spawn(
                         && notifications.owns(&notification.params)
                     {
                         let update = &notification.params["update"];
-                        if matches!(update["sessionUpdate"].as_str(), Some("config_option_update" | "current_mode_update")) {
+                        // A one-shot session has no stored chat session to update.
+                        let one_shot = notifications.one_shot.load(std::sync::atomic::Ordering::Relaxed);
+                        if !one_shot && matches!(update["sessionUpdate"].as_str(), Some("config_option_update" | "current_mode_update")) {
                             let store = crate::store::Store::open().map_err(|error| agent_client_protocol::Error::internal_error().data(error.to_string()))?;
                             store.apply_acp_configuration_update(&chat_id, update).map_err(|error| agent_client_protocol::Error::internal_error().data(error.to_string()))?;
                             if let (Some(events), Ok(Some(session))) = (&events, store.get_chat_session(&chat_id)) {
@@ -653,6 +907,12 @@ pub(super) async fn spawn(
                         );
                     }
                     if request.method != "session/request_permission" {
+                        if requests.one_shot.load(std::sync::atomic::Ordering::Relaxed) {
+                            return responder.respond_with_error(
+                                agent_client_protocol::Error::invalid_params()
+                                    .data("Tools are disabled for one-shot requests"),
+                            );
+                        }
                         let delegated = request_tools.clone();
                         let terminal_io = requests.clone();
                         connection.spawn(async move {
@@ -683,13 +943,18 @@ pub(super) async fn spawn(
                         Ok(permission) if !permission.options.is_empty() => permission,
                         _ => return responder.respond_with_error(agent_client_protocol::Error::invalid_params().data("Invalid native permission options")),
                     };
+                    // Keep lasting grants and agent mode switches behind a manual decision.
+                    let auto_option = (request.params["toolCall"]["kind"] != "switch_mode")
+                        .then(|| request.params["options"].as_array()?.iter()
+                            .find(|option| option["kind"] == "allow_once")?["optionId"].as_str().map(str::to_owned))
+                        .flatten();
                     let options = permission.options.iter().map(|option| option.option_id.to_string()).collect();
                     let id = uuid::Uuid::new_v4().to_string();
                     requests
                         .permissions
                         .lock()
                         .unwrap()
-                        .insert(id.clone(), Permission { responder, options });
+                        .insert(id.clone(), Permission { responder, options, auto_option });
                     if !requests.emit(Event::Permission {
                         id: id.clone(),
                         request: request.params,
@@ -726,46 +991,175 @@ pub(super) async fn spawn(
                 Ok(())
             });
         tokio::pin!(run);
-        tokio::select! {
-            _ = stop_receiver => {
-                let _ = tokio::time::timeout(std::time::Duration::from_millis(500), &mut run).await;
-            }
-            result = &mut run => {
-                if let Some(sender) = ready_sender.lock().unwrap().take() {
-                    let message = result.err().map(|error| error.to_string()).unwrap_or_else(|| "Agent exited before initialization".into());
-                    let _ = sender.send(Err(message));
+        let run = std::future::poll_fn(|cx| {
+            let mut result = std::task::Poll::Pending;
+            // Publish closure under the same lock readers use before a failed request can escape.
+            closed_sender.send_if_modified(|reason| {
+                result = std::future::Future::poll(run.as_mut(), cx);
+                if result.is_ready() {
+                    *reason = Some(format!("{} closed its connection.", launch.name));
+                    true
+                } else {
+                    false
+                }
+            });
+            result
+        });
+        tokio::pin!(run);
+        let (spare_detached, failure) = tokio::select! {
+            stopped = &mut stop_receiver => {
+                match stopped.unwrap_or(Stop::Shutdown(false)) {
+                    Stop::Shutdown(spare) => {
+                        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), &mut run).await;
+                        (spare, None)
+                    }
+                    Stop::Failure(message) => (false, Some(anyhow!(message))),
                 }
             }
-        }
+            result = &mut run => {
+                let error = match result {
+                    Ok(()) => anyhow!("closed its connection"),
+                    Err(error) if agent_client_protocol::is_incoming_transport_closed(&error) => {
+                        anyhow!(error).context("closed its connection")
+                    }
+                    Err(error) => {
+                        // The SDK nests a cause under `data.data` (a failed task) or `data.error` (a bad reply).
+                        let mut data = error.data.as_ref();
+                        while let Some(Value::Object(fields)) = data {
+                            data = fields.get("data").or_else(|| fields.get("error"));
+                        }
+                        let cause = data.and_then(Value::as_str).unwrap_or(&error.message);
+                        let message = format!("connection failed: {cause}");
+                        anyhow!(error).context(message)
+                    }
+                };
+                (false, Some(error))
+            }
+        };
+        drop(stop_receiver);
+        closed_sender.send_replace(Some(match &failure {
+            Some(error) => format!("{} {error}.", launch.name),
+            None => format!("{} was stopped.", launch.name),
+        }));
         task_io.cancel_permissions();
         task_io.events.lock().unwrap().take();
-        delegated.shutdown().await;
-        crate::local::chat::kill_shell_group(process.id.take());
+        // Windows has no sessions to tell detached commands apart.
+        if spare_detached && cfg!(unix) {
+            crate::local::chat::kill_shell_group(process.id.take());
+        } else {
+            crate::local::chat::kill_agent_tree(process.id.take()).await;
+        }
         let _ = process.child.kill().await;
-        let _ = process.child.wait().await;
-        let _ = closed_sender.send(true);
+        let exit = match process.child.wait().await {
+            Ok(status) => status.to_string(),
+            Err(error) => format!("could not reap the process: {error}"),
+        };
+        delegated.shutdown().await;
+        let stderr_read = if failure.is_none() {
+            None
+        } else {
+            Some(
+                match tokio::time::timeout(std::time::Duration::from_secs(1), &mut read_stderr)
+                    .await
+                {
+                    Ok(Ok(result)) => result.map_err(|error| error.to_string()),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(_) => {
+                        // A detached command may still inherit stderr after its agent exits.
+                        Err("stderr remained open after the agent stopped".to_owned())
+                    }
+                },
+            )
+        };
+        let message = if let Some(error) = failure {
+            let path = crate::local::chat::harness_log_path("acp");
+            let mut stderr = String::from_utf8_lossy(&stderr.lock().unwrap())
+                .trim()
+                .to_owned();
+            let mut start = stderr.len().saturating_sub(MAX_OUTPUT_TAIL_BYTES);
+            while !stderr.is_char_boundary(start) {
+                start += 1;
+            }
+            stderr.drain(..start);
+            let excerpt = stderr
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("");
+            let mut start = excerpt.len().saturating_sub(320);
+            while !excerpt.is_char_boundary(start) {
+                start += 1;
+            }
+            let excerpt = &excerpt[start..];
+            let detail = if excerpt.is_empty() {
+                String::new()
+            } else {
+                format!(" Agent output: {excerpt}.")
+            };
+            let record = json!({
+                "agent": launch.name,
+                "executable": executable.to_string_lossy(),
+                "arguments": launch.arguments,
+                "pid": agent_pid,
+                "error": format!("{error:#}"),
+                "exit": exit,
+                "stderr": stderr,
+                "stderrReadError": stderr_read.and_then(Result::err),
+                "discardedStdout": discarded_stdout.lock().unwrap().trim_end(),
+            });
+            match crate::local::chat::harness_log("acp").and_then(|mut file| {
+                file.write_all(format!("{record}\n").as_bytes())
+                    .map_err(Into::into)
+            }) {
+                Ok(()) => format!(
+                    "{} {error}.{detail} See {} for details, then try again.",
+                    launch.name,
+                    path.display()
+                ),
+                Err(log_error) => {
+                    eprintln!("orx up: ACP failure diagnostics: {record}");
+                    format!(
+                        "{} {error}.{detail} Could not save the diagnostics: {log_error}.",
+                        launch.name
+                    )
+                }
+            }
+        } else {
+            format!("{} was stopped.", launch.name)
+        };
+        let _ = closed_sender.send(Some(message.clone()));
+        if let Some(sender) = ready_sender.lock().unwrap().take() {
+            let _ = sender.send(Err(message));
+        }
     });
-    let initialized = tokio::time::timeout(super::STARTUP_TIMEOUT, ready_receiver).await;
+    let initialized =
+        tokio::time::timeout(crate::config::paced(INITIALIZATION_BOUND), ready_receiver).await;
     match initialized {
-        Ok(Ok(Ok((connection, initialized)))) => Ok(Arc::new(Client {
-            alphaxiv_signed_in: crate::alphaxiv::signed_in(),
-            configuration_lock: tokio::sync::Mutex::new(()),
-            connection,
-            initialized,
-            io,
-            stop: Mutex::new(Some(stop_sender)),
-            closed: closed_receiver,
-            idle_since: Mutex::new(Some(Instant::now())),
-        })),
-        Ok(Ok(Err(message))) => {
-            drop(stop_sender);
-            bail!("ACP initialization failed: {message}")
+        Ok(Ok(Ok((connection, initialized)))) => {
+            return Ok(Arc::new(Client {
+                alphaxiv_signed_in: crate::alphaxiv::signed_in(),
+                launch: definition.clone(),
+                configuration_lock: tokio::sync::Mutex::new(()),
+                connection,
+                initialized,
+                io,
+                stop: Mutex::new(Some(stop_sender)),
+                closed: closed_receiver,
+                idle_since: Mutex::new(Some(Instant::now())),
+                delegated: client_tools,
+                pid: agent_pid,
+            }))
         }
-        _ => {
-            drop(stop_sender);
-            bail!("ACP initialization failed or timed out. Check the executable, arguments, and supported protocol version.")
+        Ok(Ok(Err(message))) => bail!("{message}"),
+        Err(_) => {
+            let _ = stop_sender.send(Stop::Failure(format!(
+                "did not initialize within {} seconds",
+                INITIALIZATION_BOUND.as_secs()
+            )));
         }
+        Ok(Err(_)) => drop(stop_sender),
     }
+    bail!("{}", closed_reason(closed_receiver).await?)
 }
 
 #[cfg(test)]
@@ -776,7 +1170,7 @@ mod tests {
         Definition {
             id: format!("acp:{}", uuid::Uuid::new_v4()),
             name: "Peer".into(),
-            executable: if cfg!(windows) { "python" } else { "python3" }.into(),
+            executable: crate::local::acp::fake_agent_interpreter("python3"),
             arguments: vec![
                 concat!(
                     env!("CARGO_MANIFEST_DIR"),
@@ -805,6 +1199,462 @@ mod tests {
         client
     }
 
+    async fn turn(client: &Client, text: &str) {
+        let session = client.native_id().unwrap();
+        let prompt = json!([{"type": "text", "text": format!("ACP_TEST:{text}")}]);
+        client
+            .request(
+                "session/prompt",
+                json!({"sessionId": session, "prompt": prompt}),
+            )
+            .await
+            .unwrap();
+        client.end_turn();
+    }
+
+    fn diagnostics(name: &str) -> Value {
+        let log = std::fs::read_to_string(crate::local::chat::harness_log_path("acp")).unwrap();
+        log.lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|entry| entry["agent"] == name)
+            .unwrap()
+    }
+
+    async fn assert_startup_socket_closed(mut gate: tokio::net::TcpStream) {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), gate.read(&mut [0]))
+            .await
+            .unwrap();
+        match result {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            result => panic!("The stopped agent kept its startup socket open: {result:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_and_chats_accept_windows_framing_fragmented_unicode_and_stdout_noise() {
+        let host = Arc::new(Host::default());
+        for mode in [
+            "transport-crlf",
+            "transport-fragments",
+            "transport-blank",
+            "transport-noise",
+            "transport-bom",
+        ] {
+            let launch = definition(mode);
+            let connected = super::super::test_connection(&launch).await.unwrap();
+            assert_eq!(connected["status"], "connected");
+            if mode == "transport-fragments" {
+                assert_eq!(connected["agentInfo"]["name"], "代理🌸");
+            }
+
+            let client = host
+                .get(mode, &launch, &std::env::temp_dir())
+                .await
+                .unwrap();
+            let session = client
+                .request(
+                    "session/new",
+                    json!({"cwd": std::env::temp_dir(), "mcpServers": []}),
+                )
+                .await
+                .unwrap();
+            client.set_native_id(session["sessionId"].as_str().unwrap());
+            let mut events = client.begin_turn();
+            let response = prompt(&client, "hello").await.unwrap();
+            assert_eq!(response["stopReason"], "end_turn");
+            assert!(matches!(events.try_recv(), Ok(Event::Update(_))));
+            host.stop(mode).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failure_keeps_a_bounded_tail_of_stdout_that_was_not_json() {
+        let host = Arc::new(Host::default());
+        let mut launch = definition("transport-noise");
+        launch.name = format!("Noisy peer {}", uuid::Uuid::new_v4());
+        let client = host
+            .get("noisy", &launch, &std::env::temp_dir())
+            .await
+            .unwrap();
+        let session = client
+            .request(
+                "session/new",
+                json!({"cwd": std::env::temp_dir(), "mcpServers": []}),
+            )
+            .await
+            .unwrap();
+        client.set_native_id(session["sessionId"].as_str().unwrap());
+        client.begin_turn();
+        prompt(&client, "hello").await.unwrap();
+        prompt(&client, "crash").await.unwrap_err();
+
+        let log = diagnostics(&launch.name);
+        assert_eq!(log["stderr"], "");
+        let discarded = log["discardedStdout"].as_str().unwrap();
+        assert!(discarded.len() <= 8192);
+        assert!(!discarded.contains("discarded-prefix"));
+        assert!(
+            discarded.ends_with(
+                "x\n[dotenv@17.2.0] injecting env (0)\nnpm notice banner\n代理 final-stdout-banner"
+            ),
+            "{discarded}"
+        );
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn slow_initialization_can_finish_after_the_previous_deadline() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mode = format!("gated-init:{}", listener.local_addr().unwrap().port());
+        let launch = definition(&mode);
+        let connecting = tokio::spawn(async move { super::super::test_connection(&launch).await });
+        let (mut gate, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(16)).await;
+        assert!(!connecting.is_finished());
+        tokio::time::resume();
+        gate.write_all(b"\n").await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), connecting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result["status"], "connected");
+    }
+
+    #[tokio::test]
+    async fn initialization_timeout_stops_the_agent_and_reports_its_diagnostics() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mode = format!("gated-init:{}", listener.local_addr().unwrap().port());
+        let mut launch = definition(&mode);
+        launch.name = format!("Timeout peer {}", uuid::Uuid::new_v4());
+        let name = launch.name.clone();
+        let connecting = tokio::spawn(async move { super::super::test_connection(&launch).await });
+        let (gate, _) = tokio::time::timeout(std::time::Duration::from_secs(30), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+
+        tokio::time::pause();
+        tokio::time::advance(INITIALIZATION_BOUND + std::time::Duration::from_secs(1)).await;
+        tokio::time::resume();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), connecting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&name), "{error}");
+        assert!(
+            error.contains(&INITIALIZATION_BOUND.as_secs().to_string()),
+            "{error}"
+        );
+        assert!(error.contains(
+            &crate::local::chat::harness_log_path("acp")
+                .display()
+                .to_string()
+        ));
+        assert_startup_socket_closed(gate).await;
+        assert!(diagnostics(&name)["error"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn cancelling_initialization_stops_its_process() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mode = format!("gated-init:{}", listener.local_addr().unwrap().port());
+        let launch = definition(&mode);
+        let connecting = tokio::spawn(async move { super::super::test_connection(&launch).await });
+        let (gate, _) = tokio::time::timeout(std::time::Duration::from_secs(30), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+
+        connecting.abort();
+        assert!(connecting.await.unwrap_err().is_cancelled());
+        assert_startup_socket_closed(gate).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_cleanup_keeps_the_cause_and_waits_past_five_seconds() {
+        let (sender, receiver) = tokio::sync::watch::channel(Some(
+            "Peer did not initialize within 60 seconds.".to_owned(),
+        ));
+        let waiting = tokio::spawn(closed_reason(receiver));
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        assert!(!waiting.is_finished());
+        drop(sender);
+        let message = waiting.await.unwrap().unwrap();
+        assert!(message.contains("Peer"));
+        assert!(message.contains("60 seconds"));
+        assert!(!message.contains("may still be stopping"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_timeout_keeps_the_cause_and_reports_that_stopping_is_incomplete() {
+        let (_sender, receiver) = tokio::sync::watch::channel(Some(
+            "Peer did not initialize within 60 seconds.".to_owned(),
+        ));
+        let message = closed_reason(receiver).await.unwrap();
+        assert!(message.contains("Peer"));
+        assert!(message.contains("60 seconds"));
+        assert!(message.contains("15 seconds"));
+        assert!(message.contains("may still be stopping"));
+    }
+
+    #[tokio::test]
+    async fn failures_keep_a_bounded_stderr_tail_and_observed_exit_status() {
+        let mut launch = definition("stderr-init");
+        launch.name = format!("Startup peer {}", uuid::Uuid::new_v4());
+        let error = super::super::test_connection(&launch)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&launch.name), "{error}");
+        assert!(error.contains(
+            &crate::local::chat::harness_log_path("acp")
+                .display()
+                .to_string()
+        ));
+        let log = diagnostics(&launch.name);
+        let stderr = log["stderr"].as_str().unwrap();
+        assert!(stderr.len() <= 8192);
+        assert!(!stderr.contains("discarded-prefix"));
+        assert!(stderr.ends_with("代理 final-startup-cause"));
+        assert!(error.contains("代理 final-startup-cause"), "{error}");
+        assert!(!error.contains("xxxx"), "{error}");
+        assert!(log["exit"].is_string());
+        assert!(log["stderrReadError"].is_null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = std::fs::metadata(crate::local::chat::harness_log_path("acp"))
+                .unwrap()
+                .permissions();
+            assert_eq!(permissions.mode() & 0o077, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_long_stderr_excerpt_is_bounded_without_splitting_unicode() {
+        let error = super::super::test_connection(&definition("stderr-init:long"))
+            .await
+            .unwrap_err()
+            .to_string();
+        let excerpt = error
+            .split_once("Agent output: ")
+            .unwrap()
+            .1
+            .split_once(". See ")
+            .unwrap()
+            .0;
+        assert!(excerpt.len() <= 320, "{error}");
+        assert!(excerpt.ends_with("final-startup-cause"), "{error}");
+        assert!(!excerpt.contains('�'), "{error}");
+        assert!(excerpt.contains("代理"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_unwritable_log_reports_the_failure_without_claiming_it_was_saved() {
+        if !crate::config::in_test_child(&[]) {
+            return;
+        }
+        let path = crate::local::chat::harness_log_path("acp");
+        std::fs::create_dir_all(&path).unwrap();
+
+        let launch = definition("stderr-init");
+        let error = super::super::test_connection(&launch)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&launch.name), "{error}");
+        assert!(error.contains("Could not save"), "{error}");
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(!error.contains("See "), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_spared_detached_command_can_keep_writing_to_stderr() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (mode, spare) in [("detached-stderr", true), ("orphan-stderr", false)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mode = format!("{mode}:{}", listener.local_addr().unwrap().port());
+            let host = Arc::new(Host::default());
+            let client = host
+                .get("detached-stderr", &definition(&mode), &std::env::temp_dir())
+                .await
+                .unwrap();
+            let session = client
+                .request(
+                    "session/new",
+                    json!({"cwd": std::env::temp_dir(), "mcpServers": []}),
+                )
+                .await
+                .unwrap();
+            client.set_native_id(session["sessionId"].as_str().unwrap());
+            client.begin_turn();
+            prompt(&client, "detached-stderr").await.unwrap();
+            let (mut gate, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut ready = [0; 5];
+            gate.read_exact(&mut ready).await.unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                client.end(Stop::Shutdown(spare)),
+            )
+            .await
+            .expect("shutdown waited for an orphan's stderr pipe");
+            gate.write_all(b"\n").await.unwrap();
+            let mut output = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                gate.read_to_end(&mut output),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(output, b"writable");
+            host.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_turn_that_loses_its_agent_keeps_the_failure_details() {
+        let host = Arc::new(Host::default());
+        for mode in ["stderr-turn", "invalid-utf8-turn"]
+            .into_iter()
+            .cycle()
+            .take(8)
+        {
+            let mut launch = definition(mode);
+            launch.name = format!("Turn peer {}", uuid::Uuid::new_v4());
+            let client = host
+                .get(mode, &launch, &std::env::temp_dir())
+                .await
+                .unwrap();
+            let session = client
+                .request(
+                    "session/new",
+                    json!({"cwd": std::env::temp_dir(), "mcpServers": []}),
+                )
+                .await
+                .unwrap();
+            client.set_native_id(session["sessionId"].as_str().unwrap());
+            client.begin_turn();
+            let rejected = prompt(&client, "error").await.unwrap_err();
+            assert_eq!(
+                rejected
+                    .downcast_ref::<agent_client_protocol::Error>()
+                    .unwrap()
+                    .code,
+                agent_client_protocol::ErrorCode::InternalError
+            );
+            assert_eq!(
+                prompt(&client, "hello").await.unwrap()["stopReason"],
+                "end_turn"
+            );
+            let error = prompt(&client, "crash").await.unwrap_err().to_string();
+            assert!(error.contains(&launch.name), "{error}");
+            assert!(error.contains(
+                &crate::local::chat::harness_log_path("acp")
+                    .display()
+                    .to_string()
+            ));
+            let log = diagnostics(&launch.name);
+            assert_eq!(log["stderr"], "final-turn-cause");
+            if mode == "invalid-utf8-turn" {
+                assert_eq!(log["discardedStdout"], "(a line that is not UTF-8)");
+            }
+            assert!(error.contains("final-turn-cause"), "{error}");
+        }
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reaper_keeps_an_agent_only_while_its_terminal_runs() {
+        use crate::local::agent_lifecycle::IdlePolicy;
+        let host = Arc::new(Host::default());
+        let kept = |id: &str| {
+            host.clients
+                .lock()
+                .unwrap()
+                .get(id)
+                .is_some_and(|slot| slot.try_lock().is_ok_and(|saved| saved.is_some()))
+        };
+        let later = Instant::now() + std::time::Duration::from_secs(60 * 60);
+
+        let client = new_client(&host, "terminal").await;
+        turn(&client, "live-terminal").await;
+        for policy in [IdlePolicy::DEFAULT, IdlePolicy::LOW_MEMORY] {
+            host.reap_idle_at(later, policy).await;
+            assert!(kept("terminal"), "reaped while its terminal ran");
+        }
+        turn(&client, "kill-live-terminal").await;
+        host.reap_idle_at(later, IdlePolicy::DEFAULT).await;
+        assert!(!kept("terminal"), "kept after its terminal exited");
+        assert!(client.closed.borrow().is_some());
+
+        let client = new_client(&host, "reported").await;
+        turn(&client, "background").await;
+        let cancel = async {
+            tokio::task::yield_now().await;
+            client.cancel();
+        };
+        tokio::join!(turn(&client, "hang"), cancel);
+        assert!(
+            client.closed.borrow().is_none(),
+            "the cancel ended the agent"
+        );
+        host.reap_idle_at(later, IdlePolicy::DEFAULT).await;
+        assert!(
+            !kept("reported"),
+            "a call left running after a cancel kept the agent"
+        );
+        host.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reaper_keeps_an_agent_while_a_command_it_detached_runs() {
+        use crate::local::agent_lifecycle::IdlePolicy;
+        let host = Arc::new(Host::default());
+        let kept = || {
+            host.clients
+                .lock()
+                .unwrap()
+                .get("detached")
+                .is_some_and(|slot| slot.try_lock().is_ok_and(|saved| saved.is_some()))
+        };
+        let later = Instant::now() + std::time::Duration::from_secs(60 * 60);
+        let client = new_client(&host, "detached").await;
+        // A helper in the agent's own session, like agy's MCP servers, keeps nothing.
+        turn(&client, "attached").await;
+        turn(&client, "detached").await;
+        for policy in [IdlePolicy::DEFAULT, IdlePolicy::LOW_MEMORY] {
+            host.reap_idle_at(later, policy).await;
+            assert!(kept(), "reaped while its detached command ran");
+        }
+
+        turn(&client, "end-detached").await;
+        host.reap_idle_at(later, IdlePolicy::DEFAULT).await;
+        assert!(!kept(), "kept after its detached command exited");
+        assert!(client.closed.borrow().is_some());
+        host.shutdown().await;
+    }
+
     #[tokio::test]
     async fn alphaxiv_server_reaches_new_loaded_and_resumed_sessions() {
         use agent_client_protocol::schema::v1::NewSessionRequest;
@@ -831,6 +1681,116 @@ mod tests {
                 .unwrap();
             host.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn restoring_a_session_the_agent_no_longer_lists_is_not_found() {
+        let host = Arc::new(Host::default());
+        let cwd = std::env::temp_dir();
+        let client = host
+            .get("unlisted", &definition("unlisted"), &cwd)
+            .await
+            .unwrap();
+        let code = |error: crate::error::Error| {
+            error
+                .downcast_ref::<agent_client_protocol::Error>()
+                .map(|error| error.code)
+        };
+        let gone = client.restore("gone", &cwd, vec![]).await.unwrap_err();
+        assert_eq!(
+            code(gone),
+            Some(agent_client_protocol::ErrorCode::ResourceNotFound)
+        );
+        // Listed on the second page: the agent still has it, so its own error stands.
+        let kept = client.restore("kept", &cwd, vec![]).await.unwrap_err();
+        assert_eq!(
+            code(kept),
+            Some(agent_client_protocol::ErrorCode::InternalError)
+        );
+        host.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_idle_stop_spares_only_commands_in_their_own_sessions() {
+        // An orphan stays a zombie under an init that never reaps it, as in some containers.
+        fn running(pid: libc::pid_t) -> bool {
+            let state = crate::process::command("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&state.stdout)
+                .trim()
+                .chars()
+                .next()
+                .is_some_and(|state| state != 'Z')
+        }
+        async fn exits(pid: libc::pid_t) -> bool {
+            for _ in 0..200 {
+                if !running(pid) {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            false
+        }
+        for idle in [true, false] {
+            let pids = std::env::temp_dir().join(format!("orx-acp-pids-{}", uuid::Uuid::new_v4()));
+            let peer = definition("normal");
+            let mut launch = peer.clone();
+            launch.executable = crate::local::acp::fake_agent_interpreter("sh");
+            launch.arguments = [
+                "-c".into(),
+                r#"python3 -c 'import os, time; os.setsid(); time.sleep(60)' & echo $! > "$0"
+sleep 60 & echo $! >> "$0"
+exec "$@""#
+                    .into(),
+                pids.to_string_lossy().into_owned(),
+                peer.executable,
+            ]
+            .into_iter()
+            .chain(peer.arguments)
+            .collect();
+            let host = Arc::new(Host::default());
+            let client = host
+                .get("detached", &launch, &std::env::temp_dir())
+                .await
+                .unwrap();
+            let started = std::fs::read_to_string(&pids).unwrap();
+            std::fs::remove_file(&pids).unwrap();
+            let started: Vec<libc::pid_t> =
+                started.lines().map(|pid| pid.parse().unwrap()).collect();
+            let [detached, attached] = started[..] else {
+                panic!("expected two commands: {started:?}");
+            };
+            client.end(Stop::Shutdown(idle)).await;
+            assert!(
+                exits(attached).await,
+                "a command in the agent's group outlived it"
+            );
+            if idle {
+                assert!(running(detached), "an idle stop killed a detached command");
+                unsafe { libc::kill(detached, libc::SIGKILL) };
+            } else {
+                assert!(exits(detached).await, "a detached command outlived a stop");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_changed_launch_restarts_the_resident_process() {
+        let host = Arc::new(Host::default());
+        let cwd = std::env::temp_dir();
+        let launch = definition("normal");
+        let first = host.get("relaunch", &launch, &cwd).await.unwrap();
+        let again = host.get("relaunch", &launch, &cwd).await.unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        let mut changed = launch.clone();
+        changed.arguments.push("--changed".into());
+        let restarted = host.get("relaunch", &changed, &cwd).await.unwrap();
+        assert!(!Arc::ptr_eq(&first, &restarted));
+        assert!(first.closed.borrow().is_some());
+        host.shutdown().await;
     }
 
     #[tokio::test]
@@ -867,7 +1827,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("session/new timed out"));
-        assert!(*client.closed.borrow());
+        assert!(client.closed.borrow().is_some());
         host.stop("stalled").await;
     }
 
@@ -908,6 +1868,47 @@ mod tests {
             assert!(host.answer("chat", &id, "not-offered").await.is_err());
             host.answer("chat", &id, selected).await.unwrap();
             assert!(host.answer("chat", &id, selected).await.is_err());
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            client.end_turn();
+        }
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn automatic_approval_uses_only_offered_single_action_grants() {
+        let host = Arc::new(Host::default());
+        let client = new_client(&host, "auto-approval").await;
+        for (text, automatic) in [
+            ("permission", true),
+            ("permission-always", false),
+            ("permission-deny", false),
+            ("permission-switch", false),
+        ] {
+            let mut events = client.begin_turn();
+            let task_client = client.clone();
+            let task = tokio::spawn(async move { prompt(&task_client, text).await });
+            let id = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Some(Event::Permission { id, .. }) = events.recv().await {
+                        break id;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let approved = client.approve_pending().unwrap();
+            if automatic {
+                assert_eq!(approved, vec![(id, "opaque-once".into())]);
+            } else {
+                assert!(approved.is_empty());
+                assert!(client.awaiting_permission());
+                client.answer(&id, "opaque-deny").unwrap();
+            }
+            assert!(client.approve_pending().unwrap().is_empty());
             tokio::time::timeout(std::time::Duration::from_secs(5), task)
                 .await
                 .unwrap()
@@ -985,6 +1986,7 @@ mod tests {
             }
         };
         client.end_turn();
+        assert!(client.approve_pending().unwrap().is_empty());
         tokio::time::timeout(std::time::Duration::from_secs(5), task)
             .await
             .unwrap()
@@ -995,13 +1997,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_shot_configuration_updates_reach_the_turn_without_a_stored_chat() {
+        let host = Arc::new(Host::default());
+        let client = new_client(&host, "acp-oneshot-configuration").await;
+        client.mark_one_shot();
+        let mut events = client.begin_turn();
+        client
+            .request(
+                "session/set_config_option",
+                json!({"sessionId": client.native_id(), "configId": "opaque-model", "value": "second"}),
+            )
+            .await
+            .unwrap();
+        // No chat session has this ID, so a store write would fail and drop the update.
+        assert!(
+            matches!(events.try_recv(), Ok(Event::Update(update)) if update["sessionUpdate"] == "current_mode_update")
+        );
+        client.end_turn();
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn chat_configuration_updates_from_the_agent_are_stored() {
+        let store = crate::store::Store::open().unwrap();
+        let id = format!("chat_{}", uuid::Uuid::new_v4());
+        store
+            .create_chat_session(&crate::store::StoredChatSession {
+                profile_id: None,
+                id: id.clone(),
+                project_id: "proj_1".into(),
+                harness: super::super::presets().remove(0).launch.id,
+                native_session_id: None,
+                native_fork_at: None,
+                title: None,
+                title_source: None,
+                model: None,
+                service_tier: None,
+                permission_mode: None,
+                plan_mode: false,
+                plan_reset_pending: false,
+                reasoning_level: None,
+                archived: false,
+                context_usage_json: None,
+                bootstrap_context: None,
+                goal: None,
+                autonomy: None,
+                active_leaf_id: None,
+                side_parent_session_id: None,
+                side_parent_leaf_id: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        store
+            .set_acp_configuration(&id, &json!({"modes": {"currentModeId": "initial"}}))
+            .unwrap();
+        let host = Arc::new(Host::default());
+        let client = new_client(&host, &id).await;
+        let mut events = client.begin_turn();
+        client
+            .request(
+                "session/set_config_option",
+                json!({"sessionId": client.native_id(), "configId": "opaque-model", "value": "second"}),
+            )
+            .await
+            .unwrap();
+        // The update reaches the turn only after the store write.
+        assert!(
+            matches!(events.try_recv(), Ok(Event::Update(update)) if update["sessionUpdate"] == "current_mode_update")
+        );
+        let configuration = store.acp_session_state(&id).unwrap().unwrap().configuration;
+        assert_eq!(configuration["modes"]["currentModeId"], "agent-changed");
+        client.end_turn();
+        host.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn failed_initialization_and_process_death_are_explicit() {
         let host = Arc::new(Host::default());
-        for mode in ["incompatible", "auth-init", "crash-init"] {
-            assert!(host
+        for mode in ["incompatible", "auth-init", "crash-init", "shapeless-init"] {
+            let error = host
                 .get(mode, &definition(mode), &std::env::temp_dir())
                 .await
-                .is_err());
+                .err()
+                .expect("initialization must fail")
+                .to_string();
+            if mode == "incompatible" {
+                assert!(error.contains("stable v1"), "{error}");
+                assert!(error.contains("Incompatible ACP protocol"), "{error}");
+            }
+            if mode == "shapeless-init" {
+                assert!(error.contains("protocolVersion"), "{error}");
+            }
         }
         let client = new_client(&host, "crash").await;
         client.begin_turn();

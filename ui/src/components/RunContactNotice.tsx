@@ -1,4 +1,6 @@
 import { useWorkspace } from "../workspace";
+import { mutAbandonRun, mutCancelRun, mutCleanupRun } from "../queries/projects";
+import { mutRetryEngineHost } from "../queries/settings";
 import { CircleStop, Plug, RefreshCw } from "lucide-react";
 import { useState } from "react";
 import { type Run } from "../api";
@@ -10,7 +12,7 @@ import { statusLabel } from "./StatusBadge";
 import { Button } from "./ui";
 import { cn } from "./ui/cn";
 
-type NoticeRun = Parameters<typeof runNotice>[0] & Pick<Run, "id" | "host">;
+type NoticeRun = Parameters<typeof runNotice>[0] & Pick<Run, "id" | "projectId" | "host">;
 
 const TONES = {
   warning: "text-accent-amber",
@@ -18,7 +20,7 @@ const TONES = {
   quiet: "text-subtext",
 };
 
-function copy(notice: RunNotice, nextRetryMs: number | null, provider: string | null): { lead: string; detail: string | null; tone: keyof typeof TONES } {
+function copy(notice: RunNotice, nextRetryMs: number | null, provider: string | null): { lead: string; detail: string | null; next?: string; tone: keyof typeof TONES } {
   const authLead = provider === "k8s_job" ? m.run_notice_cluster_auth() : provider ? m.run_notice_provider_auth() : null;
   const host = (name: string | null) => ltr(name ?? m.run_notice_the_host());
   switch (notice.kind) {
@@ -42,9 +44,13 @@ function copy(notice: RunNotice, nextRetryMs: number | null, provider: string | 
     case "unconfirmed_launch":
       return { lead: m.run_notice_unconfirmed_launch(), detail: notice.detail, tone: "caution" };
     case "cancel_pending_launch":
-      return { lead: m.status_cancellation_pending(), detail: m.run_notice_cancel_pending_launch(), tone: "caution" };
+      return notice.detail
+        ? { lead: m.status_cancellation_pending(), detail: notice.detail, next: m.run_notice_cancel_pending_launch_unknown(), tone: "caution" }
+        : { lead: m.status_cancellation_pending(), detail: m.run_notice_cancel_pending_launch(), tone: "caution" };
     case "cancel_unconfirmed":
-      return { lead: m.status_cancelling(), detail: notice.detail, tone: "caution" };
+      return { lead: m.status_cancellation_pending(), detail: notice.detail, tone: "caution" };
+    case "cancel_refused":
+      return { lead: m.status_cancellation_pending(), detail: notice.detail, next: m.run_notice_cancel_refused(), tone: "caution" };
     case "not_fully_stopped":
       return { lead: statusLabel(notice.kind, notice), detail: null, tone: "caution" };
     case "cancelled_unconfirmed": {
@@ -72,10 +78,10 @@ function copy(notice: RunNotice, nextRetryMs: number | null, provider: string | 
 
 /** What a run's status alone can't say: lost contact, a pending cancel, or an abandoned job's pending kill. */
 export function RunContactNotice({ run, className }: { run: NoticeRun; className?: string }) {
-  const { abandonRun, cancelRun, cleanupRun, retryEngineHost } = useWorkspace().api;
+  const workspace = useWorkspace();
   const { showConfirmDialog } = useWorkspace().dialogs;
   const { requestHostConnect } = useWorkspace().events;
-  const { setEngineHost, useEngineHosts } = useWorkspace().queries;
+  const { useEngineHosts } = workspace.queries;
 
   const hosts = useEngineHosts();
   const [busy, setBusy] = useState(false);
@@ -85,7 +91,7 @@ export function RunContactNotice({ run, className }: { run: NoticeRun; className
 
   const engineHost = hostForRun(hosts, run);
   const nextRetryMs = engineHost?.status === "backoff" ? engineHost.nextRetryMs : null;
-  const { lead, detail, tone } = copy(notice, nextRetryMs, runApiProvider(run));
+  const { lead, detail, next, tone } = copy(notice, nextRetryMs, runApiProvider(run));
   const rentalBilling = run.backend?.kind === "openresearch_job"
     && runActive(run.status)
     && (run.contact?.type === "needs_auth" || run.contact?.type === "unreachable");
@@ -117,6 +123,7 @@ export function RunContactNotice({ run, className }: { run: NoticeRun; className
         <p className={cn("m-0 wrap-anywhere", notice.kind !== "monitoring" && "font-medium", TONES[tone])}>{lead}</p>
         {rentalBilling && <p className="m-0 mt-0.5 text-xs text-subtext wrap-anywhere">{m.run_notice_rental_billing()}</p>}
         {detail && <p className="m-0 mt-0.5 text-xs text-subtext wrap-anywhere">{detail}</p>}
+        {next && <p className="m-0 mt-0.5 text-xs text-subtext wrap-anywhere">{next}</p>}
         {error && <p role="alert" className="m-0 mt-0.5 text-xs text-accent-red wrap-anywhere">{error}</p>}
       </div>
       {(connectHost || retryHost || rentalBilling || stopAgain || killPending || abandonable) && (
@@ -127,34 +134,34 @@ export function RunContactNotice({ run, className }: { run: NoticeRun; className
             </Button>
           )}
           {retryHost && (
-            <Button size="small" variant="ghost" disabled={busy} onClick={() => void act(async () => setEngineHost(await retryEngineHost(retryHost)))}>
+            <Button size="small" variant="ghost" disabled={busy} onClick={() => void act(async () => { await mutRetryEngineHost.runAsHeadlessPromise(workspace, retryHost, {}); })}>
               <RefreshCw size={14} />{m.app_retry()}
             </Button>
           )}
           {rentalBilling && (
-            <Button size="small" variant="ghost" disabled={busy} onClick={() => void act(() => cancelRun(run.id))}>
+            <Button size="small" variant="ghost" disabled={busy} onClick={() => void act(() => mutCancelRun.runAsHeadlessPromise(workspace, run, {}))}>
               <CircleStop size={14} />{m.run_stop_box()}
             </Button>
           )}
           {stopAgain && (
-            <Button size="small" variant="ghost" disabled={busy} onClick={() => void act(() => cancelRun(run.id))}>
+            <Button size="small" variant="ghost" disabled={busy} onClick={() => void act(() => mutCancelRun.runAsHeadlessPromise(workspace, run, {}))}>
               <CircleStop size={14} />{m.run_stop_again()}
             </Button>
           )}
           {killPending && (
-            <Button size="small" variant="ghost" disabled={busy} onClick={() => void act(() => cleanupRun(run.id))}>
+            <Button size="small" variant="ghost" disabled={busy} onClick={() => void act(() => mutCleanupRun.runAsHeadlessPromise(workspace, run.id, {}))}>
               <CircleStop size={14} />{m.run_stop_now()}
             </Button>
           )}
           {abandonable && (
             <Button size="small" variant="ghost" className="text-accent-red" onClick={() => showConfirmDialog({
               title: m.run_abandon_title(),
-              description: <>{run.contact?.type === "unreachable" && <>{m.run_abandon_unreachable()} </>}{m.run_abandon_body()}</>,
+              description: <>{run.contact?.type === "unreachable" && <>{m.run_abandon_unreachable()} </>}{m.run_abandon_effect()}</>,
               destructive: true,
               confirmLabel: m.run_abandon_confirm(),
               cancelLabel: m.run_abandon_keep(),
               onCancel: "close",
-              onConfirm: async () => { await abandonRun(run.id); },
+              onConfirm: async () => { await mutAbandonRun.runAsHeadlessPromise(workspace, run.id, {}); },
             })}>
               {m.run_abandon()}
             </Button>

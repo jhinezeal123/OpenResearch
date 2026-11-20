@@ -56,6 +56,7 @@ pub(crate) struct Api {
     engine: Arc<Engine>,
     commands: Arc<dyn Commands>,
     admit: Admit,
+    chat: Arc<crate::local::chat::ChatHost>,
     data_dir: PathBuf,
     store: Mutex<Store>,
     clients: AtomicUsize,
@@ -68,6 +69,7 @@ impl Api {
         engine: Arc<Engine>,
         commands: Arc<dyn Commands>,
         admit: Admit,
+        chat: Arc<crate::local::chat::ChatHost>,
         data_dir: PathBuf,
     ) -> Result<Self> {
         let store = Mutex::new(Store::open_at(data_dir.clone())?);
@@ -77,6 +79,7 @@ impl Api {
             engine,
             commands,
             admit,
+            chat,
             data_dir,
             store,
             clients: AtomicUsize::new(0),
@@ -99,12 +102,8 @@ impl Api {
         args.forwarded = true;
         crate::local::apply_compute_default(&mut args.backend, &mut args.flavor);
         args.backend.get_or_insert_with(|| "local".into());
-        if crate::config::run_engine_settings()?.0 {
-            self.commands.run(args, admission).await
-        } else {
-            let run = crate::compute::submit_supervised(&args).await?;
-            Ok(run.id)
-        }
+        super::require_caller_settings(&args, &super::absolute_config_dir()).await?;
+        self.commands.run(args, admission).await
     }
 
     fn run(&self, id: &str) -> Result<StoredRun> {
@@ -131,6 +130,9 @@ impl Api {
         value["cancelUnconfirmed"] = json!(state
             .as_ref()
             .and_then(|state| state.cancel_unconfirmed.as_ref()));
+        value["waitingReason"] = json!(state
+            .as_ref()
+            .and_then(|state| state.waiting_reason.as_ref()));
         value["contact"] =
             serde_json::to_value(state.map_or(Contact::Live, |state| state.contact))?;
         if let Some((failed, error)) = self.store().log_collection(&run.id)? {
@@ -139,13 +141,90 @@ impl Api {
         }
         value["host"] = json!(super::run_host(&self.store(), run)?);
         value["cancelling"] = json!(cancelling);
+        value["cancelError"] = json!(self.engine.cancel_error(&run.id));
         value["durationSecs"] = json!(crate::local::run_duration_secs(run));
         value["updatedDisplay"] = json!(crate::local::fmt_ago(run.updated_at));
         Ok(value)
     }
 
-    pub(super) fn busy(&self) -> Result<bool> {
-        Ok(self.store().engine_idle_blocked()? || self.sse_clients() != 0)
+    /// Asks each run that needs the app open to stop, including runs launched meanwhile, for at most `wait`.
+    #[cfg_attr(not(desktop_app), allow(dead_code))]
+    pub(crate) async fn force_stop_runs(&self, wait: Duration) {
+        use futures::StreamExt;
+
+        let mut asked = std::collections::HashSet::new();
+        let mut stops = futures::stream::FuturesUnordered::new();
+        let stopping = async {
+            loop {
+                let runs = match self.pending_work().await {
+                    Ok(work) => work.runs,
+                    Err(error) => {
+                        eprintln!(
+                            "openresearch app: could not check which runs to stop: {error:#}"
+                        );
+                        return;
+                    }
+                };
+                let mut unsettled = false;
+                for run in runs {
+                    if run.after_quit != crate::store::AfterQuit::NeedsApp {
+                        continue;
+                    }
+                    let stored = match self.run(&run.run_id) {
+                        Ok(stored) => stored,
+                        Err(error) => {
+                            eprintln!(
+                                "openresearch app: could not stop run {}: {error:#}",
+                                run.run_id
+                            );
+                            continue;
+                        }
+                    };
+                    // A run still launching takes its stop only once it has a handle, so it is asked again then;
+                    // the stop its launch delivers, or one already on its way, is waited for here.
+                    let launched = crate::engine::handle_of(&stored).is_some();
+                    unsettled |= !launched || self.engine.delivering_cancel(&stored.id);
+                    if !asked.insert((run.run_id, launched)) {
+                        continue;
+                    }
+                    stops.push(async move {
+                        if let Err(error) = self
+                            .commands
+                            .cancel(&stored, "Stopped when OpenResearch was force quit.")
+                            .await
+                        {
+                            eprintln!(
+                                "openresearch app: could not stop run {}: {error:#}",
+                                stored.id
+                            );
+                        }
+                    });
+                }
+                if stops.is_empty() && !unsettled {
+                    return;
+                }
+
+                // Agents keep working until the quit, so a run can start while others stop.
+                let poll = tokio::time::sleep(crate::config::paced(Duration::from_millis(250)));
+                tokio::select! {
+                    Some(()) = stops.next() => {}
+                    () = poll => {}
+                }
+            }
+        };
+        if tokio::time::timeout(wait, stopping).await.is_err() {
+            eprintln!("openresearch app: quitting before every run answered its stop");
+        }
+    }
+
+    /// Agents are the chats the sidebar shows working, so a quit lists exactly those.
+    pub(crate) async fn pending_work(&self) -> Result<crate::store::PendingWork> {
+        let working = self.chat.busy_sessions().await;
+        self.store().pending_work(&working)
+    }
+
+    pub(super) async fn busy(&self) -> Result<bool> {
+        Ok(!self.pending_work().await?.is_empty() || self.sse_clients() != 0)
     }
 
     pub fn sse_clients(&self) -> usize {
@@ -187,9 +266,15 @@ fn dashboard_routes(api: Arc<Api>) -> Router {
         .route("/api/runs/{id}/log", get(log))
         .route("/api/runs/{id}/abandon", post(dashboard_abandon))
         .route("/api/runs/{id}/cleanup", post(cleanup))
+        .route("/api/pending-work", get(dashboard_pending_work))
         .route("/api/compute/hosts", get(hosts))
         .route("/api/compute/hosts/{alias}/retry", post(retry_host))
         .with_state(api)
+}
+
+/// See [`Engine::cancel_error`]; none when the engine isn't running in this process.
+pub(crate) fn cancel_error(run_id: &str) -> Option<String> {
+    installed().ok()?.engine.cancel_error(run_id)
 }
 
 fn installed() -> Result<&'static Arc<Api>> {
@@ -200,13 +285,24 @@ fn installed() -> Result<&'static Arc<Api>> {
 }
 
 #[cfg(desktop_app)]
-pub(crate) fn busy() -> Result<bool> {
-    installed()?.busy()
+pub(crate) async fn busy() -> Result<bool> {
+    installed()?.busy().await
 }
 
+/// For the window's event loop, which runs on the thread blocked on the runtime.
 #[cfg(desktop_app)]
-pub(crate) fn runs_busy() -> Result<bool> {
-    installed()?.store().engine_runs_block_idle()
+pub(crate) fn pending_work() -> Result<crate::store::PendingWork> {
+    let api = installed()?;
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(api.pending_work()))
+}
+
+/// A force quit's stops; the quit goes ahead once all have answered or ten seconds have passed.
+#[cfg(desktop_app)]
+pub(crate) async fn force_stop_runs() {
+    match installed() {
+        Ok(api) => api.force_stop_runs(Duration::from_secs(10)).await,
+        Err(error) => eprintln!("openresearch app: could not stop runs before quitting: {error:#}"),
+    }
 }
 
 /// For the dashboard's `/api/runs`: the same launch as `POST /api/v2/runs`.
@@ -359,7 +455,11 @@ impl Filter {
         let rows = if let Some(id) = &self.run {
             store.get_run(id)?.into_iter().collect()
         } else if let Some(id) = &self.experiment {
-            store.list_runs_by_experiment(id)?
+            if self.wait {
+                store.latest_run_for_experiment(id)?.into_iter().collect()
+            } else {
+                store.list_runs_by_experiment(id)?
+            }
         } else if let Some(id) = &self.project {
             store.list_runs_by_project(id)?
         } else {
@@ -389,10 +489,6 @@ async fn run(
     State(api): State<Arc<Api>>,
     Json(args): Json<crate::ExpRunArgs>,
 ) -> ApiResult<Json<Value>> {
-    crate::commands::up::require_caller_config_dir(
-        args.caller_config_dir.as_deref(),
-        &crate::commands::up::absolute_config_dir(),
-    )?;
     let id = api.launch(args).await?;
     Ok(Json(api.view(&api.run(&id)?)?))
 }
@@ -422,22 +518,50 @@ async fn abandon(State(api): State<Arc<Api>>, Path(id): Path<String>) -> ApiResu
     Ok(Json(api.view(&api.run(&id)?)?))
 }
 fn abandon_run(api: &Api, id: &str) -> ApiResult<()> {
+    let ended = |run: &StoredRun| {
+        Failure::Message(
+            StatusCode::CONFLICT,
+            format!(
+                "Run {id} already ended ({}), so there is nothing to abandon.",
+                run.status
+            ),
+        )
+    };
+    let elsewhere = || {
+        Failure::Message(
+            StatusCode::CONFLICT,
+            format!("Run {id} is supervised by another orx process, such as an orx 0.2 run, so it can't be abandoned. Cancel it instead: `orx exp cancel --run {id}`."),
+        )
+    };
+
     let run = api.run(id)?;
+    if Phase::parse(&run.status).is_some_and(Phase::is_terminal) {
+        return Err(ended(&run));
+    }
+    if !crate::engine::is_engine_row(&run) && !api.engine.holds(id) {
+        return Err(elsewhere());
+    }
     let contact = api
         .store()
         .engine_run_state(id)?
         .map_or(Contact::Live, |state| state.contact);
-    if Phase::parse(&run.status).is_some_and(Phase::is_terminal) || contact == Contact::Live {
+    // A stop the backend keeps refusing is as stuck as one that cannot reach it.
+    if contact == Contact::Live && api.engine.cancel_error(id).is_none() {
         return Err(Failure::Message(
             StatusCode::CONFLICT,
-            "Abandon requires a non-terminal run without live contact".into(),
+            format!("OpenResearch can reach run {id} again. Cancel it instead: `orx exp cancel --run {id}`."),
         ));
     }
+
     if !api.engine.abandon(id)? {
-        return Err(Failure::Message(
-            StatusCode::CONFLICT,
-            "Run cannot be abandoned".into(),
-        ));
+        let run = api.run(id)?;
+        return Err(
+            if Phase::parse(&run.status).is_some_and(Phase::is_terminal) {
+                ended(&run)
+            } else {
+                elsewhere()
+            },
+        );
     }
     Ok(())
 }
@@ -463,12 +587,9 @@ pub(crate) fn host_view(
     use crate::engine::transport::{HostClass, Status};
     let class = store.engine_host_auth(alias)?.class;
     let connect_required = cfg!(windows)
-        && crate::compute::supervised_ssh_needed(
-            crate::config::run_engine_settings()?.0,
-            &store.list_active_runs()?,
-            alias,
-            |id| installed().is_ok_and(|api| api.engine.holds(id)),
-        );
+        && crate::compute::supervised_ssh_needed(&store.list_active_runs()?, alias, |id| {
+            installed().is_ok_and(|api| api.engine.holds(id))
+        });
     Ok(json!({
         "alias": alias, "root": root,
         "status": match state.status { Status::Idle => "idle", Status::Connecting => "connecting", Status::Live => "live", Status::Backoff => "backoff", Status::NeedsAuth => "needs_auth" },
@@ -476,6 +597,11 @@ pub(crate) fn host_view(
         "connectRequired": connect_required,
         "sinceMs": state.since_ms, "nextRetryMs": state.next_retry_ms, "cause": state.cause,
     }))
+}
+
+/// What a quit would interrupt, for the page's close dialog.
+async fn dashboard_pending_work(State(api): State<Arc<Api>>) -> super::ApiResult {
+    Ok(Json(json!(api.pending_work().await?)))
 }
 
 async fn hosts(State(api): State<Arc<Api>>) -> ApiResult<Json<Value>> {
@@ -936,6 +1062,12 @@ async fn events(
                             if !filter.matches(&run) || filter.wait && completed.contains(run_id) {
                                 return Ok(None);
                             }
+                            if filter.wait && filter.experiment.is_some() {
+                                let rows = filter.rows(api)?;
+                                if rows.first().is_none_or(|latest| latest.id != run.id) {
+                                    return Ok(None);
+                                }
+                            }
                             let mut value = api.view(&run)?;
                             match &event {
                                 RunEvent::Changed {
@@ -1021,10 +1153,10 @@ impl Idle {
         now.saturating_sub(*self.since.get_or_insert(now)) >= Duration::from_secs(600)
     }
 
-    pub fn check(&mut self, api: &Api, now: Duration) -> Result<bool> {
+    pub async fn check(&mut self, api: &Api, now: Duration) -> Result<bool> {
         Ok(self.should_exit(
             now,
-            api.busy()? || super::ACTIVE.load(Ordering::SeqCst) != 0,
+            api.busy().await? || super::ACTIVE.load(Ordering::SeqCst) != 0,
         ))
     }
 }
